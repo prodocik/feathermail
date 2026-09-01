@@ -22006,6 +22006,19 @@ mod tests {
     }
 
     #[test]
+    fn shell_motion_never_transitions_layout_properties() {
+        let css = include_str!("style.css");
+        for line in css.lines().filter(|line| line.contains("transition:")) {
+            for property in ["margin", "padding", "width", "height"] {
+                assert!(
+                    !line.contains(property),
+                    "layout property `{property}` must not be transitioned: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn account_card_initials_are_bounded_and_have_an_email_fallback() {
         assert_eq!(account_initials("Feather Studio", "ignored@test"), "FS");
         assert_eq!(account_initials("", "maya@northstar.test"), "M");

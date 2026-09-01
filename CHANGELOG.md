@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 — 2026-09-01
+
+- Pull-to-refresh no longer animates the bubble's layout margin, avoiding repeated layout work while the gesture follows the pointer or wheel.
+- The lightweight opacity and burst feedback remain unchanged, including reduced-motion behavior.
+- A regression test now rejects transitions of layout properties in the shell CSS.
+
 ## 0.1.0 — 2026-09-01
 
 First public Feather Mail release.

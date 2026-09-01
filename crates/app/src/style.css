@@ -1365,7 +1365,7 @@ button.search-hit:hover {
   border: 1px solid @stroke_soft;
   border-radius: 999px;
   padding: 7px;
-  transition: margin 120ms ease-out, opacity 120ms ease-out;
+  transition: opacity 120ms ease-out;
 }
 .pull-refresh-bubble.armed {
   color: @accent_deep;

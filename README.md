@@ -35,11 +35,11 @@ The [v0.1 release](https://github.com/prodocik/feathermail/releases/latest) prov
 
 ```bash
 # Ubuntu / Debian / Linux Mint
-sudo apt install ./feathermail_0.1.0_amd64.deb
+sudo apt install ./feathermail_0.1.1_amd64.deb
 
 # Other recent x86_64 distributions
-chmod +x Feather-Mail-0.1.0-x86_64.AppImage
-./Feather-Mail-0.1.0-x86_64.AppImage
+chmod +x Feather-Mail-0.1.1-x86_64.AppImage
+./Feather-Mail-0.1.1-x86_64.AppImage
 ```
 
 See [docs/install.md](docs/install.md) for dependencies, source builds and provider notes.
