@@ -5,7 +5,9 @@ use rusqlite::{params, OptionalExtension};
 use crate::error::CoreError;
 use crate::model::{AccountId, OpKind, OpStatus, Operation, OperationId};
 use crate::provider::{ApplyError, MailProvider};
-use crate::store::{apply_undo, archive_move_history, json_string_field, sql_err, Core};
+use crate::store::{
+    apply_undo, archive_move_history, json_string_field, mailbox_remote_id, sql_err, Core,
+};
 
 /// D32: 2s, 5s, 15s, 30s, 60s, then exp backoff capped at 15 minutes.
 pub fn retry_delay_secs(failures: u32) -> i64 {
@@ -173,6 +175,22 @@ impl Core {
 
     /// `account = None` claims across every account ([`Core::tick`]);
     /// `Some(id)` restricts to one ([`Core::tick_for_account`]).
+    ///
+    /// `created_at` is `Core::now()`, i.e. whole seconds, so two commands
+    /// the user issued back to back almost always carry the same value and
+    /// the tie-break decides the real order. `operations.seq` is that
+    /// tie-break (T-162, schema v29): `store::enqueue` hands out
+    /// `MAX(seq) + 1` on every INSERT *and* on every revive. It replaced
+    /// `id ASC`, which sorted by the operation *kind's* name (`archive` <
+    /// `star`) and so applied a Star issued before an Archive after it --
+    /// a flag STORE against a UID the MOVE had already taken away, which
+    /// the server answers OK and silently does nothing for -- and then
+    /// `rowid`, which SQLite fixes at the first INSERT and never moves
+    /// again. That was right for a queue that only grows and wrong for the
+    /// one this is: `enqueue` revives a `failed`/`acked` row in place
+    /// (D29's idempotency key lands a repeated command on the row the
+    /// first one wrote), so under `rowid` a Star issued ten minutes ago and
+    /// revived now was claimed ahead of the Move issued a second ago.
     fn claim_next(&self, now: i64, account: Option<&str>) -> Result<Option<Operation>, CoreError> {
         let conn = self.db.conn();
         let sql = format!(
@@ -181,7 +199,7 @@ impl Core {
              FROM operations
              WHERE status = 'pending'
                AND (next_attempt_at IS NULL OR next_attempt_at <= ?1){}
-             ORDER BY created_at ASC, id ASC
+             ORDER BY created_at ASC, seq ASC
              LIMIT 1",
             if account.is_some() {
                 "\n               AND account_id = ?2"
@@ -387,6 +405,13 @@ impl Core {
 /// against a stale payload: if identity already moved (a server-side rename
 /// discovered first, or a replayed ACK), nothing matches and nothing is
 /// overwritten.
+///
+/// T-158: the destination is rebuilt from the payload's parts through
+/// [`mailbox_remote_id`] -- the same function `ImapMailProvider` builds the
+/// `RENAME` argument with, so the id written here is by construction the
+/// mailbox the server was actually asked for. A payload queued before that
+/// change carries a ready-made `to` instead; it is applied as it always
+/// was, since the operation it belongs to is being sent the old way too.
 fn settle_folder_rename(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<(), CoreError> {
     let row: Option<(String, String, String)> = tx
         .query_row(
@@ -400,10 +425,10 @@ fn settle_folder_rename(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<(), 
     let Some((account_id, folder_id, payload)) = row else {
         return Ok(());
     };
-    let (Some(from), Some(to)) = (
-        json_string_field(&payload, "from"),
-        json_string_field(&payload, "to"),
-    ) else {
+    let Some(from) = json_string_field(&payload, "from") else {
+        return Ok(());
+    };
+    let Some(to) = rename_destination(&payload) else {
         return Ok(());
     };
     tx.execute(
@@ -413,6 +438,21 @@ fn settle_folder_rename(tx: &rusqlite::Transaction<'_>, id: &str) -> Result<(), 
     )
     .map_err(sql_err)?;
     Ok(())
+}
+
+/// The mailbox path a `rename_folder` payload asks for, on the wire.
+///
+/// Current payloads carry `parent_remote_id` + `delimiter` + the raw
+/// `label`; one queued before T-158 carries a pre-joined `to`. Kept in
+/// this order deliberately: a payload that has `label` is a new one and
+/// must be built the new way even if some future field were named `to`.
+pub(crate) fn rename_destination(payload: &str) -> Option<String> {
+    if let Some(label) = json_string_field(payload, "label") {
+        let parent = json_string_field(payload, "parent_remote_id").unwrap_or_default();
+        let delimiter = json_string_field(payload, "delimiter").unwrap_or_default();
+        return Some(mailbox_remote_id(&parent, &delimiter, &label));
+    }
+    json_string_field(payload, "to")
 }
 
 /// T-060u: a `DeleteFolder` ACK is the moment the mailbox stops existing, so
@@ -2036,7 +2076,8 @@ mod tests {
             )
             .unwrap();
         assert!(payload.contains(r#""from":"Ideas""#), "{payload}");
-        assert!(payload.contains(r#""to":"Plans""#), "{payload}");
+        assert!(payload.contains(r#""label":"Plans""#), "{payload}");
+        assert_eq!(rename_destination(&payload).as_deref(), Some("Plans"));
 
         let mut provider = FakeProvider::ok();
         assert!(matches!(
@@ -2074,13 +2115,109 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(payload.contains(r#""to":"Team/Plans""#), "{payload}");
+        assert!(
+            payload.contains(r#""parent_remote_id":"Team""#),
+            "{payload}"
+        );
+        assert!(payload.contains(r#""delimiter":"/""#), "{payload}");
+        assert!(payload.contains(r#""label":"Plans""#), "{payload}");
+        assert_eq!(
+            rename_destination(&payload).as_deref(),
+            Some("Team/Plans"),
+            "the parts must rejoin into the path the mailbox actually has"
+        );
 
         let mut provider = FakeProvider::ok();
         core.tick(&mut provider).unwrap();
         assert_eq!(
             folder_row(&core, "john:team-ideas").1,
             Some("Team/Plans".to_string())
+        );
+    }
+
+    /// T-158: a folder under a non-ASCII parent. `LIST` reported the parent
+    /// already encoded (`&BB8EQAQ+BDUEOgRCBEs-` is «Проекты»), so joining
+    /// that prefix to the new label and encoding the whole thing escaped
+    /// the prefix a second time -- `&-BB8…`, a mailbox no server has. Only
+    /// the leaf may be encoded, and `folders.remote_id` after the ACK must
+    /// be exactly the path that went out.
+    #[test]
+    fn a_rename_under_a_non_ascii_parent_encodes_only_the_leaf() {
+        let mut core = Core::memory().unwrap();
+        core.set_now(FIXTURE_NOW);
+        seed(&core);
+        seed_custom_folder(
+            &core,
+            "john:reports",
+            "&BB8EQAQ+BDUEOgRCBEs-/Reports",
+            "Reports",
+            Some("/"),
+        );
+
+        core.rename_folder(
+            &AccountId("john".into()),
+            &FolderId("john:reports".into()),
+            "Отчёты",
+        )
+        .unwrap();
+        let payload: String = core
+            .db
+            .conn()
+            .query_row(
+                "SELECT payload FROM operations WHERE op = 'rename_folder'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let destination = rename_destination(&payload).expect("a rename has a destination");
+        assert_eq!(destination, "&BB8EQAQ+BDUEOgRCBEs-/&BB4EQgRHBFEEQgRL-");
+        assert!(
+            !destination.contains("&-"),
+            "an escaped ampersand means the parent was encoded twice: {destination}"
+        );
+
+        let mut provider = FakeProvider::ok();
+        core.tick(&mut provider).unwrap();
+        assert_eq!(
+            folder_row(&core, "john:reports").1.as_deref(),
+            Some(destination.as_str()),
+            "the local id must be the mailbox the server was asked for"
+        );
+    }
+
+    /// An operation queued before T-158 changed the payload carries a
+    /// ready-made `to` and no `label`. It is still in the queue after the
+    /// upgrade -- offline work survives restarts (D29) -- and must still
+    /// settle, by the old route.
+    #[test]
+    fn a_rename_queued_with_the_old_payload_still_settles() {
+        let mut core = Core::memory().unwrap();
+        core.set_now(FIXTURE_NOW);
+        seed(&core);
+        seed_custom_folder(&core, "john:ideas", "Team/Ideas", "Plans", Some("/"));
+        core.db
+            .conn()
+            .execute(
+                "INSERT INTO operations
+                     (id, account_id, target_id, op, payload, payload_hash, created_at,
+                      retry_count, status, seq)
+                 VALUES ('rename_folder:john:john:ideas:h', 'john', 'john:ideas',
+                         'rename_folder',
+                         '{\"from\":\"Team/Ideas\",\"to\":\"Team/Plans\",\"at\":0}',
+                         'h', ?1, 0, 'pending', 1)",
+                params![FIXTURE_NOW],
+            )
+            .unwrap();
+
+        let mut provider = FakeProvider::ok();
+        assert!(matches!(
+            core.tick(&mut provider).unwrap(),
+            TickOutcome::Acked(_)
+        ));
+        assert_eq!(
+            folder_row(&core, "john:ideas").1,
+            Some("Team/Plans".to_string()),
+            "the old payload's own `to` is what identity moves to"
         );
     }
 
@@ -2511,5 +2648,210 @@ mod tests {
         let folders = core.list_folders(&AccountId("john".into())).unwrap();
         let created = folders.iter().find(|f| f.folder.id == id).unwrap();
         assert!(!created.folder.create_failed);
+    }
+
+    /// Star -> Unstar -> Star: the third command must reach the wire. The
+    /// D29 idempotency key dedups *unsent* work, not a state the user has
+    /// legitimately returned to.
+    #[test]
+    fn a_command_repeated_after_its_ack_is_queued_again() {
+        let mut core = Core::memory().unwrap();
+        core.set_now(FIXTURE_NOW);
+        seed(&core);
+        let acct = AccountId("john".into());
+        let t1 = vec![ThreadId("t1".into())];
+        let mut provider = FakeProvider::ok();
+        core.dispatch(Command::Star {
+            account_id: acct.clone(),
+            thread_ids: t1.clone(),
+        })
+        .unwrap();
+        core.tick(&mut provider).unwrap();
+        core.dispatch(Command::Unstar {
+            account_id: acct.clone(),
+            thread_ids: t1.clone(),
+        })
+        .unwrap();
+        core.tick(&mut provider).unwrap();
+        core.dispatch(Command::Star {
+            account_id: acct.clone(),
+            thread_ids: t1.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            core.queue_counts().unwrap().pending,
+            1,
+            "re-starring must queue an operation, not vanish"
+        );
+        core.tick(&mut provider).unwrap();
+        assert_eq!(
+            provider.applies.len(),
+            3,
+            "the third command must reach the provider"
+        );
+    }
+
+    /// The same rule for the flag users toggle most: read -> unread -> read.
+    #[test]
+    fn mark_read_after_mark_unread_after_an_ack_is_queued_again() {
+        let mut core = Core::memory().unwrap();
+        core.set_now(FIXTURE_NOW);
+        seed(&core);
+        let acct = AccountId("john".into());
+        let t1 = vec![ThreadId("t1".into())];
+        let mut provider = FakeProvider::ok();
+        for cmd in [
+            Command::MarkRead {
+                account_id: acct.clone(),
+                thread_ids: t1.clone(),
+            },
+            Command::MarkUnread {
+                account_id: acct.clone(),
+                thread_ids: t1.clone(),
+            },
+        ] {
+            core.dispatch(cmd).unwrap();
+            core.tick(&mut provider).unwrap();
+        }
+        core.dispatch(Command::MarkRead {
+            account_id: acct.clone(),
+            thread_ids: t1.clone(),
+        })
+        .unwrap();
+        assert_eq!(core.queue_counts().unwrap().pending, 1);
+    }
+
+    /// Two commands on one thread inside the same wall-clock second must
+    /// apply in the order the user issued them, not alphabetically by op
+    /// name.
+    #[test]
+    fn two_commands_in_one_second_apply_in_dispatch_order() {
+        let mut core = Core::memory().unwrap();
+        core.set_now(FIXTURE_NOW);
+        seed(&core);
+        let acct = AccountId("john".into());
+        let t1 = vec![ThreadId("t1".into())];
+        core.dispatch(Command::Star {
+            account_id: acct.clone(),
+            thread_ids: t1.clone(),
+        })
+        .unwrap();
+        core.dispatch(Command::Archive {
+            account_id: acct.clone(),
+            thread_ids: t1.clone(),
+        })
+        .unwrap();
+        let mut provider = FakeProvider::ok();
+        core.tick(&mut provider).unwrap();
+        core.tick(&mut provider).unwrap();
+        let kinds: Vec<OpKind> = provider.applies.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            kinds,
+            vec![OpKind::Star, OpKind::Archive],
+            "FIFO within one second, or a flag set before a move is lost"
+        );
+    }
+
+    /// The mirror case, where the alphabet points the other way
+    /// ("mark_read" > "archive"): still dispatch order, not luck.
+    #[test]
+    fn mark_read_before_archive_in_one_second_still_applies_first() {
+        let mut core = Core::memory().unwrap();
+        core.set_now(FIXTURE_NOW);
+        seed(&core);
+        let acct = AccountId("john".into());
+        let t1 = vec![ThreadId("t1".into())];
+        core.dispatch(Command::MarkRead {
+            account_id: acct.clone(),
+            thread_ids: t1.clone(),
+        })
+        .unwrap();
+        core.dispatch(Command::Archive {
+            account_id: acct.clone(),
+            thread_ids: t1.clone(),
+        })
+        .unwrap();
+        let mut provider = FakeProvider::ok();
+        core.tick(&mut provider).unwrap();
+        core.tick(&mut provider).unwrap();
+        let kinds: Vec<OpKind> = provider.applies.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, vec![OpKind::MarkRead, OpKind::Archive]);
+    }
+
+    /// T-162: a command the user issues again lands on the row the first
+    /// one wrote (D29's idempotency key) and `enqueue` revives that row in
+    /// place. It re-enters the queue *now* though, not where it stood when
+    /// it was first issued -- under the old `rowid` tie-break the revived
+    /// Star was claimed ahead of the Unstar issued between the two, so the
+    /// server ended up with the flag the user had just taken off while
+    /// SQLite showed it set.
+    #[test]
+    fn a_revived_operation_applies_after_the_commands_issued_before_it() {
+        let mut core = Core::memory().unwrap();
+        core.set_now(FIXTURE_NOW);
+        seed(&core);
+        let acct = AccountId("john".into());
+        let t1 = vec![ThreadId("t1".into())];
+        let mut provider = FakeProvider::ok();
+
+        core.dispatch(Command::Star {
+            account_id: acct.clone(),
+            thread_ids: t1.clone(),
+        })
+        .unwrap();
+        core.tick(&mut provider).unwrap();
+
+        // Same second, so `created_at` ties on all three and the tie-break
+        // is the whole question.
+        core.dispatch(Command::Unstar {
+            account_id: acct.clone(),
+            thread_ids: t1.clone(),
+        })
+        .unwrap();
+        core.dispatch(Command::Star {
+            account_id: acct.clone(),
+            thread_ids: t1.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            core.queue_counts().unwrap().pending,
+            2,
+            "precondition: the second Star revived the acked row, it did not \
+             open a third one"
+        );
+
+        core.tick(&mut provider).unwrap();
+        core.tick(&mut provider).unwrap();
+
+        let kinds: Vec<OpKind> = provider.applies.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            kinds,
+            vec![OpKind::Star, OpKind::Unstar, OpKind::Star],
+            "the revived Star goes out after the Unstar issued before it, or \
+             the last state the user asked for is not the one the server keeps"
+        );
+    }
+
+    /// The regression that reviving `acked` rows is most likely to cause:
+    /// D29 must still collapse the *same unsent* command into one operation.
+    #[test]
+    fn the_same_command_twice_before_any_tick_is_still_one_operation() {
+        let mut core = Core::memory().unwrap();
+        core.set_now(FIXTURE_NOW);
+        seed(&core);
+        let acct = AccountId("john".into());
+        let t1 = vec![ThreadId("t1".into())];
+        for _ in 0..2 {
+            core.dispatch(Command::Star {
+                account_id: acct.clone(),
+                thread_ids: t1.clone(),
+            })
+            .unwrap();
+        }
+        assert_eq!(core.queue_counts().unwrap().pending, 1);
+        let mut provider = FakeProvider::ok();
+        core.tick(&mut provider).unwrap();
+        assert_eq!(core.tick(&mut provider).unwrap(), TickOutcome::Idle);
+        assert_eq!(provider.applies.len(), 1);
     }
 }

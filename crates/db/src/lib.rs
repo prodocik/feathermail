@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 /// Schema version written by [`Database::open`].
-pub const SCHEMA_VERSION: i32 = 27;
+pub const SCHEMA_VERSION: i32 = 29;
 
 /// Inbox page query. T-005/D15 require its folder-local index even when
 /// another account-wide ordering index exists for FTS search, so the SQL pins
@@ -149,10 +149,46 @@ impl Database {
         self.conn.pragma_update(None, "foreign_keys", "ON")?;
         self.conn.pragma_update(None, "busy_timeout", 5000)?;
         if wal {
-            self.conn.pragma_update(None, "journal_mode", "WAL")?;
+            self.enable_wal()?;
             self.conn.pragma_update(None, "synchronous", "NORMAL")?;
         }
         Ok(())
+    }
+
+    /// Switch the file to WAL, tolerating a concurrent opener doing the same.
+    ///
+    /// `PRAGMA journal_mode = WAL` on a file that is not in WAL yet needs
+    /// an exclusive lock, and SQLite answers `SQLITE_BUSY` at once without
+    /// consulting the busy handler, so `busy_timeout` does not help here.
+    /// Two `Database::open` racing on a fresh profile (the GUI starting
+    /// while an agent spawns the stdio MCP server, or the worker's
+    /// per-connect `Core::open`) would otherwise lose one of them with
+    /// "database is locked" -- and the shell then quietly falls back to an
+    /// ephemeral in-memory session. Retry with a growing pause, and accept
+    /// the file already being in WAL: whoever won switched it for everyone.
+    /// A file that is in WAL already never takes the lock, so the steady
+    /// state costs nothing.
+    fn enable_wal(&self) -> Result<()> {
+        const ATTEMPTS: u32 = 8;
+        let mut last_err = None;
+        for attempt in 0..ATTEMPTS {
+            match self.conn.pragma_update(None, "journal_mode", "WAL") {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    let mode: String = self
+                        .conn
+                        .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+                    if mode.eq_ignore_ascii_case("wal") {
+                        return Ok(());
+                    }
+                    last_err = Some(err);
+                    // 10 ms, 20, 40, ... 1280: about 2.5 s in total, well
+                    // inside the 5 s `busy_timeout` the rest of open uses.
+                    std::thread::sleep(std::time::Duration::from_millis(10 << attempt));
+                }
+            }
+        }
+        Err(last_err.expect("at least one attempt was made").into())
     }
 
     fn migrate(&self) -> Result<()> {
@@ -630,9 +666,76 @@ impl Database {
                 [],
             )?;
         }
+        if current < 28 {
+            // Two `REFERENCES` clauses were the only ones in this schema
+            // left at the SQL default, `NO ACTION`: `drafts.thread_id` and
+            // `outbox.draft_id`. Both named a parent that ordinary use
+            // deletes underneath them, so both turned a routine delete into
+            // `FOREIGN KEY constraint failed`:
+            //
+            //  * sync deletes threads (a UIDVALIDITY reset, the last
+            //    message of a thread vanishing on the server, a duplicate
+            //    being folded away). One reply draft was enough to roll the
+            //    whole sync transaction back -- deterministically, on every
+            //    later poll, so the folder never synced again.
+            //  * `Core::delete_draft` deletes a draft that has already been
+            //    handed to the outbox. The discard came back "Couldn't save
+            //    that change." and the row could never be removed.
+            //
+            // Both become `ON DELETE SET NULL` (see schema.sql for why that
+            // and not CASCADE: a draft is the owner's own text, and an
+            // outbox row is a frozen snapshot per T-041/T-045 -- neither
+            // may ride its parent out). Like the v5 `folders` rebuild this
+            // is not additive: SQLite cannot alter a foreign key in place,
+            // so the tables are copied, dropped and renamed, and for the
+            // same reason as there the rebuild is entered only when the
+            // stored table text says it is needed -- a brand new profile
+            // already got the right shape from `schema.sql`, and rebuilding
+            // it anyway would quietly promote this Rust copy to the real
+            // definition of both tables.
+            if draft_links_lack_on_delete_set_null(&self.conn)? {
+                rebuild_draft_links_for_v28(&self.conn)?;
+            }
+        }
+        if current < 29 {
+            // Three additive changes that share one version bump.
+            //
+            // T-157: `sync_state.resync_cursor` / `resync_completed_at` --
+            // the rolling reconciliation walk that finally lets a message
+            // deleted below the newest window disappear locally on a
+            // CONDSTORE server too (schema.sql carries the argument). Both
+            // are NULL on every existing row, which is the honest state:
+            // "no walk has started, and none has ever finished", so the
+            // first pass after the upgrade starts one.
+            add_column_if_missing(&self.conn, "sync_state", "resync_cursor", "INTEGER")?;
+            add_column_if_missing(&self.conn, "sync_state", "resync_completed_at", "INTEGER")?;
+            // T-162: `operations.seq`. Existing rows are backfilled from
+            // `rowid`, which is exactly the order they were inserted in and
+            // therefore the order `claim_next` was already applying them in
+            // -- the upgrade changes nothing about a queue that is already
+            // drained, and everything about the next revive.
+            add_column_if_missing(&self.conn, "operations", "seq", "INTEGER")?;
+            self.conn
+                .execute("UPDATE operations SET seq = rowid WHERE seq IS NULL", [])?;
+            // T-155: the FTS text normalisation changed, so every row
+            // `messages_fts` already holds answers a different set of
+            // queries than a row indexed today. Same move as the v9 and
+            // v23 blocks above, one difference: *every* message is
+            // re-queued, not only those with a cached body. Normalisation
+            // applies to the subject and the addresses as well, and those
+            // are indexed for a message whose body was never downloaded --
+            // filtering on `body_path` here would leave exactly that mail
+            // findable only by the old rules, with nothing to tell the
+            // owner which half of the mailbox that is.
+            self.conn.execute(
+                "INSERT OR IGNORE INTO fts_pending (message_id, queued_at)
+                 SELECT id, strftime('%s','now') FROM messages",
+                [],
+            )?;
+        }
         if current < SCHEMA_VERSION {
             self.conn.execute(
-                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
                 [SCHEMA_VERSION],
             )?;
         }
@@ -650,6 +753,30 @@ impl Database {
     pub fn immediate_transaction(&mut self) -> rusqlite::Result<Transaction<'_>> {
         self.conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
+    }
+
+    /// Same write transaction through a shared borrow, for the many Core
+    /// doorways that only hold `&Database`.
+    ///
+    /// Needed because `busy_timeout` does not cover the DEFERRED
+    /// read-then-write shape under WAL: once such a transaction has taken a
+    /// read snapshot, a competing commit makes the upgrade to a write fail
+    /// with `SQLITE_BUSY_SNAPSHOT` (extended code 517) *immediately* -- the
+    /// busy handler is never consulted, so the 5 s timeout D13 configures
+    /// buys nothing. Beginning IMMEDIATE takes the write lock before the
+    /// first read, which is a case `busy_timeout` does cover.
+    ///
+    /// `Transaction::new_unchecked` is what makes the shared borrow legal;
+    /// the `&mut self` on [`Self::immediate_transaction`] is only rusqlite's
+    /// compile-time guard against nesting. Nesting here is a runtime error
+    /// ("cannot start a transaction within a transaction") instead, so use
+    /// this only where no transaction is already open on the handle.
+    ///
+    /// Not a blanket replacement: IMMEDIATE holds the write lock for the
+    /// whole transaction, so read-only paths (search, list) must stay
+    /// DEFERRED rather than block every writer for the length of a SELECT.
+    pub fn immediate_transaction_ref(&self) -> rusqlite::Result<Transaction<'_>> {
+        Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
     }
 
     pub fn schema_version(&self) -> Result<i32> {
@@ -851,6 +978,151 @@ fn rebuild_folders_table_for_v5(conn: &Connection) -> Result<()> {
     // Whether the closure above committed or bailed out early (rolling the
     // transaction back via `Transaction::drop`), foreign key enforcement
     // must be restored either way.
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    outcome
+}
+
+/// Do `drafts.thread_id` and `outbox.draft_id` still point at their parents
+/// with a bare `REFERENCES` (i.e. `NO ACTION`)?
+///
+/// Read off `sqlite_master`'s stored `CREATE TABLE` text for the same
+/// reason [`folders_has_legacy_unique`] does: `schema_migrations` records
+/// which migrations ran, this says what the tables actually look like right
+/// now, which is the only thing the rebuild below cares about. A profile
+/// created from today's `schema.sql` already has both clauses and must be
+/// left alone.
+fn draft_links_lack_on_delete_set_null(conn: &Connection) -> Result<bool> {
+    const EXPECTED: [(&str, &str); 2] = [
+        (
+            "drafts",
+            "thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL",
+        ),
+        (
+            "outbox",
+            "draft_id TEXT REFERENCES drafts(id) ON DELETE SET NULL",
+        ),
+    ];
+    for (table, clause) in EXPECTED {
+        let sql: String = conn.query_row(
+            "SELECT COALESCE(\
+               (SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1), '')",
+            [table],
+            |row| row.get(0),
+        )?;
+        let normalised = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !normalised.contains(clause) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// v27 -> v28: rebuilds `drafts` and `outbox` so their one non-cascading
+/// foreign key each becomes `ON DELETE SET NULL` (see the `current < 28`
+/// call site for what that fixes).
+///
+/// Follows [`rebuild_folders_table_for_v5`] step for step, including why it
+/// is safe with `foreign_keys = ON` in force everywhere else (D13): the
+/// pragma is switched off for the duration, so dropping a table other rows
+/// still reference is allowed and -- crucially -- `DROP TABLE` does not run
+/// the implicit `DELETE FROM` that would cascade `draft_attachments` away
+/// with its parent. `draft_attachments.draft_id` and
+/// `outbox_attachments.outbox_id` keep their unedited `REFERENCES drafts(id)`
+/// / `REFERENCES outbox(id)` text, which points at whatever table answers to
+/// that name -- the old one before the rename, the rebuilt one after it.
+/// `PRAGMA foreign_key_check` on exactly the four tables involved proves
+/// that before the transaction commits; it is deliberately scoped rather
+/// than whole-database, so an unrelated pre-existing violation somewhere
+/// else in an old profile cannot turn this into a database that refuses to
+/// open at all.
+fn rebuild_draft_links_for_v28(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let outcome = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        // A profile that enforced NO ACTION cannot hold a draft pointing at
+        // a thread that is already gone -- but one whose `drafts` table
+        // predates the `REFERENCES` clause entirely (v13 and older) can.
+        // Such a pointer is exactly what the new rule would have nulled at
+        // deletion time, so null it now instead of letting
+        // `foreign_key_check` reject the upgrade.
+        tx.execute(
+            "UPDATE drafts SET thread_id = NULL WHERE thread_id IS NOT NULL \
+             AND thread_id NOT IN (SELECT id FROM threads)",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE outbox SET draft_id = NULL WHERE draft_id IS NOT NULL \
+             AND draft_id NOT IN (SELECT id FROM drafts)",
+            [],
+        )?;
+        tx.execute_batch(
+            "CREATE TABLE drafts_new (
+                 id TEXT PRIMARY KEY,
+                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL,
+                 in_reply_to TEXT,
+                 from_addr TEXT NOT NULL,
+                 to_addr TEXT NOT NULL DEFAULT '',
+                 cc TEXT NOT NULL DEFAULT '',
+                 bcc TEXT NOT NULL DEFAULT '',
+                 subject TEXT NOT NULL DEFAULT '',
+                 body TEXT NOT NULL DEFAULT '',
+                 updated_at INTEGER NOT NULL,
+                 remote_uid INTEGER,
+                 sync_revision INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO drafts_new (id, account_id, thread_id, in_reply_to, from_addr,
+                 to_addr, cc, bcc, subject, body, updated_at, remote_uid, sync_revision)
+                 SELECT id, account_id, thread_id, in_reply_to, from_addr,
+                     to_addr, cc, bcc, subject, body, updated_at, remote_uid, sync_revision
+                 FROM drafts;
+             DROP TABLE drafts;
+             ALTER TABLE drafts_new RENAME TO drafts;
+             CREATE TABLE outbox_new (
+                 id TEXT PRIMARY KEY,
+                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                 draft_id TEXT REFERENCES drafts(id) ON DELETE SET NULL,
+                 from_addr TEXT NOT NULL DEFAULT '',
+                 to_addr TEXT NOT NULL,
+                 cc TEXT NOT NULL DEFAULT '',
+                 bcc TEXT NOT NULL DEFAULT '',
+                 subject TEXT NOT NULL DEFAULT '',
+                 body TEXT NOT NULL DEFAULT '',
+                 in_reply_to TEXT,
+                 references_header TEXT,
+                 created_at INTEGER NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'queued',
+                 sent_at INTEGER
+             );
+             INSERT INTO outbox_new (id, account_id, draft_id, from_addr, to_addr, cc, bcc,
+                 subject, body, in_reply_to, references_header, created_at, status, sent_at)
+                 SELECT id, account_id, draft_id, from_addr, to_addr, cc, bcc,
+                     subject, body, in_reply_to, references_header, created_at, status, sent_at
+                 FROM outbox;
+             DROP TABLE outbox;
+             ALTER TABLE outbox_new RENAME TO outbox;
+             CREATE INDEX IF NOT EXISTS outbox_account_status ON outbox (account_id, status);",
+        )?;
+        for table in [
+            "drafts",
+            "draft_attachments",
+            "outbox",
+            "outbox_attachments",
+        ] {
+            let mut stmt = tx.prepare(&format!("PRAGMA foreign_key_check({table})"))?;
+            let mut rows = stmt.query([])?;
+            if rows.next()?.is_some() {
+                return Err(Error::Migration(format!(
+                    "v28 draft-link rebuild left a dangling foreign key in `{table}` \
+                     (see rebuild_draft_links_for_v28)"
+                )));
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    })();
+    // Committed or bailed out early (rolling back via `Transaction::drop`),
+    // foreign key enforcement must be restored either way.
     conn.pragma_update(None, "foreign_keys", "ON")?;
     outcome
 }
@@ -4054,13 +4326,16 @@ CREATE INDEX IF NOT EXISTS fts_pending_queued_at ON fts_pending (queued_at);
     /// (see the `current < 9` migration block's doc comment). Without this
     /// re-queue, a message synced before T-093 landed would stay
     /// findable only by header/boundary noise forever, since nothing else
-    /// ever revisits an already-indexed row. A message with no cached body
-    /// must NOT be queued -- it indexes to an empty string either way (see
-    /// `body_text_for_index` in `feathermail-core`), so queuing it here
-    /// would just be wasted indexer work, not a correctness fix -- this is
-    /// the regression this test exists to catch by name.
+    /// ever revisits an already-indexed row.
+    ///
+    /// The v9 statement itself is still gated on `body_path IS NOT NULL`
+    /// (a body-less message indexes to an empty body either way, so queuing
+    /// it there would be wasted indexer work). What the *queue* holds after
+    /// this open is a different question: a profile this old walks every
+    /// later block too, and v29's re-normalisation re-queues every message
+    /// including the body-less one, so both ids are expected below.
     #[test]
-    fn migrate_upgrades_v8_profile_to_v9_backfilling_only_messages_with_a_cached_body() {
+    fn migrate_upgrades_v8_profile_to_v9_backfilling_the_stale_index_queue() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mail.db");
         {
@@ -4107,8 +4382,9 @@ CREATE INDEX IF NOT EXISTS fts_pending_queued_at ON fts_pending (queued_at);
         };
         assert_eq!(
             pending,
-            vec!["m1".to_string()],
-            "only the message with a cached body must be re-queued for indexing"
+            vec!["m1".to_string(), "m2".to_string()],
+            "v9 re-queues the cached body; v29, which this profile also \
+             walks, re-queues the rest of the index with it"
         );
 
         let migrations_after_first_open: i32 = db
@@ -4128,7 +4404,7 @@ CREATE INDEX IF NOT EXISTS fts_pending_queued_at ON fts_pending (queued_at);
             .conn
             .query_row("SELECT COUNT(*) FROM fts_pending", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(pending_after_reopen, 1);
+        assert_eq!(pending_after_reopen, 2);
         let migrations_after_second_open: i32 = db2
             .conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
@@ -4402,8 +4678,15 @@ CREATE INDEX IF NOT EXISTS fts_pending_queued_at ON fts_pending (queued_at);
     /// stamping `schema_migrations` back to 22, which is faithful precisely
     /// because v23 adds no DDL at all: a real v22 profile's structure is
     /// byte-for-byte this one's (see `schema.sql`'s T-096 note).
+    ///
+    /// The v23 statement is gated on `body_path IS NOT NULL` -- a message
+    /// with no body on disk has no words to become findable by. The queue
+    /// this test reads afterwards holds more than that: a v22 profile also
+    /// walks v29, whose re-normalisation re-queues the whole index (see
+    /// `schema.sql`'s T-155 note), so the body-less message is expected in
+    /// it too.
     #[test]
-    fn migrate_upgrades_v22_profile_to_v23_requeueing_only_messages_with_a_cached_body() {
+    fn migrate_upgrades_v22_profile_to_v23_requeueing_the_stale_html_index() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mail.db");
         {
@@ -4440,8 +4723,9 @@ CREATE INDEX IF NOT EXISTS fts_pending_queued_at ON fts_pending (queued_at);
             .collect();
         assert_eq!(
             queued,
-            vec!["m1".to_string()],
-            "only a message whose body is actually on disk is worth re-indexing"
+            vec!["m1".to_string(), "m2".to_string()],
+            "v23 re-queues the message whose body is on disk; v29, which \
+             this profile also walks, re-queues the whole index with it"
         );
 
         // Idempotent: a second open must not re-run the backfill, and the
@@ -4453,7 +4737,7 @@ CREATE INDEX IF NOT EXISTS fts_pending_queued_at ON fts_pending (queued_at);
             .conn
             .query_row("SELECT COUNT(*) FROM fts_pending", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
     }
 
     /// T-111: a v24 profile gains `attachments.cache_bytes` and keeps
@@ -4577,6 +4861,596 @@ CREATE INDEX IF NOT EXISTS fts_pending_queued_at ON fts_pending (queued_at);
             "a new profile must keep schema.sql's own folders table, not one \
              the v5 rebuild wrote"
         );
+    }
+
+    /// v28: a real pre-v28 profile (today's `schema.sql` with the two
+    /// `ON DELETE SET NULL` clauses taken back out -- the only difference
+    /// v27 had) upgrades in place. `drafts` and `outbox` are rebuilt, every
+    /// row survives with its links intact, and the deletes that used to
+    /// fail with `FOREIGN KEY constraint failed` now go through: the thread
+    /// drops and leaves the reply draft behind with a NULL `thread_id`, and
+    /// the already-queued draft can finally be discarded while its frozen
+    /// outbox snapshot stays.
+    #[test]
+    fn migrate_upgrades_v27_profile_to_v28_relaxing_the_draft_links_preserving_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mail.db");
+        let v27_schema = include_str!("schema.sql")
+            .replace(
+                "thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL",
+                "thread_id TEXT REFERENCES threads(id)",
+            )
+            .replace(
+                "draft_id TEXT REFERENCES drafts(id) ON DELETE SET NULL",
+                "draft_id TEXT REFERENCES drafts(id)",
+            );
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&v27_schema).unwrap();
+            conn.execute_batch(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (27, 1000);
+                 INSERT INTO accounts (id, name, email, provider, created_at, updated_at)
+                     VALUES ('john', 'John Doe', 'john@example.com', 'generic', 1000, 1000);
+                 INSERT INTO folders (id, account_id, remote_id, name, kind)
+                     VALUES ('inbox', 'john', 'INBOX', 'Inbox', 'inbox');
+                 INSERT INTO threads (id, account_id, folder_id, subject, snippet, date)
+                     VALUES ('t1', 'john', 'inbox', 'Hi', 'Hi', 1000);
+                 INSERT INTO drafts (id, account_id, thread_id, in_reply_to, from_addr,
+                     to_addr, subject, body, updated_at, sync_revision)
+                     VALUES ('draft:john:1', 'john', 't1', '<orig@example.com>',
+                         'john@example.com', 'jane@example.com', 'Re: Hi', 'text', 1000, 3);
+                 INSERT INTO draft_attachments (id, account_id, draft_id, filename, size_bytes,
+                     source_path)
+                     VALUES ('att:1', 'john', 'draft:john:1', 'a.pdf', 12, '/tmp/a.pdf');
+                 INSERT INTO drafts (id, account_id, from_addr, to_addr, updated_at)
+                     VALUES ('draft:john:2', 'john', 'john@example.com', 'jane@example.com', 1000);
+                 INSERT INTO outbox (id, account_id, draft_id, to_addr, subject, created_at, status)
+                     VALUES ('out:1', 'john', 'draft:john:2', 'jane@example.com', 'Sent', 1000, 'sent');
+                 INSERT INTO outbox_attachments (outbox_id, filename, size_bytes, source_path)
+                     VALUES ('out:1', 'a.pdf', 12, '/tmp/a.pdf');",
+            )
+            .unwrap();
+
+            // Sanity: this really is the old shape, not a fixture that
+            // already matches v28. Matched against the column definition
+            // itself -- schema.sql's comment above that column names the
+            // clause too, and sqlite_master stores comments verbatim.
+            let drafts_sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = 'drafts'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!drafts_sql.contains("REFERENCES threads(id) ON DELETE SET NULL"));
+        }
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+
+        // Nothing was lost by the copy-drop-rename, including the child
+        // rows whose FK briefly pointed at a table that did not exist.
+        let (thread_id, in_reply_to, subject, revision): (Option<String>, String, String, i64) = db
+            .conn
+            .query_row(
+                "SELECT thread_id, in_reply_to, subject, sync_revision FROM drafts \
+                 WHERE id = 'draft:john:1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(thread_id.as_deref(), Some("t1"));
+        assert_eq!(
+            (in_reply_to.as_str(), subject.as_str(), revision),
+            ("<orig@example.com>", "Re: Hi", 3)
+        );
+        let attachments: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM draft_attachments", [], |r| r.get(0))
+            .unwrap();
+        let outbox_attachments: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM outbox_attachments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((attachments, outbox_attachments), (1, 1));
+
+        // The two deletes that used to be impossible.
+        db.conn
+            .execute("DELETE FROM threads WHERE id = 't1'", [])
+            .expect("a folder reset must be able to drop its threads");
+        let orphaned: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT thread_id FROM drafts WHERE id = 'draft:john:1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphaned, None, "the draft survives its thread");
+        db.conn
+            .execute("DELETE FROM drafts WHERE id = 'draft:john:2'", [])
+            .expect("a sent draft must still be discardable");
+        let snapshot: (Option<String>, String) = db
+            .conn
+            .query_row(
+                "SELECT draft_id, subject FROM outbox WHERE id = 'out:1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot,
+            (None, "Sent".to_string()),
+            "the frozen outbox snapshot outlives the draft it came from"
+        );
+
+        // Reopening is idempotent: the rebuild is gated on the stored table
+        // text, so an already-current profile does not go through it again.
+        drop(db);
+        let db2 = Database::open(&path).unwrap();
+        assert!(!draft_links_lack_on_delete_set_null(&db2.conn).unwrap());
+        let drafts: i64 = db2
+            .conn
+            .query_row("SELECT COUNT(*) FROM drafts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(drafts, 1);
+    }
+
+    /// The v28 rebuild writes a Rust copy of `drafts`/`outbox`, so -- same
+    /// hazard as the v5 `folders` rebuild -- a brand new profile must keep
+    /// the tables `schema.sql` itself declared, or the next column added
+    /// there would silently exist only on upgraded profiles.
+    #[test]
+    fn a_fresh_profile_keeps_schema_sqls_own_draft_tables() {
+        let db = Database::memory().unwrap();
+        let schema = include_str!("schema.sql");
+        for table in ["drafts", "outbox"] {
+            let sql: String = db
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let start = schema
+                .find(&format!("CREATE TABLE IF NOT EXISTS {table} ("))
+                .expect("schema.sql declares the table");
+            let end = start + schema[start..].find("\n);").expect("the block ends") + 2;
+            let expected = schema[start..end].replace("IF NOT EXISTS ", "");
+            assert_eq!(
+                sql.trim(),
+                expected.trim(),
+                "a new profile must keep schema.sql's own {table} table, not one \
+                 the v28 rebuild wrote"
+            );
+        }
+    }
+
+    /// v29: a real pre-v29 profile (today's `schema.sql` with the three new
+    /// columns taken back out) upgrades in place, additively. All three
+    /// halves of the version are checked at once because they ship as one
+    /// migration: the reconciliation cursor starts NULL ("no walk yet"),
+    /// every existing operation gets the `seq` its rowid already implied,
+    /// and every message -- body cached or not -- is re-queued for the
+    /// re-normalised FTS index.
+    #[test]
+    fn migrate_upgrades_v28_profile_to_v29_adding_the_cursor_seq_and_reindex_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mail.db");
+        // Only the column declarations are removed; the doc comments above
+        // them stay in the fixture text and are inert -- SQLite keeps them
+        // verbatim in `sqlite_master`, and nothing here reads that.
+        let v28_schema = include_str!("schema.sql")
+            .replace(
+                "    resync_cursor INTEGER,\n    resync_completed_at INTEGER,\n",
+                "",
+            )
+            .replace("    seq INTEGER,\n", "");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&v28_schema).unwrap();
+            conn.execute_batch(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (28, 1000);
+                 INSERT INTO accounts (id, name, email, provider, created_at, updated_at)
+                     VALUES ('john', 'John Doe', 'john@example.com', 'generic', 1000, 1000);
+                 INSERT INTO folders (id, account_id, remote_id, name, kind)
+                     VALUES ('inbox', 'john', 'INBOX', 'Inbox', 'inbox');
+                 INSERT INTO sync_state (account_id, folder_id, uidvalidity, uidnext, last_sync_at)
+                     VALUES ('john', 'inbox', 7, 900, 1000);
+                 INSERT INTO threads (id, account_id, folder_id, subject, snippet, date)
+                     VALUES ('t1', 'john', 'inbox', 'Hi', 'Hi', 1000);
+                 INSERT INTO messages (id, account_id, thread_id, folder_id, date, body_path)
+                     VALUES ('m:cached', 'john', 't1', 'inbox', 1000, '/tmp/m1');
+                 INSERT INTO messages (id, account_id, thread_id, folder_id, date)
+                     VALUES ('m:headers-only', 'john', 't1', 'inbox', 1000);
+                 INSERT INTO operations (id, account_id, target_id, op, payload_hash, created_at)
+                     VALUES ('star:john:t1:a', 'john', 't1', 'star', 'a', 1000);
+                 INSERT INTO operations (id, account_id, target_id, op, payload_hash, created_at)
+                     VALUES ('archive:john:t1:b', 'john', 't1', 'archive', 'b', 1000);",
+            )
+            .unwrap();
+            // Sanity: this really is the old shape, not a fixture that
+            // already matches v29.
+            for (table, column) in [
+                ("sync_state", "resync_cursor"),
+                ("sync_state", "resync_completed_at"),
+                ("operations", "seq"),
+            ] {
+                let mut stmt = conn
+                    .prepare(&format!("PRAGMA table_info({table})"))
+                    .unwrap();
+                let present = stmt
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .unwrap()
+                    .filter_map(std::result::Result::ok)
+                    .any(|name| name == column);
+                assert!(!present, "fixture must predate {table}.{column}");
+            }
+        }
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+
+        // T-157: the cursor and its completion stamp start NULL, which is
+        // the honest "no walk has started and none has finished" -- the
+        // first pass after the upgrade opens a circle.
+        let cursor: (Option<i64>, Option<i64>) = db
+            .conn
+            .query_row(
+                "SELECT resync_cursor, resync_completed_at FROM sync_state \
+                 WHERE account_id = 'john' AND folder_id = 'inbox'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cursor, (None, None));
+        // The rest of the row is untouched by an additive migration.
+        let uidnext: i64 = db
+            .conn
+            .query_row(
+                "SELECT uidnext FROM sync_state WHERE folder_id = 'inbox'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(uidnext, 900);
+
+        // T-162: `seq` is backfilled from `rowid`, i.e. the insert order
+        // `claim_next` was already applying these two in.
+        let seqs: Vec<(String, i64)> = db
+            .conn
+            .prepare("SELECT id, seq FROM operations ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            seqs,
+            vec![
+                ("star:john:t1:a".to_string(), 1),
+                ("archive:john:t1:b".to_string(), 2)
+            ],
+            "an upgraded queue keeps the order it already had"
+        );
+
+        // T-155: every message is re-queued, including the one whose body
+        // was never downloaded -- its subject and addresses are indexed
+        // too, and the normalisation changed for those as well.
+        let queued: Vec<String> = db
+            .conn
+            .prepare("SELECT message_id FROM fts_pending ORDER BY message_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            queued,
+            vec!["m:cached".to_string(), "m:headers-only".to_string()]
+        );
+
+        // Reopening an already-current profile re-runs nothing: no second
+        // queue entry, and no `seq` handed out again.
+        drop(db);
+        let db2 = Database::open(&path).unwrap();
+        assert_eq!(db2.schema_version().unwrap(), SCHEMA_VERSION);
+        let pending: i64 = db2
+            .conn
+            .query_row("SELECT COUNT(*) FROM fts_pending", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 2);
+    }
+
+    /// Seeds one account + folder so the FK-shape tests below have parents.
+    fn seed_account_and_folder(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO accounts (id, name, email, provider, status, download_policy, \
+             created_at, updated_at) VALUES ('a', 'A', 'a@example.test', 'imap', 'online', \
+             'recent', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO folders (id, account_id, remote_id, name, kind) \
+             VALUES ('f', 'a', 'INBOX', 'Inbox', 'inbox')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// v28: sync deletes threads all the time -- a UIDVALIDITY reset, the
+    /// last message of a thread vanishing on the server -- and a reply
+    /// draft pointing at one used to make that `FOREIGN KEY constraint
+    /// failed`, rolling the whole sync transaction back on every later
+    /// poll. The thread goes, the owner's text stays.
+    #[test]
+    fn deleting_a_thread_keeps_the_reply_draft_that_pointed_at_it() {
+        let db = Database::memory().unwrap();
+        let conn = db.conn();
+        seed_account_and_folder(conn);
+        conn.execute(
+            "INSERT INTO threads (id, account_id, folder_id, subject, date) \
+             VALUES ('t', 'a', 'f', 'subject', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO drafts (id, account_id, thread_id, from_addr, updated_at) \
+             VALUES ('d', 'a', 't', 'me@example.test', 0)",
+            [],
+        )
+        .unwrap();
+        // The exact statement CoreSyncStore::reset_folder runs on a
+        // UIDVALIDITY change (crates/core/src/sync_store.rs).
+        let deleted = conn.execute(
+            "DELETE FROM threads WHERE account_id = ?1 AND folder_id = ?2",
+            rusqlite::params!["a", "f"],
+        );
+        assert!(
+            deleted.is_ok(),
+            "a folder reset must be able to drop its threads while a draft \
+             still references one: {:?}",
+            deleted.err()
+        );
+        let threads: i64 = conn
+            .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
+            .unwrap();
+        let drafts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM drafts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(threads, 0);
+        assert_eq!(drafts, 1, "the local draft must survive the thread");
+    }
+
+    /// v28: an outbox row is a frozen snapshot (T-041/T-045) that never
+    /// reads its draft again, so its `draft_id` must not be able to pin
+    /// that draft in place forever -- `Core::delete_draft` used to fail
+    /// with `FOREIGN KEY constraint failed` for anything already sent.
+    #[test]
+    fn deleting_a_draft_that_was_already_queued_for_send_is_allowed() {
+        let db = Database::memory().unwrap();
+        let conn = db.conn();
+        seed_account_and_folder(conn);
+        conn.execute(
+            "INSERT INTO drafts (id, account_id, from_addr, to_addr, updated_at) \
+             VALUES ('d', 'a', 'me@example.test', 'you@example.test', 0)",
+            [],
+        )
+        .unwrap();
+        // The frozen snapshot Core::queue_draft_send_in writes.
+        conn.execute(
+            "INSERT INTO outbox (id, account_id, draft_id, to_addr, created_at) \
+             VALUES ('outbox:d:0', 'a', 'd', 'you@example.test', 0)",
+            [],
+        )
+        .unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM drafts WHERE account_id = ?1 AND id = ?2",
+            rusqlite::params!["a", "d"],
+        );
+        assert!(
+            deleted.is_ok(),
+            "Core::delete_draft must still discard a draft whose outbox \
+             snapshot exists: {:?}",
+            deleted.err()
+        );
+        let drafts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM drafts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(drafts, 0);
+    }
+
+    /// D13 configures `busy_timeout`, but that only helps a transaction
+    /// that takes its write lock up front. A DEFERRED transaction which
+    /// reads first and writes later loses its upgrade to
+    /// `SQLITE_BUSY_SNAPSHOT` the instant a competitor commits underneath
+    /// it -- immediately, with the busy handler never consulted, so the
+    /// five second timeout buys nothing there. `immediate_transaction_ref`
+    /// is the shape that does wait, and this is the guard on that: a
+    /// competing writer holds the lock, our writer blocks until it commits,
+    /// then reads what the competitor wrote and finishes on top of it.
+    #[test]
+    fn an_immediate_transaction_waits_out_a_competing_writer() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        const HOLD: Duration = Duration::from_millis(150);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mail.db");
+        let ours = Database::open(&path).unwrap();
+        ours.conn()
+            .execute("INSERT INTO settings (key, value) VALUES ('k', '1')", [])
+            .unwrap();
+
+        let (locked, lock_held) = mpsc::channel();
+        let competitor_path = path.clone();
+        let competitor = std::thread::spawn(move || {
+            let theirs = Database::open(&competitor_path).unwrap();
+            let tx = theirs.immediate_transaction_ref().unwrap();
+            tx.execute("UPDATE settings SET value = '2' WHERE key = 'k'", [])
+                .unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(HOLD);
+            tx.commit().unwrap();
+        });
+        lock_held.recv().unwrap();
+
+        let start = Instant::now();
+        let tx = ours
+            .immediate_transaction_ref()
+            .expect("a competing writer must be waited out, not reported as an error");
+        let seen: String = tx
+            .query_row("SELECT value FROM settings WHERE key = 'k'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        tx.execute("UPDATE settings SET value = '3' WHERE key = 'k'", [])
+            .unwrap();
+        tx.commit().unwrap();
+        let waited = start.elapsed();
+        competitor.join().unwrap();
+
+        assert!(
+            waited >= HOLD / 2,
+            "the writer returned after {waited:?} without ever blocking, so the \
+             competitor's lock was not actually held"
+        );
+        assert_eq!(
+            seen, "2",
+            "the waiting writer must read what the competitor committed, not a \
+             snapshot from before it"
+        );
+        let final_value: String = ours
+            .conn()
+            .query_row("SELECT value FROM settings WHERE key = 'k'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(final_value, "3");
+    }
+
+    // What `tokenize = 'unicode61'` in schema.sql does with text that has
+    // no word separators, and what T-155 does about it.
+    //
+    // Left to itself, `unicode61` glues a whole CJK run into one token and
+    // keeps Cyrillic "ё" apart from "е", which made a word inside a
+    // Japanese sentence and the query `счет` unreachable through the
+    // exact-phrase MATCH `Core::search` issues (D54). T-155 did *not*
+    // change the tokenizer (no new schema version, no reindex, no trigram):
+    // it normalizes the text on both sides instead --
+    // `feathermail_search::fts_text`, applied by `index_one` before the
+    // INSERT and by `escape_fts_literal` before the MATCH.
+    //
+    // These two tests are what that strategy rests on at the schema layer:
+    // given the normalized spelling, `unicode61` really does find the word.
+    // The normalized literals below are written out by hand rather than
+    // produced by `fts_text`, because `scripts/check-layering.sh`
+    // (`require_no_feathermail_deps db`) forbids this crate from depending
+    // on `feathermail-search` -- the schema is the bottom of the stack. The
+    // end-to-end coverage, where both sides genuinely share one function,
+    // lives in `crates/core/src/search.rs`
+    // (`a_word_inside_a_cjk_body_is_found_by_that_word`,
+    // `a_cyrillic_yo_message_is_found_whether_the_user_types_yo_or_ye`).
+    #[test]
+    fn unicode61_finds_a_cjk_word_once_the_run_is_space_separated() {
+        let db = Database::memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO messages_fts (sender, recipients, subject, body, \
+                 attachment_names, labels, message_id) \
+                 VALUES ('a', 'b', '件 名', \
+                 '今 日 の 会 議 は 東 京 で 行 わ れ ま し た', '', '', 'm1')",
+                [],
+            )
+            .unwrap();
+        let count = |needle: &str| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1",
+                    [needle],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        // What `fts_text("東京")` produces on the query side: a two-token
+        // phrase, which matches those two tokens next to each other.
+        assert_eq!(
+            count("\"東 京\""),
+            1,
+            "a word inside a CJK run must be findable once every character is its own token"
+        );
+        assert_eq!(
+            count("\"今 日 の 会 議 は 東 京 で 行 わ れ ま し た\""),
+            1,
+            "the whole sentence is still a phrase over the same tokens"
+        );
+        // Still a literal phrase search, not a wildcard: characters that
+        // are not adjacent in the text do not match as a phrase.
+        assert_eq!(
+            count("\"京 東\""),
+            0,
+            "per-character tokens must not turn D54's literal phrase into a fuzzy match"
+        );
+    }
+
+    #[test]
+    fn unicode61_finds_a_yo_word_once_yo_is_folded_to_ye() {
+        let db = Database::memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO messages_fts (sender, recipients, subject, body, \
+                 attachment_names, labels, message_id) \
+                 VALUES ('a', 'b', 's', 'Оплатите СЧЕТ пожалуйста', '', '', 'm1')",
+                [],
+            )
+            .unwrap();
+        let count = |needle: &str| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?1",
+                    [needle],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        // Case folding for Cyrillic is `unicode61`'s own doing; folding
+        // "ё" to "е" is ours, applied to the indexed text above and to the
+        // query alike -- so both spellings arrive here as "счет".
+        assert_eq!(count("\"счет\""), 1, "case folding for Cyrillic works");
+        assert_eq!(
+            count("\"счета\""),
+            0,
+            "folding ё must not make the search a prefix/fuzzy match"
+        );
+    }
+
+    #[test]
+    fn concurrent_opens_of_a_fresh_profile_all_succeed() {
+        for round in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("mail.db");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    Database::open(&path).map(|_| ())
+                }));
+            }
+            for handle in handles {
+                let result = handle.join().unwrap();
+                assert!(
+                    result.is_ok(),
+                    "round {round}: a concurrent open of a fresh profile failed: {:?}",
+                    result.err()
+                );
+            }
+        }
     }
 
     #[test]

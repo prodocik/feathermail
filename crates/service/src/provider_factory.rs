@@ -708,9 +708,12 @@ impl OauthClientSource for LiveOauthClientSource {
 /// locator by value, and `Core::tick` takes `&mut self`, so one `Core`
 /// cannot sit in both places at once; two handles open on the same
 /// on-disk WAL file is the supported way around that (SQLite serializes
-/// the actual disk access, `busy_timeout = 5000` absorbs the rest), and is
-/// exactly what `crates/app/src/shell.rs`'s `open_core_handles` already
-/// does for its `core`/`reader` split.
+/// the actual disk access; `busy_timeout = 5000` absorbs lock waits, but
+/// a DEFERRED read-then-write transaction can still fail fast with
+/// `SQLITE_BUSY_SNAPSHOT` under WAL, which is why the Core doors that
+/// read before they write take `Database::immediate_transaction_ref`),
+/// and is exactly what `crates/app/src/shell.rs`'s `open_core_handles`
+/// already does for its `core`/`reader` split.
 ///
 /// `secrets`/`oauth` (T-083, third review round) are the two things a
 /// prior review round found `connect()` still hardcoded even after

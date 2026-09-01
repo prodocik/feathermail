@@ -17,6 +17,7 @@
 use std::cell::RefCell;
 
 use html5ever::tendril::ByteTendril;
+use html5ever::tokenizer::states::RawKind;
 use html5ever::tokenizer::{
     BufferQueue, Tag, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer,
 };
@@ -64,9 +65,30 @@ struct State {
     /// text flags live here.
     open: Vec<Open>,
     skip: Option<Skip>,
+    /// The open raw-text element, if any (see [`raw_text_kind`]). Its
+    /// content is literal text: it is copied out verbatim, and it is not
+    /// text a reader sees, so it counts towards neither `seen_text` nor
+    /// `kept_text`.
+    raw_text: Option<LocalName>,
     seen_text: usize,
     kept_text: usize,
     kept_images: usize,
+}
+
+/// The tree builder's raw-text table, copied here for the same reason
+/// `text.rs` copies it: this pass drives the tokenizer without a tree
+/// builder, so nothing else puts the tokenizer into RAWTEXT/RCDATA. Without
+/// it, `<style>.a > .b{}</style>` arrives as ordinary character tokens and
+/// leaves here as `.a &gt; .b{}` — which ammonia keeps verbatim (raw text
+/// is not entity-decoded) and `css::sanitize_selector` then rejects,
+/// silently dropping the sender's stylesheet.
+pub(crate) fn raw_text_kind(name: &str) -> Option<RawKind> {
+    match name {
+        "script" => Some(RawKind::ScriptData),
+        "style" | "iframe" | "noembed" | "noframes" | "xmp" => Some(RawKind::Rawtext),
+        "title" | "textarea" => Some(RawKind::Rcdata),
+        _ => None,
+    }
 }
 
 /// An open element and what it says about the text inside it.
@@ -97,8 +119,21 @@ impl TokenSink for Sink {
     type Handle = ();
 
     fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<()> {
+        // Decided from the token itself and returned unconditionally, even
+        // for a start tag inside a hidden subtree: the tokenizer state has
+        // to match the document either way, or `<style>x<p>y</style>` would
+        // push a phantom `<p>` onto the skip stack and swallow the rest of
+        // the letter. `self_closing` is deliberately ignored — `<style/>`
+        // is a parse error HTML5 says to drop, the element stays open.
+        let raw = match &token {
+            Token::TagToken(tag) if tag.kind == TagKind::StartTag => raw_text_kind(&tag.name),
+            _ => None,
+        };
         self.handle(token);
-        TokenSinkResult::Continue
+        match raw {
+            Some(kind) => TokenSinkResult::RawData(kind),
+            None => TokenSinkResult::Continue,
+        }
     }
 
     fn end(&self) {}
@@ -107,8 +142,22 @@ impl TokenSink for Sink {
 impl Sink {
     fn handle(&self, token: Token) {
         let mut state = self.state.borrow_mut();
+        let in_raw_text = state.raw_text.is_some();
+        if let Token::TagToken(tag) = &token {
+            if raw_text_kind(&tag.name).is_some() {
+                match tag.kind {
+                    TagKind::StartTag => state.raw_text = Some(tag.name.clone()),
+                    TagKind::EndTag if state.raw_text.as_ref() == Some(&tag.name) => {
+                        state.raw_text = None;
+                    }
+                    TagKind::EndTag => {}
+                }
+            }
+        }
         if let Token::CharacterTokens(text) = &token {
-            state.seen_text += text.trim().chars().count();
+            if !in_raw_text {
+                state.seen_text += text.trim().chars().count();
+            }
         }
         if state.skip.is_some() && !self.leave_skip(&mut state, &token) {
             return;
@@ -132,7 +181,10 @@ impl Sink {
                     state.kept_images += 1;
                 }
             }
-            Token::CharacterTokens(text) => {
+            // Raw-text content is skipped here on purpose: a stylesheet is
+            // neither hideable by the font-size rules nor evidence that the
+            // letter still has something for a reader to see.
+            Token::CharacterTokens(text) if !in_raw_text => {
                 if text_is_invisible(&state) {
                     return;
                 }
@@ -141,7 +193,7 @@ impl Sink {
             _ => {}
         }
 
-        emit(&mut state.out, &token);
+        emit(&mut state.out, &token, in_raw_text);
     }
 
     /// Returns `true` when the skip has just ended *and* the token still
@@ -483,9 +535,12 @@ fn closes_phrasing(name: &LocalName) -> bool {
     )
 }
 
-fn emit(out: &mut String, token: &Token) {
+fn emit(out: &mut String, token: &Token, in_raw_text: bool) {
     match token {
         Token::TagToken(tag) => emit_tag(out, tag),
+        // Raw-text content is literal, not markup: escaping `>`/`&` here
+        // corrupts the CSS (or script) that the next pass has to parse.
+        Token::CharacterTokens(text) if in_raw_text => out.push_str(text),
         Token::CharacterTokens(text) => push_escaped_text(out, text),
         Token::NullCharacterToken => {}
         Token::CommentToken(_)
@@ -669,5 +724,55 @@ mod tests {
         let out = strip_visually_hidden(raw);
         assert!(!out.contains("PREHEADER_TOKEN"), "{out}");
         assert!(out.contains("keep"), "{out}");
+    }
+
+    #[test]
+    fn raw_text_in_a_style_block_is_copied_verbatim() {
+        // Escaping `>`/`&` here corrupts the stylesheet: ammonia keeps raw
+        // text as-is (it decodes no entities inside `<style>`), so the CSS
+        // parser downstream would see `.a &gt; .b` and drop the rule.
+        let out = strip_visually_hidden("<style>.a > .b{color:red}</style><p>hi</p>");
+        assert!(out.contains(".a > .b"), "{out}");
+        let out = strip_visually_hidden("<style>.a{font-family:\"A&B\"}</style><p>hi</p>");
+        assert!(out.contains("\"A&B\""), "{out}");
+    }
+
+    #[test]
+    fn markup_inside_raw_text_does_not_desynchronise_the_hidden_bookkeeping() {
+        // Without the raw-text states, `<p>` inside a script string is a
+        // real start tag to this tokenizer; opened inside a hidden subtree
+        // it would never be closed and would swallow the rest of the mail.
+        let raw = concat!(
+            r#"<div style="display:none"><script>var s = "<p>";</script></div>"#,
+            "<p>Important message text</p>"
+        );
+        let out = strip_visually_hidden(raw);
+        assert!(out.contains("Important message text"), "{out}");
+    }
+
+    #[test]
+    fn a_stylesheet_does_not_count_as_the_text_the_all_hidden_guard_looks_for() {
+        // A stylesheet is not prose. If its content counted as kept text,
+        // a letter whose *only* real text was hidden would look like it
+        // still had something to read, and the "everything we recognised
+        // turned out hidden -- give the reader the original" guard would
+        // never fire.
+        let raw = concat!(
+            "<style>.a{color:red}.b{color:blue}</style>",
+            r#"<span style="display:none">PREHEADER_TOKEN</span>"#
+        );
+        assert_eq!(strip_visually_hidden(raw), raw);
+
+        // ... and with real visible text present the guard still stands
+        // down, stylesheet or no stylesheet.
+        let raw = concat!(
+            "<style>.a > .b{color:red}</style>",
+            r#"<span style="display:none">PREHEADER_TOKEN</span>"#,
+            "<p>Visible</p>"
+        );
+        let out = strip_visually_hidden(raw);
+        assert!(!out.contains("PREHEADER_TOKEN"), "{out}");
+        assert!(out.contains(".a > .b"), "{out}");
+        assert!(out.contains("Visible"), "{out}");
     }
 }

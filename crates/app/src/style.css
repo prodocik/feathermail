@@ -573,7 +573,7 @@ listview.thread-list > row:selected .msg-row {
 }
 .msg-time {
   font-size: calc(12px * var(--fm-scale));
-  color: @ink_tertiary;
+  color: @ink_secondary;
 }
 .msg-subject {
   min-height: 19px;
@@ -1222,7 +1222,7 @@ button.compose-secondary {
   min-width: 40px;
   min-height: 40px;
   border-radius: 999px;
-  background-color: @paper-selected;
+  background-color: @paper_selected;
   color: @accent;
   font-size: calc(13px * var(--fm-scale));
   font-weight: 650;
@@ -1245,7 +1245,7 @@ button.compose-secondary {
 }
 .account-status.synced,
 .account-status.syncing {
-  background-color: @paper-selected;
+  background-color: @paper_selected;
   color: @accent;
 }
 .account-status.error {

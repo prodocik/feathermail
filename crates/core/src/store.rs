@@ -872,16 +872,29 @@ impl Core {
             ));
         }
         let now = self.now();
-        let id = draft_id.cloned().unwrap_or_else(|| {
-            DraftId(format!(
+        // IMMEDIATE, not the default DEFERRED: everything below is a read
+        // (sequence, owner) followed by a write. Under WAL a DEFERRED
+        // transaction that read first gets SQLITE_BUSY_SNAPSHOT the instant
+        // another handle commits in between -- returned immediately, without
+        // consulting `busy_timeout` -- and autosave would fail for no reason
+        // the user could act on. Taking the write lock up front also makes
+        // the sequence lookup and the INSERT one linearization point.
+        let tx = self.db.immediate_transaction_ref().map_err(sql_err)?;
+        // No `unwrap_or(1)` here. A failed sequence query used to fall back
+        // to id `draft:{account}:1`, which the upsert below then *overwrote*
+        // -- the user's first draft replaced by whatever they were typing,
+        // with `save_draft` still returning Ok. A sequence Core cannot
+        // compute is an error, not a licence to reuse someone else's id.
+        let id = match draft_id {
+            Some(id) => id.clone(),
+            None => DraftId(format!(
                 "draft:{}:{}",
                 account_id.as_str(),
-                next_draft_sequence(self.db.conn(), account_id.as_str()).unwrap_or(1)
-            ))
-        });
-        if let Some(owner) = self
-            .db
-            .conn()
+                next_draft_sequence(&tx, account_id.as_str()).map_err(sql_err)?
+            )),
+        };
+        let is_new = draft_id.is_none();
+        if let Some(owner) = tx
             .query_row(
                 "SELECT account_id FROM drafts WHERE id = ?1",
                 params![id.as_str()],
@@ -894,10 +907,15 @@ impl Core {
                 return Err(CoreError::from_code(ErrorCode::PermissionDenied));
             }
         }
-        let conn = self.db.conn();
-        let tx = conn.unchecked_transaction().map_err(sql_err)?;
-        tx.execute(
-            "INSERT INTO drafts
+        // Second line of defence for the same data loss: when the caller
+        // asked for a *new* draft, a colliding id must raise UNIQUE rather
+        // than quietly rewrite the row that already owns it. The upsert stays
+        // for the autosave path, where updating the named draft is the point.
+        const INSERT_NEW: &str = "INSERT INTO drafts
+                 (id, account_id, thread_id, in_reply_to, from_addr, to_addr,
+                  cc, bcc, subject, body, updated_at, remote_uid, sync_revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, 1)";
+        const UPSERT: &str = "INSERT INTO drafts
                  (id, account_id, thread_id, in_reply_to, from_addr, to_addr,
                   cc, bcc, subject, body, updated_at, remote_uid, sync_revision)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, 1)
@@ -911,7 +929,9 @@ impl Core {
                    subject=excluded.subject,
                    body=excluded.body,
                    updated_at=excluded.updated_at,
-                   sync_revision=drafts.sync_revision + 1",
+                   sync_revision=drafts.sync_revision + 1";
+        tx.execute(
+            if is_new { INSERT_NEW } else { UPSERT },
             params![
                 id.as_str(),
                 account_id.as_str(),
@@ -1626,8 +1646,13 @@ impl Core {
     ) -> Result<OperationId, CoreError> {
         self.require_account(account_id.as_str())?;
         let now = self.now();
-        let conn = self.db.conn();
-        let tx = conn.unchecked_transaction().map_err(sql_err)?;
+        // IMMEDIATE: `queue_draft_send_in` reads the draft and its revision
+        // first and only then writes `outbox`. A DEFERRED transaction of that
+        // shape fails with SQLITE_BUSY_SNAPSHOT the moment the sync worker
+        // (its own `Core::open` on the same file) commits in between -- and
+        // that error arrives instantly, ignoring `busy_timeout`, so Send
+        // would report "Couldn't save that change." with no retry left.
+        let tx = self.db.immediate_transaction_ref().map_err(sql_err)?;
         let operation = queue_draft_send_in(&tx, account_id, draft_id, expected_revision, now)?;
         tx.commit().map_err(sql_err)?;
         Ok(operation)
@@ -2334,7 +2359,7 @@ impl Core {
             return Err(rename_err(RenameFolderError::Duplicate));
         }
 
-        let destination = renamed_remote_id(&remote_id, delimiter.as_deref(), label);
+        let (parent_remote_id, delimiter) = mailbox_parent(&remote_id, delimiter.as_deref());
         let now = self.now();
         let conn = self.db.conn();
         let tx = conn.unchecked_transaction().map_err(sql_err)?;
@@ -2343,6 +2368,19 @@ impl Core {
             params![label, account, folder_id.as_str()],
         )
         .map_err(sql_err)?;
+        // T-158: the destination goes out as its parts -- the parent path
+        // exactly as the server reported it, the delimiter, and the raw
+        // label the user typed -- not as one pre-joined string. Joining
+        // here meant gluing an *already encoded* prefix to a *not yet
+        // encoded* leaf, and the provider then encoded the result as a
+        // whole: for a parent «Проекты» the RENAME went out with the
+        // prefix escaped a second time, naming a mailbox that does not
+        // exist. Only the leaf is ever encoded now, and both sides
+        // (`ImapMailProvider`, `queue::settle_folder_rename`) build the
+        // path from these fields through `mailbox_remote_id`, so what the
+        // server is asked for and what `folders.remote_id` records after
+        // the ACK cannot drift apart.
+        //
         // `at` is in the payload for one reason: the operation id is
         // kind+account+target+payload hash (D29 dedup), so without it a
         // rename back to a name this folder already had once would hash to
@@ -2350,9 +2388,11 @@ impl Core {
         // `INSERT OR IGNORE`. Two renames within the same second are still
         // the same request and still dedup, which is the case D29 is for.
         let payload = format!(
-            r#"{{"from":"{}","to":"{}","at":{}}}"#,
+            r#"{{"from":"{}","parent_remote_id":"{}","delimiter":"{}","label":"{}","at":{}}}"#,
             json_escape(&remote_id),
-            json_escape(&destination),
+            json_escape(&parent_remote_id),
+            json_escape(&delimiter),
+            json_escape(label),
             now
         );
         enqueue(
@@ -2885,13 +2925,30 @@ impl Core {
     }
 }
 
+/// The next free `draft:{account}:{n}` number for this account.
+///
+/// Only ids whose tail is *entirely* digits, and short enough that the CAST
+/// cannot saturate, are counted. Both guards matter: `drafts.id` is not
+/// Core's alone -- MCP passes `draft_id` through unvalidated and writes ids
+/// like `draft:{acc}:send-email:{digest}` itself -- so one planted row such
+/// as `draft:{acc}:99999999999999999999` used to saturate the CAST at
+/// `i64::MAX`, make `MAX(...) + 1` come back as a REAL, and fail the whole
+/// query. The `+ 1` moved out of SQL for the same reason: overflow is an
+/// error here, never a silent change of type.
 fn next_draft_sequence(conn: &rusqlite::Connection, account: &str) -> rusqlite::Result<i64> {
-    conn.query_row(
-        "SELECT COALESCE(MAX(CAST(substr(id, length(?1) + 8) AS INTEGER)), 0) + 1
-         FROM drafts WHERE account_id = ?1 AND id LIKE 'draft:' || ?1 || ':%'",
+    let max: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(CAST(substr(id, length(?1) + 8) AS INTEGER)), 0)
+         FROM drafts
+         WHERE account_id = ?1
+           AND id LIKE 'draft:' || ?1 || ':%'
+           AND substr(id, length(?1) + 8) GLOB '[0-9]*'
+           AND NOT substr(id, length(?1) + 8) GLOB '*[^0-9]*'
+           AND length(id) - length(?1) - 7 <= 18",
         params![account],
         |row| row.get(0),
-    )
+    )?;
+    max.checked_add(1)
+        .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, max))
 }
 
 fn mime_from_filename(filename: &str) -> &'static str {
@@ -3307,23 +3364,113 @@ fn rename_err(err: RenameFolderError) -> CoreError {
     CoreError::new(ErrorCode::InvalidArgument, err.as_str())
 }
 
-/// The mailbox path `remote_id` becomes when its leaf is renamed to
-/// `label`, keeping whatever hierarchy prefix it already had.
+/// Split a mailbox path into the hierarchy prefix its leaf hangs off and
+/// the delimiter that separates the two.
 ///
 /// `delimiter` is the server's own separator as stored in
-/// `folders.delimiter`; with none reported the namespace is flat and the
-/// new path is just the label. Only the *last* segment is replaced, so
-/// `Team/Sub/Ideas` → `Team/Sub/Plans`. A multi-character `delimiter` value
-/// cannot come from IMAP (`LIST` reports a single character) but is handled
-/// by `rsplit_once` anyway rather than indexed into.
-fn renamed_remote_id(remote_id: &str, delimiter: Option<&str>, label: &str) -> String {
-    match delimiter.filter(|d| !d.is_empty()) {
-        Some(delim) => match remote_id.rsplit_once(delim) {
-            Some((prefix, _leaf)) => format!("{prefix}{delim}{label}"),
-            None => label.to_string(),
-        },
-        None => label.to_string(),
+/// `folders.delimiter`; with none reported, or none actually present in
+/// this path, the folder is at the top of the namespace and both halves
+/// are empty -- which is why the delimiter is returned rather than assumed
+/// by the caller: `"/Ideas"` under `/` has an *empty* prefix and still
+/// needs its leading slash, and `"Ideas"` under `/` has no prefix at all
+/// and must not gain one. A multi-character `delimiter` value cannot come
+/// from IMAP (`LIST` reports a single character) but is handled by
+/// `rsplit_once` anyway rather than indexed into.
+pub(crate) fn mailbox_parent(remote_id: &str, delimiter: Option<&str>) -> (String, String) {
+    match delimiter
+        .filter(|d| !d.is_empty())
+        .and_then(|d| remote_id.rsplit_once(d).map(|(prefix, _leaf)| (prefix, d)))
+    {
+        Some((prefix, delim)) => (prefix.to_string(), delim.to_string()),
+        None => (String::new(), String::new()),
     }
+}
+
+/// T-158: the mailbox path a folder has once its leaf is `label`, ready to
+/// go on the wire.
+///
+/// Only the leaf is encoded to modified UTF-7. `parent_remote_id` is the
+/// prefix the server itself reported in `LIST` and is already in the
+/// server's own encoding, so encoding it again would produce a path no
+/// mailbox has: for a parent «Проекты» (`&BB8EQAQ+BDUEOgRCBEs-` on the
+/// wire) a second pass escapes the leading `&` and yields
+/// `&-BB8EQAQ+BDUEOgRCBEs-…`.
+///
+/// This lives in Core, not in `feathermail-providers`, because both sides
+/// need the same answer and only one of them may own it: the provider
+/// sends this path in `RENAME`, and `queue::settle_folder_rename` writes
+/// it into `folders.remote_id` when the server acks. Two implementations
+/// that drifted by one character would leave the local row pointing at a
+/// mailbox that does not exist. `providers` depends on `core` (D9), so it
+/// calls this one.
+pub fn mailbox_remote_id(parent_remote_id: &str, delimiter: &str, label: &str) -> String {
+    let leaf = encode_modified_utf7(label);
+    if delimiter.is_empty() {
+        leaf
+    } else {
+        format!("{parent_remote_id}{delimiter}{leaf}")
+    }
+}
+
+/// Encode a human mailbox label into modified UTF-7 (RFC 3501 §5.1.3) for
+/// `CREATE`/`RENAME`.
+///
+/// Printable US-ASCII (0x20..=0x7E) goes on the wire as-is except `&`,
+/// which becomes `&-`; every other run of characters is encoded as
+/// UTF-16BE and then base64'd in the modified alphabet -- no padding, and
+/// `,` where ordinary base64 writes `/` -- wrapped in `&`…`-`.
+///
+/// Only a label the user typed may be encoded. Anything that came back
+/// from `LIST` (a `remote_id`) is already in the server's own encoding and
+/// must go back byte-for-byte, or it would be encoded twice.
+pub fn encode_modified_utf7(input: &str) -> String {
+    /// RFC 3501's modified base64 alphabet: standard, with `,` for `/`.
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,";
+
+    fn flush(run: &mut Vec<u16>, out: &mut String) {
+        if run.is_empty() {
+            return;
+        }
+        let mut bytes = Vec::with_capacity(run.len() * 2);
+        for word in run.drain(..) {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        out.push('&');
+        for chunk in bytes.chunks(3) {
+            let b0 = u32::from(chunk[0]);
+            let b1 = chunk.get(1).copied().map_or(0, u32::from);
+            let b2 = chunk.get(2).copied().map_or(0, u32::from);
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            // 3 bytes -> 4 characters, 2 -> 3, 1 -> 2. The unused tail is
+            // simply not written: this alphabet carries no `=` padding.
+            for i in 0..=chunk.len() {
+                let index = (triple >> (18 - 6 * i)) & 0x3f;
+                out.push(ALPHABET[index as usize] as char);
+            }
+        }
+        out.push('-');
+    }
+
+    let mut encoded = String::with_capacity(input.len());
+    let mut run: Vec<u16> = Vec::new();
+    for ch in input.chars() {
+        match ch {
+            '&' => {
+                flush(&mut run, &mut encoded);
+                encoded.push_str("&-");
+            }
+            '\u{20}'..='\u{7e}' => {
+                flush(&mut run, &mut encoded);
+                encoded.push(ch);
+            }
+            other => {
+                let mut buf = [0u16; 2];
+                run.extend_from_slice(other.encode_utf16(&mut buf));
+            }
+        }
+    }
+    flush(&mut run, &mut encoded);
+    encoded
 }
 
 /// Minimal `"key":"value"` extractor for the flat payloads this module
@@ -3559,6 +3706,65 @@ fn real_move_target(
         remote_id,
         messages,
     }))
+}
+
+/// The wire coordinates a `PermanentDelete` is allowed to EXPUNGE, frozen
+/// at dispatch (T-081 / providers-03).
+///
+/// `Move`/`Archive`/`Trash` capture their targets in `operation_moves`;
+/// `PermanentDelete` cannot reuse that table, because the whole queue
+/// treats a row there as an *active move* -- `queue::finish` rehomes the
+/// message to `destination_folder_id`, `fail_and_undo` rehomes it back, and
+/// `RemoteLocator::thread_messages` hides the current row in favour of the
+/// captured source. So the snapshot rides in the operation's own payload
+/// instead, and [`crate::locator`] reads it back for
+/// `thread_messages_for_operation`.
+///
+/// Why a snapshot at all: EXPUNGE is irreversible (`consume_undo_in`
+/// refuses to undo a `PermanentDelete`) and the queue is asynchronous. A
+/// reply that lands in the thread while the operation waits -- offline, or
+/// in network backoff -- would otherwise be destroyed by a command the user
+/// issued before it ever arrived.
+///
+/// Messages with no confirmed mailbox or UID are left out, the same rule
+/// `RemoteLocator::thread_messages` applies: there is no honest coordinate
+/// to act on. Ordering by `messages.id` keeps the payload -- and therefore
+/// D29's idempotency hash -- stable for the same set of targets.
+fn permanent_delete_payload(
+    tx: &rusqlite::Transaction<'_>,
+    account: &str,
+    tid: &str,
+) -> Result<String, CoreError> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT f.remote_id, m.provider_uid
+             FROM messages m JOIN folders f ON f.id = m.folder_id
+             WHERE m.account_id = ?1 AND m.thread_id = ?2
+             ORDER BY m.id",
+        )
+        .map_err(sql_err)?;
+    let rows = stmt
+        .query_map(params![account, tid], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+            ))
+        })
+        .map_err(sql_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_err)?;
+    let targets = rows
+        .into_iter()
+        .filter_map(|(remote_id, uid)| {
+            let folder = remote_id.filter(|s| !s.is_empty())?;
+            let uid = uid.filter(|v| *v >= 0)?;
+            Some(format!(
+                r#"{{"folder":"{}","uid":{uid}}}"#,
+                json_escape(&folder)
+            ))
+        })
+        .collect::<Vec<_>>();
+    Ok(format!(r#"{{"targets":[{}]}}"#, targets.join(",")))
 }
 
 struct UndoOperation {
@@ -3920,8 +4126,9 @@ fn materialize_reverse(
     tx.execute(
         "INSERT INTO operations
          (id, account_id, target_id, op, payload, payload_hash, created_at,
-          retry_count, status, undo_payload, undo_of)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s','now'), 0, ?7, ?8, ?9)",
+          retry_count, status, undo_payload, undo_of, seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s','now'), 0, ?7, ?8, ?9,
+                 (SELECT COALESCE(MAX(seq), 0) + 1 FROM operations))",
         params![
             reverse_id.as_str(),
             original.account_id,
@@ -4006,6 +4213,33 @@ fn apply_one(
 ) -> Result<(usize, Option<OperationId>), CoreError> {
     let account = cmd.account_id().as_str();
     let tid = id.as_str();
+    // A `Move` names its destination by raw `folders.id`, and the FK on
+    // `threads.folder_id` only proves the row exists -- not that it belongs
+    // to this account. Without this check a thread of account A could be
+    // parked in a folder of account B: gone from A's sidebar (no such
+    // folder) and filtered out of B's list (`t.account_id`), i.e. invisible
+    // everywhere. Refuse before any UPDATE so a rejected thread cannot leave
+    // half of a batch applied. `deleted_at IS NULL` because a tombstone is
+    // not in `list_folders` either, so landing there hides the thread the
+    // same way; `revive_folder` clears the column when the folder comes back.
+    if let Command::Move { folder_id, .. } = cmd {
+        let known = tx
+            .query_row(
+                "SELECT 1 FROM folders
+                 WHERE account_id = ?1 AND id = ?2 AND deleted_at IS NULL",
+                params![account, folder_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .is_some();
+        if !known {
+            return Err(CoreError::new(
+                ErrorCode::InvalidArgument,
+                "That folder isn't in this account.",
+            ));
+        }
+    }
     let Some(before) = read_thread_fields(tx, account, tid)? else {
         return Ok((0, None));
     };
@@ -4188,8 +4422,14 @@ fn apply_one(
     }
     let payload = match cmd {
         Command::Move { folder_id, .. } => {
-            format!(r#"{{"folder_id":"{}"}}"#, folder_id.as_str())
+            // `folder_id` is `{account}:{slug}` and the slug keeps whatever
+            // the user typed, `\` and `"` included, so it has to be escaped
+            // like every other payload this module writes (`materialize_reverse`,
+            // `create_folder_payload`, ...). Unescaped, the provider's
+            // `json_string` reader silently returns a *different* folder id.
+            format!(r#"{{"folder_id":"{}"}}"#, json_escape(folder_id.as_str()))
         }
+        Command::PermanentDelete { .. } => permanent_delete_payload(tx, account, tid)?,
         _ => payload.to_string(),
     };
     let undo = undo_snapshot(&before, kind, moving_to_real_folder);
@@ -4543,11 +4783,19 @@ fn enqueue(
 ) -> Result<OperationId, CoreError> {
     let hash = payload_hash(payload);
     let id = format!("{}:{account}:{target}:{hash}", kind.as_str());
+    // T-162: `seq` is the queue's own order of issue, handed out here and
+    // nowhere else. `created_at` is whole seconds and ties constantly, and
+    // the `rowid` that used to break those ties is fixed at first INSERT --
+    // which is wrong for the revive below, where the row becomes claimable
+    // again long after it was first written. `MAX(seq) + 1` is evaluated
+    // inside this transaction, so two commands issued in the same second
+    // keep the order the user issued them in.
     let inserted = tx
         .execute(
             "INSERT OR IGNORE INTO operations
-             (id, account_id, target_id, op, payload, payload_hash, created_at, retry_count, status, undo_payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'pending', ?8)",
+             (id, account_id, target_id, op, payload, payload_hash, created_at, retry_count, status, undo_payload, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'pending', ?8,
+                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM operations))",
             params![id, account, target, kind.as_str(), payload, hash, now, undo_payload],
         )
         .map_err(sql_err)?;
@@ -4565,22 +4813,38 @@ fn enqueue(
         // attempt's pre-mutation snapshot (the old one describes a state
         // this same call's rollback already restored, so it's stale).
         //
+        // `acked` rows are revived for the same reason. D29 dedups *unsent*
+        // work; it does not say a state the user legitimately returned to may
+        // never be sent again. Because the id is only (kind, account, target,
+        // payload hash), a thread that leaves a state and comes back to it
+        // (Star -> Unstar -> Star, MarkRead -> MarkUnread -> MarkRead, Move
+        // A -> B -> A) lands on the row the first occurrence already ACKed.
+        // Leaving that alone dropped the third command silently: the local
+        // mark stayed, no operation existed to carry it to the server, and
+        // the next CONDSTORE pass overwrote the flag with the server's.
+        // Re-sending a confirmed operation is the cheaper failure: every op
+        // this path can revive is idempotent on the wire (STORE of a flag
+        // already set, MOVE of a UID that is already gone answers
+        // NotFound/Conflict, which `queue::tick` treats as success).
+        //
         // `pending`/`running` rows are left alone -- landing on the same id
-        // there is D29's dedup working as intended, not this bug. `acked`
-        // rows are left alone too: the id can only ever represent one
-        // confirmed occurrence of a given (kind, account, target, payload)
-        // tuple, so a thread that leaves and later returns to the same
-        // state (e.g. moved away and back) will not re-enqueue against an
-        // already-`acked` row of the same id. That is a separate,
-        // pre-existing gap in the id scheme -- not one this task
-        // introduces or worsens (this `WHERE` clause never touches an
-        // `acked` row, same as no code did before) -- and reviving an
-        // `acked` row would risk replaying an operation the server already
-        // confirmed, which is worse than leaving it as is.
+        // there is D29's dedup working as intended, not this bug. `local`
+        // and `cancelled` are left alone deliberately: `local` is the Snooze
+        // overlay (D26/T-035) that `claim_next` must never select, and
+        // reviving it would put a command IMAP cannot represent on the wire.
+        //
+        // T-162: a revived row is *newly* claimable, so it takes a fresh
+        // `seq` as well. Keeping the old one put it back in the queue at
+        // the position it held when it was first issued -- ahead of every
+        // command the user gave since, which for a Star revived behind a
+        // Move meant a flag STORE against a UID the MOVE had already taken
+        // away. The row is the same row (D29's key), the order of issue is
+        // not.
         tx.execute(
             "UPDATE operations
-             SET status = 'pending', retry_count = 0, next_attempt_at = NULL, undo_payload = ?2
-             WHERE id = ?1 AND status = 'failed'",
+             SET status = 'pending', retry_count = 0, next_attempt_at = NULL, undo_payload = ?2,
+                 seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM operations)
+             WHERE id = ?1 AND status IN ('failed', 'acked')",
             params![id, undo_payload],
         )
         .map_err(sql_err)?;
@@ -7884,20 +8148,68 @@ mod tests {
         assert_eq!(queued, 0, "RENAME x x is a server error, not a no-op");
     }
 
+    /// The two halves of a rename path, as `rename_folder` splits and
+    /// `mailbox_remote_id` rejoins them: only the last segment is replaced,
+    /// so `Team/Sub/Ideas` -> `Team/Sub/Plans`.
     #[test]
-    fn renamed_remote_id_replaces_only_the_last_path_segment() {
-        assert_eq!(renamed_remote_id("Ideas", Some("/"), "Plans"), "Plans");
+    fn a_renamed_path_replaces_only_its_last_segment() {
+        let rename = |remote_id: &str, delimiter: Option<&str>, label: &str| {
+            let (parent, delim) = mailbox_parent(remote_id, delimiter);
+            mailbox_remote_id(&parent, &delim, label)
+        };
+        assert_eq!(rename("Ideas", Some("/"), "Plans"), "Plans");
         assert_eq!(
-            renamed_remote_id("Team/Sub/Ideas", Some("/"), "Plans"),
+            rename("Team/Sub/Ideas", Some("/"), "Plans"),
             "Team/Sub/Plans"
         );
-        assert_eq!(
-            renamed_remote_id("Team.Ideas", Some("."), "Plans"),
-            "Team.Plans"
-        );
+        assert_eq!(rename("Team.Ideas", Some("."), "Plans"), "Team.Plans");
+        // A path that starts at the delimiter keeps it: the prefix is
+        // empty, the delimiter is not.
+        assert_eq!(rename("/Team/Ideas", Some("/"), "Plans"), "/Team/Plans");
         // No delimiter reported means a flat namespace, not "guess one".
-        assert_eq!(renamed_remote_id("Team/Ideas", None, "Plans"), "Plans");
-        assert_eq!(renamed_remote_id("Team/Ideas", Some(""), "Plans"), "Plans");
+        assert_eq!(rename("Team/Ideas", None, "Plans"), "Plans");
+        assert_eq!(rename("Team/Ideas", Some(""), "Plans"), "Plans");
+    }
+
+    /// T-158: the encoding happens on the leaf and only on the leaf. A
+    /// parent path came back from `LIST` already in the server's encoding;
+    /// running it through the encoder again escapes its `&` and names a
+    /// mailbox nobody has.
+    #[test]
+    fn only_the_leaf_of_a_rename_path_is_encoded() {
+        // «Проекты» / «Отчёты»: the parent goes on the wire byte for byte,
+        // the leaf is encoded once.
+        assert_eq!(
+            mailbox_remote_id("&BB8EQAQ+BDUEOgRCBEs-", "/", "Отчёты"),
+            "&BB8EQAQ+BDUEOgRCBEs-/&BB4EQgRHBFEEQgRL-"
+        );
+        assert!(
+            !mailbox_remote_id("&BB8EQAQ+BDUEOgRCBEs-", "/", "Отчёты").contains("&-"),
+            "a `&-` in the result means the parent was escaped a second time"
+        );
+        // ASCII hierarchies are byte-identical to what they always were.
+        assert_eq!(
+            mailbox_remote_id("Team/Sub", "/", "Plans"),
+            "Team/Sub/Plans"
+        );
+    }
+
+    /// RFC 3501 §5.1.3, checked against the shapes the decoder in
+    /// `feathermail_providers::folders` reads back.
+    #[test]
+    fn modified_utf7_encodes_non_ascii_and_escapes_the_ampersand() {
+        assert_eq!(encode_modified_utf7("Notes"), "Notes");
+        assert_eq!(encode_modified_utf7("Проекты"), "&BB8EQAQ+BDUEOgRCBEs-");
+        assert_eq!(
+            encode_modified_utf7("Исходящие"),
+            "&BBgEQQRFBD4ENARPBEkEOAQ1-"
+        );
+        assert_eq!(encode_modified_utf7("R&D"), "R&-D");
+        assert_eq!(encode_modified_utf7(""), "");
+        // The three base64 tail lengths: 3, 2 and 1 leftover bytes.
+        assert_eq!(encode_modified_utf7("\u{4f60}\u{597d}"), "&T2BZfQ-");
+        assert_eq!(encode_modified_utf7("\u{4f60}"), "&T2A-");
+        assert_eq!(encode_modified_utf7("\u{1f600}"), "&2D3eAA-");
     }
 
     fn seed_thread_in_folder(core: &Core, id: &str, folder: &str) {
@@ -8341,5 +8653,209 @@ mod tests {
             .create_folder(&AccountId("nope".into()), "Ideas")
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::AccountNotFound);
+    }
+
+    /// An outside caller (MCP passes `draft_id` straight through) can plant a
+    /// draft whose numeric tail does not fit in an i64. That used to make the
+    /// sequence query fail, `unwrap_or(1)` reused `draft:john:1`, and the
+    /// upsert silently replaced the draft that already owned it.
+    #[test]
+    fn a_new_draft_never_lands_on_an_existing_id() {
+        let mut core = Core::memory().unwrap();
+        seed(&core);
+        core.set_now(10);
+        let first = core
+            .save_draft(&john(), None, draft_content("keep me"))
+            .unwrap();
+        assert_eq!(first.id.as_str(), "draft:john:1");
+        core.save_draft(
+            &john(),
+            Some(&DraftId("draft:john:99999999999999999999".into())),
+            draft_content("planted"),
+        )
+        .unwrap();
+        let third = core
+            .save_draft(&john(), None, draft_content("brand new"))
+            .unwrap();
+        assert_eq!(
+            core.get_draft(&john(), &first.id).unwrap().body,
+            "keep me",
+            "the existing draft must not be overwritten"
+        );
+        assert_ne!(
+            third.id, first.id,
+            "a new draft must not be handed an id that already exists"
+        );
+    }
+
+    /// The unnumbered ids Core and MCP really write (`send-email` digests,
+    /// oversized planted tails) are skipped rather than saturating the CAST.
+    #[test]
+    fn draft_numbering_ignores_ids_that_are_not_plain_numbers() {
+        let mut core = Core::memory().unwrap();
+        seed(&core);
+        core.set_now(10);
+        core.save_draft(&john(), None, draft_content("one"))
+            .unwrap();
+        for planted in [
+            "draft:john:99999999999999999999",
+            "draft:john:send-email:abc",
+            "draft:john:7x",
+        ] {
+            core.save_draft(
+                &john(),
+                Some(&DraftId(planted.into())),
+                draft_content("planted"),
+            )
+            .unwrap();
+        }
+        assert_eq!(next_draft_sequence(core.db.conn(), "john").unwrap(), 2);
+        assert_eq!(
+            core.save_draft(&john(), None, draft_content("two"))
+                .unwrap()
+                .id
+                .as_str(),
+            "draft:john:2"
+        );
+    }
+
+    /// A folder name may hold the two characters JSON cares about, and the
+    /// provider reads `folder_id` back with the mirror of `json_escape`.
+    /// Unescaped, `acc:a\\b` arrives as `acc:ab` -- a *different*, possibly
+    /// existing, mailbox.
+    #[test]
+    fn a_move_payload_survives_a_folder_id_that_needs_escaping() {
+        for label in ["a\\b", "Q1 \"plan\""] {
+            let mut core = Core::memory().unwrap();
+            seed(&core);
+            core.set_now(FIXTURE_NOW);
+            let folder = core.create_folder(&john(), label).unwrap();
+            core.dispatch_with_receipt(Command::Move {
+                account_id: john(),
+                thread_ids: vec![tid("t1")],
+                folder_id: folder.clone(),
+            })
+            .unwrap();
+            let payload: String = core
+                .db
+                .conn()
+                .query_row(
+                    "SELECT payload FROM operations WHERE op = 'move' AND target_id = 't1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                json_string_field(&payload, "folder_id").as_deref(),
+                Some(folder.as_str()),
+                "folder_id must survive the round trip through the queue payload: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_draft_already_queued_for_sending_can_still_be_deleted() {
+        let mut core = Core::memory().unwrap();
+        seed(&core);
+        core.set_now(10);
+        let draft = core.save_draft(&john(), None, draft_content("hi")).unwrap();
+        core.queue_draft_send(&john(), &draft.id).unwrap();
+        let result = core.delete_draft(&john(), &draft.id);
+        assert!(
+            result.is_ok(),
+            "deleting a queued draft must not fail on a foreign key: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            core.get_draft(&john(), &draft.id).unwrap_err().code,
+            ErrorCode::MessageNotFound
+        );
+    }
+
+    /// `threads.folder_id` has a foreign key to `folders(id)`, which proves
+    /// the row exists but says nothing about whose account it is in. A thread
+    /// parked in another account's folder is invisible in both.
+    #[test]
+    fn move_refuses_a_folder_that_belongs_to_another_account() {
+        let mut core = Core::memory().unwrap();
+        seed(&core);
+        seed_second_account(&core);
+        core.set_now(FIXTURE_NOW);
+        let outcome = core.dispatch(Command::Move {
+            account_id: john(),
+            thread_ids: vec![tid("t1")],
+            folder_id: FolderId("jane:inbox".into()),
+        });
+        assert_eq!(outcome.unwrap_err().code, ErrorCode::InvalidArgument);
+        let folder: String = core
+            .db
+            .conn()
+            .query_row("SELECT folder_id FROM threads WHERE id = 't1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            folder, "inbox",
+            "a thread must not move into another account's folder"
+        );
+    }
+
+    /// And a folder id that names nothing at all is a bad argument, not the
+    /// raw foreign-key failure ("Couldn't save that change.") it used to be.
+    #[test]
+    fn move_to_an_unknown_folder_is_an_invalid_argument() {
+        let mut core = Core::memory().unwrap();
+        seed(&core);
+        core.set_now(FIXTURE_NOW);
+        let err = core
+            .dispatch(Command::Move {
+                account_id: john(),
+                thread_ids: vec![tid("t1")],
+                folder_id: FolderId("john:nope".into()),
+            })
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    /// The snapshot `permanent_delete_payload` freezes is what makes the
+    /// EXPUNGE match what the user saw; `locator` covers reading it back.
+    #[test]
+    fn permanent_delete_records_the_targets_it_was_dispatched_with() {
+        let mut core = Core::memory().unwrap();
+        seed(&core);
+        core.set_now(FIXTURE_NOW);
+        core.db
+            .conn()
+            .execute(
+                "UPDATE folders SET remote_id = 'INBOX' WHERE id = 'inbox'",
+                [],
+            )
+            .unwrap();
+        core.db
+            .conn()
+            .execute(
+                "INSERT INTO messages (id, account_id, thread_id, folder_id, date, provider_uid)
+                 VALUES ('m1', 'john', 't1', 'inbox', 0, 7)",
+                [],
+            )
+            .unwrap();
+        core.dispatch(Command::PermanentDelete {
+            account_id: john(),
+            thread_ids: vec![tid("t1")],
+        })
+        .unwrap();
+        let payload: String = core
+            .db
+            .conn()
+            .query_row(
+                "SELECT payload FROM operations WHERE op = 'permanent_delete' AND target_id = 't1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            payload, r#"{"targets":[{"folder":"INBOX","uid":7}]}"#,
+            "the queued operation must carry its own target snapshot"
+        );
     }
 }

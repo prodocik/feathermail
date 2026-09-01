@@ -177,6 +177,11 @@ pub struct ImapSession {
     /// whether `X-GM-THRID` is legal on FETCH — fail-closed: missing cache
     /// is fetched once, never guessed as Gmail.
     caps: Option<Capabilities>,
+    /// Whether [`Self::ensure_condstore_enabled`] has already run for this
+    /// session. `ENABLE CONDSTORE` is sent at most once, before the first
+    /// `SELECT`; a server that never advertised CONDSTORE, or refused the
+    /// `ENABLE`, is not asked again.
+    condstore_attempted: bool,
 }
 
 impl ImapSession {
@@ -191,6 +196,7 @@ impl ImapSession {
             idle_tag: None,
             idle_buf: Vec::new(),
             caps: None,
+            condstore_attempted: false,
         };
         match auth {
             ImapAuth::Login(password) => {
@@ -281,7 +287,38 @@ impl ImapSession {
         }
     }
 
+    /// Sends `ENABLE CONDSTORE` (RFC 7162 §3.1) once per session, in
+    /// authenticated state before the first `SELECT` (RFC 5161 forbids
+    /// `ENABLE` once a mailbox is selected).
+    ///
+    /// Until some CONDSTORE-enabling command has run, a server is not
+    /// obliged to report `OK [HIGHESTMODSEQ n]` on `SELECT`, and without
+    /// that number the sync engine can never start a `CHANGEDSINCE` delta
+    /// (D30/D33): it has nothing to compare against, so it falls back to
+    /// re-fetching every flag in the folder on every pass forever.
+    ///
+    /// Best-effort by design: a server that advertised CONDSTORE but
+    /// answers `NO`/`BAD` here just keeps that periodic full flag resync,
+    /// which is slower, not broken. The tagged response is still consumed
+    /// either way, so the command stream stays in step.
+    fn ensure_condstore_enabled(&mut self) -> Result<(), ConnectError> {
+        if self.condstore_attempted {
+            return Ok(());
+        }
+        if !self.capabilities()?.condstore {
+            self.condstore_attempted = true;
+            return Ok(());
+        }
+        self.condstore_attempted = true;
+        let tag = self.next_tag();
+        let _ = wire::tagged(&mut self.stream, &tag, "ENABLE CONDSTORE");
+        Ok(())
+    }
+
     pub fn select(&mut self, mailbox: &str) -> Result<SelectedMailbox, ConnectError> {
+        // Before `next_tag`: both `capabilities()` and the `ENABLE` do
+        // their own tagged round trip, and tags must stay in order.
+        self.ensure_condstore_enabled()?;
         let tag = self.next_tag();
         let quoted = wire::imap_quote(mailbox)?;
         wire::write_cmd(&mut self.stream, &tag, &format!("SELECT {quoted}"))?;
@@ -481,18 +518,31 @@ impl ImapSession {
     /// decides whether that is fine (D29: creating a folder that is already
     /// there is a no-op, not a failure), since only it knows the
     /// operation's retry semantics.
+    ///
+    /// `name` is the label the user typed, so it is encoded to modified
+    /// UTF-7 (RFC 3501 §5.1.3) on the way out: a mailbox name is not an
+    /// 8-bit string on the wire, and `UTF8=ACCEPT` (RFC 6855) is not
+    /// negotiated here.
     pub fn create_mailbox(&mut self, name: &str) -> Result<(), ConnectError> {
-        let quoted = wire::imap_quote(name)?;
+        let quoted = wire::imap_quote(&crate::folders::encode_modified_utf7(name))?;
         self.run_ok(&format!("CREATE {quoted}"))
     }
 
     /// `RENAME "<from>" "<to>"` (T-060t). Both names are full mailbox paths
-    /// computed by Core, not reconstructed here: this session knows the
-    /// delimiter only for the mailboxes its own `LIST` returned, and the
-    /// operation it is applying may have been queued long before that walk.
-    /// A server `NO` (destination exists, source gone, hierarchy refused)
-    /// comes back as `Err` -- unlike `CREATE`, there is no response here
-    /// that means "already in the state you asked for".
+    /// in the server's own encoding, ready for the wire: this session knows
+    /// the delimiter only for the mailboxes its own `LIST` returned, and
+    /// the operation it is applying may have been queued long before that
+    /// walk. A server `NO` (destination exists, source gone, hierarchy
+    /// refused) comes back as `Err` -- unlike `CREATE`, there is no
+    /// response here that means "already in the state you asked for".
+    ///
+    /// Neither name is encoded here (T-158). `from` is the path the server
+    /// itself reported in `LIST`; `to` is assembled by [`crate::apply`]
+    /// out of that same reported prefix plus the *one* newly encoded leaf.
+    /// Encoding either one at this point would encode a prefix that is
+    /// already encoded -- for a parent «Проекты» the `&` of `&BB8…` would
+    /// be escaped again and the RENAME would name a mailbox that does not
+    /// exist.
     pub fn rename_mailbox(&mut self, from: &str, to: &str) -> Result<(), ConnectError> {
         let from = wire::imap_quote(from)?;
         let to = wire::imap_quote(to)?;
@@ -1514,6 +1564,176 @@ mod tests {
             }
         });
         port
+    }
+
+    /// A fake IMAP server for the mailbox-name and CONDSTORE tests.
+    ///
+    /// Records every command line it is sent, and -- like a real CONDSTORE
+    /// server (RFC 7162 3.1.2) -- reports `HIGHESTMODSEQ` on `SELECT` only
+    /// once a CONDSTORE-enabling command has run in this session
+    /// (`ENABLE CONDSTORE`, or `SELECT ... (CONDSTORE)`).
+    fn spawn_recording_server(
+        advertise_condstore: bool,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log2 = log.clone();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            write!(writer, "* OK fake ready\r\n").unwrap();
+            writer.flush().unwrap();
+            let mut condstore_enabled = false;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end().to_string();
+                log2.lock().unwrap().push(trimmed.clone());
+                let upper = trimmed.to_ascii_uppercase();
+                let tag = trimmed.split_whitespace().next().unwrap_or("*").to_string();
+                if upper.contains(" LOGIN ") {
+                    write!(writer, "{tag} OK logged in\r\n").unwrap();
+                } else if upper.contains(" CAPABILITY") {
+                    let condstore = if advertise_condstore {
+                        "CONDSTORE "
+                    } else {
+                        ""
+                    };
+                    write!(
+                        writer,
+                        "* CAPABILITY IMAP4rev1 {condstore}UIDPLUS IDLE MOVE\r\n{tag} OK CAPABILITY completed\r\n"
+                    )
+                    .unwrap();
+                } else if upper.contains(" ENABLE ") {
+                    if upper.contains("CONDSTORE") {
+                        condstore_enabled = true;
+                        write!(writer, "* ENABLED CONDSTORE\r\n").unwrap();
+                    }
+                    write!(writer, "{tag} OK ENABLE completed\r\n").unwrap();
+                } else if upper.contains(" SELECT ") {
+                    if upper.contains("(CONDSTORE)") {
+                        condstore_enabled = true;
+                    }
+                    write!(writer, "* 3 EXISTS\r\n").unwrap();
+                    write!(writer, "* OK [UIDVALIDITY 123456] UIDs valid\r\n").unwrap();
+                    write!(writer, "* OK [UIDNEXT 42] Predicted next UID\r\n").unwrap();
+                    if condstore_enabled {
+                        write!(writer, "* OK [HIGHESTMODSEQ 999] highest\r\n").unwrap();
+                    } else {
+                        write!(writer, "* OK [NOMODSEQ] no modseqs yet\r\n").unwrap();
+                    }
+                    write!(writer, "{tag} OK [READ-WRITE] SELECT completed\r\n").unwrap();
+                } else {
+                    write!(writer, "{tag} OK completed\r\n").unwrap();
+                }
+                writer.flush().unwrap();
+            }
+        });
+        (port, log)
+    }
+
+    /// `CREATE` still encodes the label it is handed (it is a bare label,
+    /// typed by the user). `RENAME` no longer encodes anything: T-158 moved
+    /// that one step up, to [`crate::apply`], which encodes the leaf alone
+    /// and leaves the `LIST`-reported prefix as it is. So a destination
+    /// whose parent is *already* encoded must reach the wire byte for byte.
+    #[test]
+    fn create_encodes_its_label_and_rename_sends_both_paths_verbatim() {
+        let (port, log) = spawn_recording_server(true);
+        thread::sleep(Duration::from_millis(30));
+        let mut session = ImapSession::connect(&form(port), ImapAuth::Login("x".into())).unwrap();
+        session
+            .create_mailbox("\u{41f}\u{440}\u{43e}\u{435}\u{43a}\u{442}\u{44b}")
+            .unwrap();
+        // «Проекты/Ideas» -> «Проекты/Идеи», as `apply` assembles it.
+        session
+            .rename_mailbox(
+                "&BB8EQAQ+BDUEOgRCBEs-/Ideas",
+                "&BB8EQAQ+BDUEOgRCBEs-/&BBgENAQ1BDg-",
+            )
+            .unwrap();
+
+        let lines = log.lock().unwrap().clone();
+        let create = lines
+            .iter()
+            .find(|l| l.to_ascii_uppercase().contains(" CREATE "))
+            .expect("a CREATE must have gone out");
+        assert!(
+            create.ends_with("CREATE \"&BB8EQAQ+BDUEOgRCBEs-\""),
+            "mailbox names go on the wire in modified UTF-7 (RFC 3501 5.1.3), got {create:?}"
+        );
+        let rename = lines
+            .iter()
+            .find(|l| l.to_ascii_uppercase().contains(" RENAME "))
+            .expect("a RENAME must have gone out");
+        assert!(
+            rename.ends_with(
+                "RENAME \"&BB8EQAQ+BDUEOgRCBEs-/Ideas\" \"&BB8EQAQ+BDUEOgRCBEs-/&BBgENAQ1BDg-\""
+            ),
+            "both paths must reach the server exactly as given, got {rename:?}"
+        );
+        assert!(
+            !rename.contains("&-BB8"),
+            "an escaped ampersand means the prefix was encoded twice: {rename:?}"
+        );
+    }
+
+    #[test]
+    fn condstore_is_enabled_so_select_reports_highestmodseq() {
+        let (port, log) = spawn_recording_server(true);
+        thread::sleep(Duration::from_millis(30));
+        let mut session = ImapSession::connect(&form(port), ImapAuth::Login("x".into())).unwrap();
+        assert!(session.capabilities().unwrap().condstore);
+
+        let selected = session.select("INBOX").unwrap();
+
+        let lines = log.lock().unwrap().clone();
+        assert_eq!(
+            selected.highest_modseq,
+            Some(999),
+            "a CONDSTORE-enabling command must run before SELECT, sent: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.to_ascii_uppercase().contains("ENABLE CONDSTORE")),
+            "ENABLE CONDSTORE must go out once, in authenticated state, sent: {lines:?}"
+        );
+
+        // Once per session, not before every SELECT.
+        session.select("INBOX").unwrap();
+        let lines = log.lock().unwrap().clone();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.to_ascii_uppercase().contains("ENABLE CONDSTORE"))
+                .count(),
+            1,
+            "ENABLE must not repeat on every SELECT, sent: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn condstore_is_not_enabled_when_the_server_never_advertised_it() {
+        let (port, log) = spawn_recording_server(false);
+        thread::sleep(Duration::from_millis(30));
+        let mut session = ImapSession::connect(&form(port), ImapAuth::Login("x".into())).unwrap();
+        assert!(!session.capabilities().unwrap().condstore);
+
+        let selected = session.select("INBOX").unwrap();
+        assert_eq!(selected.highest_modseq, None);
+        let lines = log.lock().unwrap().clone();
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.to_ascii_uppercase().contains("ENABLE")),
+            "ENABLE must not be sent to a server that never advertised CONDSTORE, sent: {lines:?}"
+        );
     }
 
     #[test]

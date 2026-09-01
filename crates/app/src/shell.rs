@@ -20,20 +20,21 @@ use feathermail_core::{
     empty_copy, format_clock, group_label, recipient_field_is_sendable, sender_image_domain,
     stamp_headers, Account, AccountEdit, AccountId, AccountStatus, Address, ApplyError, Attachment,
     AttachmentId, Command, ConnectError, ConnectOk, Core, CoreError, CreateFolderError, Density,
-    DispatchReceipt, Draft, DraftAttachment, DraftContent, DraftId, FakeMailStore, FolderId,
-    FolderKind, FolderSummary, ListRow, ListThreadsQuery, MailConnector, MailSecurity,
-    MailboxDraft, MailboxForm, McpAuditEntry, McpClientSummary, McpConfirmationChoice,
-    McpConfirmationRequest, McpPermissionLevel, MessageId, OperationId, QueueCounts,
-    RenameFolderError, ResponseKind, Settings as CoreSettings, SyncProgress, Theme, Thread,
-    ThreadCursor, ThreadFilter, ThreadId, ThreadMessage, ThreadPage, UndoTicket,
-    UnifiedThreadsQuery, FIXTURE_NOW, FOLDER_PALETTE, LIST_PAGE, MAX_LIST_WIDTH, MAX_SIDEBAR_WIDTH,
-    MIN_LIST_WIDTH, MIN_SIDEBAR_WIDTH,
+    Draft, DraftAttachment, DraftContent, DraftId, FakeMailStore, FolderId, FolderKind,
+    FolderSummary, ListRow, ListThreadsQuery, MailConnector, MailSecurity, MailboxDraft,
+    MailboxForm, McpAuditEntry, McpClientSummary, McpConfirmationChoice, McpConfirmationRequest,
+    McpPermissionLevel, MessageId, OperationId, QueueCounts, RenameFolderError, ResponseKind,
+    Settings as CoreSettings, SyncProgress, Theme, Thread, ThreadCursor, ThreadFilter, ThreadId,
+    ThreadMessage, ThreadPage, UndoTicket, UnifiedThreadsQuery, FIXTURE_NOW, FOLDER_PALETTE,
+    LIST_PAGE, MAX_LIST_WIDTH, MAX_SIDEBAR_WIDTH, MIN_LIST_WIDTH, MIN_SIDEBAR_WIDTH,
 };
 use feathermail_html::decode_encoded_words;
 use feathermail_notifications::PostedNotifications;
 use feathermail_search::Query as SearchQuery;
 use feathermail_security::{SecretError, SecretKey, SecretStore, SecretString};
-use feathermail_service::{ImapProviderFactory, SyncEvent, SyncHandle, Viewport};
+use feathermail_service::{
+    AutoconfigOutcome, ImapProviderFactory, SyncEvent, SyncHandle, Viewport,
+};
 use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
@@ -42,7 +43,7 @@ use relm4::prelude::*;
 use relm4::typed_view::list::TypedListView;
 
 use crate::mail_writer::{with_retries, MailSink, MailWriter};
-use crate::msg::{MailboxPreset, Msg, SnoozePreset, UpdateCheck};
+use crate::msg::{MailboxPreset, Msg, SnoozePreset, UpdateCheck, WizardEmail};
 use crate::nav::{
     escape, letter_shortcuts_live, EscapeAction, MarkReadMode, PrefKey, Prefs, Screen,
     SettingsPage, Wizard, WizardStep, SHORTCUTS,
@@ -1147,6 +1148,14 @@ pub struct App {
     /// T-074: cache of `Core::list_folders(current_account)`, refreshed by
     /// `refill_nav`. Read directly by `#[watch]` blocks (D11).
     folders_cache: Vec<FolderSummary>,
+    /// T-161: where a list row's folder chip reads its label.
+    ///
+    /// The same list as `folders_cache` in a single mailbox, and every
+    /// account's folders in the merged view -- where `folders_cache` is
+    /// Core's four unified folders and holds no real folder's label at
+    /// all. Filled by `refill_nav` on its own background thread, so the
+    /// chip never asks Core anything at paint time (D11).
+    chip_folders: Vec<FolderSummary>,
     /// T-074: bumped on every folder/account switch; guards the async
     /// `list_threads` result against a stale reply landing after the user
     /// has already navigated elsewhere.
@@ -1224,10 +1233,36 @@ pub struct App {
     /// T-041: id of the draft currently represented by the compose
     /// window. `None` until the first debounced/manual save succeeds.
     compose_draft_id: Option<DraftId>,
+    /// Which mailbox owns the draft in the window. A reply created from
+    /// the merged view belongs to the mailbox the letter is in, which is
+    /// not the one the account menu shows -- and Core refuses a
+    /// `save_draft` whose account does not own the row (PermissionDenied),
+    /// so every compose door has to read this and not `current_account`.
+    compose_account: Option<AccountId>,
+    /// Which compose session the window is showing. Bumped by
+    /// [`Self::present_compose`], carried by every background answer that
+    /// rebinds `compose_draft_id`, so a save/attach/send from a window the
+    /// reader has already replaced is dropped instead of rebinding the new
+    /// one -- the same generation guard `body_gen`/`search_gen` carry.
+    compose_session: u64,
     compose_save_gen: u64,
     compose_dirty: bool,
     compose_save_inflight: bool,
     compose_send_pending: bool,
+    /// Whether a close is waiting on the save that was already in flight
+    /// when it happened. Closing compose is the point where an unsaved
+    /// draft must reach disk, so the retry cannot be gated on the window
+    /// still being visible -- `Msg::CloseCompose` has just hidden it.
+    compose_close_pending: bool,
+    /// A Discard waiting for the save that was already in flight when it
+    /// happened. Core's `save_draft` is an `ON CONFLICT DO UPDATE`, so a
+    /// delete that wins the race is simply undone by the write landing
+    /// after it.
+    ///
+    /// It carries the session, the mailbox and the row rather than reading
+    /// them back when the answer lands: the reader may have opened the
+    /// next letter by then, and the draft they threw away still has to go.
+    compose_discard_pending: Option<PendingDiscard>,
     /// T-054: whether the shell itself is writing the compose fields, and
     /// so the `changed` signals they are about to fire are not the user
     /// typing. Shared with those signal handlers on purpose: a plain
@@ -1427,6 +1462,13 @@ pub struct App {
     smtp_security: gtk::DropDown,
     insecure: gtk::CheckButton,
     preset_notice: gtk::Label,
+    /// T-156: the one line an autoconfig lookup is allowed to say when it
+    /// could not be completed. Empty and hidden the rest of the time.
+    autoconfig_hint: gtk::Label,
+    /// T-156: the address the last autoconfig lookup was started for, so
+    /// leaving and re-entering the field does not buy the same answer
+    /// twice. Cleared with the form.
+    autoconfig_asked: Option<String>,
     search_open: bool,
     search_draft: String,
     search_gen: u64,
@@ -1568,6 +1610,35 @@ impl App {
         unified_folder_kind(&self.folder).is_some()
     }
 
+    /// T-163: where the reader is, as one number -- which mailbox, which
+    /// folder, and which account row Settings has open.
+    ///
+    /// Every folder-CRUD and account door now answers from the mailbox
+    /// writer thread, and each of them used to act on its own result the
+    /// instant it came back: `self.folder = id`, the popover cleared, the
+    /// list reloaded. Off the GTK thread that result arrives some
+    /// milliseconds later, by which time the reader may be in another
+    /// folder, in another mailbox, or halfway through typing the next
+    /// folder's name -- and none of those may be overwritten by an answer
+    /// about a place they have left. Each door reads this before it queues
+    /// and its answer carries it back; the arm applies the parts that
+    /// belong to that place only while the number still matches.
+    ///
+    /// Derived, not counted, and deliberately so. A counter would have to
+    /// be bumped at each of the nine sites that assign `self.folder` or
+    /// `self.current_account`, and the tenth one added next year would let
+    /// a stale answer through in silence. This is computed from the fields
+    /// it is about, so a new door that moves the reader invalidates the
+    /// writes in flight by doing nothing at all.
+    fn reader_place(&self) -> u64 {
+        reader_place_stamp(
+            self.current_account.as_ref().map(AccountId::as_str),
+            &self.folder,
+            self.account_editing.as_deref(),
+            self.account_pending_remove.as_deref(),
+        )
+    }
+
     /// T-108: which account a thread belongs to.
     ///
     /// In a single mailbox that is the open account and nothing else. In
@@ -1626,7 +1697,8 @@ impl App {
         groups
     }
 
-    /// T-108: one dispatch per account behind a selection, receipts merged.
+    /// T-108/T-139/T-140/T-143: one dispatch per account behind a
+    /// selection, on the mailbox writer thread, receipts merged.
     ///
     /// Every mutating door in this shell used to read `current_account` and
     /// send one [`Command`]; in the merged view the same ten selected rows
@@ -1637,34 +1709,9 @@ impl App {
     /// merged view there is always exactly one group, so it is the old
     /// behaviour with an extra `Vec`.
     ///
-    /// The first failure stops the run and is reported: a partial success
-    /// is still visible in the receipt-less error path the callers already
-    /// have, and pressing on would multiply one broken account's failure
-    /// across the others.
-    fn dispatch_grouped(
-        &mut self,
-        ids: &[String],
-        build: impl Fn(AccountId, Vec<ThreadId>) -> Command,
-    ) -> Result<DispatchReceipt, ()> {
-        let groups = self.group_ids_by_account(ids);
-        if groups.is_empty() {
-            return Err(());
-        }
-        let mut core = self.core.lock().unwrap();
-        let mut merged = DispatchReceipt {
-            operations: Vec::new(),
-        };
-        for (account_id, thread_ids) in groups {
-            let receipt = core
-                .dispatch_with_receipt(build(account_id, thread_ids))
-                .map_err(|_| ())?;
-            merged.operations.extend(receipt.operations);
-        }
-        Ok(merged)
-    }
-
-    /// T-139/T-140/T-143: [`Self::dispatch_grouped`] with the dispatching moved
-    /// to the mailbox writer thread.
+    /// The synchronous twin this grew out of is deliberately gone rather
+    /// than kept private: while it existed, adding a new mutating door
+    /// meant one line to park the window again.
     ///
     /// The grouping stays here -- it reads the rows the list already holds,
     /// and the one fallback it can take (`account_id_for_thread`) is a
@@ -1865,33 +1912,25 @@ impl App {
             self.show_toast("Open one account to move messages.", sender);
             return;
         }
-        let Some(account_id) = self.current_account.clone() else {
+        if self.current_account.is_none() {
             return;
-        };
-        let thread_ids = ids.into_iter().map(ThreadId).collect();
-        let result = self
-            .core
-            .lock()
-            .unwrap()
-            .dispatch_with_receipt(Command::Move {
+        }
+        // T-163: the last of the grouped mutations still taking an
+        // IMMEDIATE transaction on the GTK thread. It is one account and
+        // one destination by construction (the merged view was refused
+        // above), so grouping finds exactly one group and this is the old
+        // command with the wait taken out of the click. The receipt comes
+        // back as `Msg::MoveWritten`.
+        self.dispatch_grouped_async(
+            &ids,
+            move |account_id, thread_ids| Command::Move {
                 account_id,
                 thread_ids,
-                folder_id: FolderId(folder_id),
-            });
-        match result {
-            Ok(receipt) => {
-                self.wake_sync();
-                let tickets: Vec<_> = receipt
-                    .operations
-                    .iter()
-                    .map(|operation| operation.undo_ticket())
-                    .collect();
-                self.show_undo_toasts("Moved", tickets, sender);
-                self.clear_bulk_selection();
-                self.reload_list(sender);
-            }
-            Err(_) => self.show_toast("Couldn’t move that change.", sender),
-        }
+                folder_id: FolderId(folder_id.clone()),
+            },
+            |tickets, _operation_ids, error| Msg::MoveWritten { tickets, error },
+            sender,
+        );
     }
 
     /// T-036: show only real/custom folders; the command still carries one
@@ -2102,17 +2141,20 @@ impl App {
                 self.letter_pane.append(&self.letter_body);
             }
             ThreadViewPlan::Accordion(cards) => {
+                // One reading of the wall clock for the whole stack, so two
+                // cards of the same thread cannot disagree about "today".
+                let now = wall_clock_now();
                 for card in cards {
                     let Some(msg) = self.thread_messages.iter().find(|m| m.id == *card.id()) else {
                         continue;
                     };
                     if card.needs_body() {
-                        let col = expanded_thread_card(msg);
+                        let col = expanded_thread_card(msg, now);
                         col.append(&self.letter_body);
                         self.thread_cards.append(&col);
                     } else {
                         self.thread_cards
-                            .append(&collapsed_thread_card(msg, sender));
+                            .append(&collapsed_thread_card(msg, now, sender));
                     }
                 }
                 // T-131: the open message keeps the screen; the history
@@ -3409,9 +3451,20 @@ impl App {
                         ListRow::Thread(t) => !self.settled_previews.contains(t.id.as_str()),
                         ListRow::Header(_) => false,
                     };
+                // T-161: the chip is decided here, where the open folder
+                // and the chip table both are, and handed down as a value
+                // -- the row has no way to look one up.
+                let chip = match &row {
+                    ListRow::Thread(t) => {
+                        row_chip_label(&self.folder, t.folder.as_str(), &self.chip_folders)
+                    }
+                    ListRow::Header(_) => None,
+                };
                 MailRow {
                     row,
                     preview_pending,
+                    now,
+                    chip,
                     sender: tx.clone(),
                 }
             })
@@ -3651,6 +3704,7 @@ impl App {
     /// `restore_bulk_selection` here anymore.
     fn rebind_thread(&mut self, id: &str, sender: &ComponentSender<Self>) {
         let tx = sender.input_sender().clone();
+        let now = wall_clock_now();
         let pending = self.prefetch_active() && !self.settled_previews.contains(id);
         for i in 0..self.list.len() {
             let hit = self.list.get(i).and_then(|item| match &item.borrow().row {
@@ -3666,10 +3720,13 @@ impl App {
                     .ok()
             });
             if let (Some(t), Some(item)) = (fetched, self.list.get(i)) {
-                rows::repaint_live_row(&t, pending);
+                let chip = row_chip_label(&self.folder, t.folder.as_str(), &self.chip_folders);
+                rows::repaint_live_row(&t, chip.as_deref(), pending, now);
                 *item.borrow_mut() = MailRow {
                     row: ListRow::Thread(Box::new(t)),
                     preview_pending: pending,
+                    now,
+                    chip,
                     sender: tx,
                 };
             }
@@ -3900,6 +3957,7 @@ impl App {
     /// every caller follows it with a `rebind_thread` once the write has
     /// actually landed, and that one reads Core.
     fn paint_rows_read(&mut self, ids: &[String], read: bool) {
+        let now = wall_clock_now();
         for i in 0..self.list.len() {
             let Some(item) = self.list.get(i) else {
                 continue;
@@ -3923,7 +3981,8 @@ impl App {
                 }
             };
             if let Some((thread, pending)) = changed {
-                rows::repaint_live_row(&thread, pending);
+                let chip = row_chip_label(&self.folder, thread.folder.as_str(), &self.chip_folders);
+                rows::repaint_live_row(&thread, chip.as_deref(), pending, now);
             }
         }
     }
@@ -3935,42 +3994,56 @@ impl App {
     /// synchronous Core query -- sanctioned under D11 the same way
     /// `list_folders`/`create_folder` are) to decide which command to
     /// send.
+    ///
+    /// T-143's follow-up: the *write* no longer happens here. It used to be
+    /// `let _ = self.core.lock().unwrap().dispatch(cmd)` -- an IMMEDIATE
+    /// transaction on the GTK thread behind SQLite's five second
+    /// `busy_timeout`, with its refusal thrown on the floor. The outcome
+    /// comes back as `Msg::StarWritten`, and that is also the only place
+    /// allowed to take the row off a starred-only list: deciding it here,
+    /// on the pre-toggle flag, hid a thread whose Unstar the database had
+    /// refused.
     fn toggle_star(&mut self, id: &str, sender: &ComponentSender<Self>) {
-        if let Some(account_id) = self.account_for_thread(id) {
-            let thread_id = ThreadId(id.to_string());
-            let starred = self
-                .core
-                .lock()
-                .unwrap()
-                .get_thread(&account_id, &thread_id)
-                .map(|t| t.starred)
-                .unwrap_or(false);
-            let cmd = if starred {
-                Command::Unstar {
-                    account_id,
-                    thread_ids: vec![thread_id],
+        let Some(account_id) = self.account_for_thread(id) else {
+            self.rebind_thread(id, sender);
+            return;
+        };
+        let thread_id = ThreadId(id.to_string());
+        let starred = self
+            .core
+            .lock()
+            .unwrap()
+            .get_thread(&account_id, &thread_id)
+            .map(|t| t.starred)
+            .unwrap_or(false);
+        let ids = vec![id.to_string()];
+        let answered = ids.clone();
+        let queued = self.dispatch_grouped_async(
+            &ids,
+            move |account_id, thread_ids| {
+                if starred {
+                    Command::Unstar {
+                        account_id,
+                        thread_ids,
+                    }
+                } else {
+                    Command::Star {
+                        account_id,
+                        thread_ids,
+                    }
                 }
-            } else {
-                Command::Star {
-                    account_id,
-                    thread_ids: vec![thread_id],
-                }
-            };
-            let _ = self.core.lock().unwrap().dispatch(cmd);
-            // T-078 (c): see `select_thread`'s wake comment.
-            self.wake_sync();
-            // T-054: a starred-only list must not keep a thread the user
-            // just unstarred. `rebind_thread` alone left it on screen with
-            // a hollow star -- a Starred list claiming a thread is starred
-            // when Core says it is not -- and the only way back was a
-            // folder switch. `starred` above is the *pre*-toggle flag, so
-            // it being true means this dispatch was the Unstar.
-            if starred && self.viewing_starred_only() {
-                self.hide_rows(&[id.to_string()], sender);
-                return;
-            }
+            },
+            move |_tickets, _operation_ids, error| Msg::StarWritten {
+                ids: answered,
+                starred,
+                error,
+            },
+            sender,
+        );
+        if !queued {
+            self.show_toast("Couldn’t change the star.", sender);
+            self.rebind_thread(id, sender);
         }
-        self.rebind_thread(id, sender);
     }
 
     /// T-054: the two lists that show starred threads and nothing else --
@@ -4054,6 +4127,15 @@ impl App {
         let gen = self.nav_gen;
         let unified = self.unified();
         let account_id = self.current_account.clone();
+        // T-161: which mailboxes a row chip may have to name. In a single
+        // mailbox it is that one; in the merged view every row can come
+        // from a different account, and the sidebar's four unified folders
+        // hold none of their labels.
+        let accounts: Vec<AccountId> = self
+            .accounts_cache
+            .iter()
+            .map(|account| account.id.clone())
+            .collect();
         let reader = Arc::clone(&self.reader);
         let tx = sender.input_sender().clone();
         std::thread::spawn(move || {
@@ -4070,13 +4152,34 @@ impl App {
                     None => Vec::new(),
                 }
             };
+            // T-161: and the chip's own lookup table, gathered on this
+            // thread and not on the GTK one. Outside the merged view it is
+            // the sidebar's own list, so nothing extra is asked for.
+            let chip_folders = if unified {
+                accounts
+                    .iter()
+                    .flat_map(|account_id| reader.list_folders(account_id).unwrap_or_default())
+                    .collect()
+            } else {
+                folders.clone()
+            };
             drop(reader);
-            tx.emit(Msg::NavLoaded { gen, folders });
+            tx.emit(Msg::NavLoaded {
+                gen,
+                folders,
+                chip_folders,
+            });
         });
     }
 
-    fn apply_nav(&mut self, folders: Vec<FolderSummary>, sender: &ComponentSender<Self>) {
+    fn apply_nav(
+        &mut self,
+        folders: Vec<FolderSummary>,
+        chip_folders: Vec<FolderSummary>,
+        sender: &ComponentSender<Self>,
+    ) {
         self.folders_cache = folders;
+        self.chip_folders = chip_folders;
         let (system, custom) = nav_specs(&self.folders_cache, &self.folder);
         refill(&self.system_nav, sender, system);
         refill(&self.custom_nav, sender, custom);
@@ -4199,6 +4302,46 @@ impl App {
         self.account_menu.append(&add);
     }
 
+    /// T-049 (д): remember a settled query, on the mailbox writer thread.
+    ///
+    /// This is the one profile *write* that used to sit in a typing path:
+    /// `let _ = self.core.lock().unwrap().record_search_history(&q)` ran
+    /// inside `update()`, 150 ms after the reader stopped typing, and
+    /// SQLite serialises writers -- so a query settled while the backfill
+    /// was committing a batch of headers parked the window for as long as
+    /// `busy_timeout` (5 s, `feathermail_db`), which is exactly the hang
+    /// T-133 measured. It is a write, so it belongs on `mail_writer`.
+    ///
+    /// The outer `let _` is deliberate and is not T-139's discarded
+    /// `Result`: `with_retries` has already survived the lost race, a
+    /// history row is not a mailbox mutation, and there is nothing honest
+    /// to say to a reader who is mid-sentence. D14: the query is the
+    /// reader's own text, so it is never logged or put in a toast.
+    fn record_search_history(&self, query: String) {
+        self.mail_writer.run(move |core| {
+            let _ = with_retries(core, |core| core.record_search_history(&query));
+        });
+    }
+
+    /// T-049 (д)/T-121: read the recent-query list on the reader handle,
+    /// the same way `refill_nav` reads the sidebar. Under WAL a reader is
+    /// not blocked by the backfill's writer, but it still queues behind
+    /// whatever holds the shared `Mutex<Core>` -- and the popover has
+    /// nothing to gain from waiting for it. `Msg::SearchHistoryLoaded`
+    /// repaints it when it arrives; until then the popover shows the list
+    /// it already had.
+    fn reload_search_history(&self, sender: &ComponentSender<Self>) {
+        let reader = Arc::clone(&self.reader);
+        let tx = sender.input_sender().clone();
+        std::thread::spawn(move || {
+            let history = reader
+                .lock()
+                .map(|reader| reader.list_search_history(8).unwrap_or_default())
+                .unwrap_or_default();
+            tx.emit(Msg::SearchHistoryLoaded(history));
+        });
+    }
+
     /// T-049: renders the search popover from state alone -- never calls
     /// `Core`/`self.reader` itself (that always happens earlier, in
     /// `Msg::SearchDebounced`/`Msg::SearchLoadMore` via `spawn_search`).
@@ -4286,7 +4429,7 @@ impl App {
                 from.set_hexpand(true);
                 from.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 from.set_max_width_chars(SEARCH_HIT_FROM_CHARS);
-                let when = gtk::Label::new(Some(&format_clock(t.date, FIXTURE_NOW)));
+                let when = gtk::Label::new(Some(&format_clock(t.date, wall_clock_now())));
                 when.add_css_class("when");
                 top.append(&from);
                 top.append(&when);
@@ -5142,23 +5285,59 @@ impl App {
     }
 
     fn notify_new_mail(&mut self, account_id: &AccountId) {
-        let after = self
-            .notification_watermarks
-            .get(account_id)
-            .copied()
-            .unwrap_or_default();
-        let (candidates, watermark) = {
+        let seeded = self.notification_watermarks.get(account_id).copied();
+        let after = seeded.unwrap_or_default();
+        let (candidates, candidate_count, watermark) = {
             let locked = self.core.lock().unwrap();
             (
                 locked
-                    .notification_candidates(account_id, after, 20)
+                    .notification_candidates(account_id, after, NEW_MAIL_NOTIFICATION_LIMIT)
                     .unwrap_or_default(),
+                // T-159: how many there really are, before the limit cuts
+                // anything -- the one thing the list above cannot say
+                // about itself once it has been truncated.
+                locked
+                    .notification_candidate_count(account_id, after)
+                    .unwrap_or_default(),
+                // Only ever a seed. A mailbox this session has not seen
+                // starts at the newest letter it already holds, so opening
+                // the app does not announce months of unread mail.
                 locked.notification_watermark(account_id).unwrap_or(after),
             )
         };
+        let announcement = new_mail_announcement(candidate_count, NEW_MAIL_NOTIFICATION_LIMIT);
+        // How far the watermark may move is decided by what was covered,
+        // not by what fitted. Raising it to the mailbox's global maximum
+        // after a per-letter tick wrote off everything the limit cut --
+        // and the limit cuts the *oldest* letters -- so a burst larger
+        // than the limit lost that mail permanently. A summary has no such
+        // hole: it stands for every candidate there was, the ones the
+        // limit dropped included, so it may clear the lot.
+        //
+        // T-159, mute: the watermark moves either way. Silence means
+        // silence -- a mailbox the reader muted, or a session with
+        // notifications off, must not save the backlog up and empty it
+        // onto them the moment it is unmuted. What they missed while muted
+        // is in the list, where unread mail already lives.
+        let advanced = match (seeded, announcement) {
+            // First sight of it in this session: start from the newest
+            // letter it already holds.
+            (None, _) => watermark,
+            // The summary covered everything above `after`, so the inbox
+            // maximum is an honest place to leave the mark.
+            (Some(seed), NewMailAnnouncement::Summary { .. }) => watermark.max(seed),
+            // Already tracking this mailbox: only what was actually
+            // announced may be written off.
+            (Some(seed), _) => candidates
+                .iter()
+                .map(|candidate| candidate.date)
+                .max()
+                .unwrap_or(seed)
+                .max(seed),
+        };
         self.notification_watermarks
-            .insert(account_id.clone(), watermark.max(after));
-        if candidates.is_empty()
+            .insert(account_id.clone(), advanced);
+        if announcement == NewMailAnnouncement::Nothing
             || !self.prefs.notify_mail
             || self.muted_notification_accounts.contains(account_id)
         {
@@ -5167,15 +5346,39 @@ impl App {
         let Some(application) = self.window.application() else {
             return;
         };
-        for candidate in &candidates {
-            let payload = feathermail_notifications::NotificationPayload::new(
-                account_id.as_str(),
-                candidate.thread_id.as_str(),
-                &candidate.sender,
-                &candidate.subject,
-            );
+        let payloads = match announcement {
+            NewMailAnnouncement::Nothing => Vec::new(),
+            // T-159: past the limit the reader does not want twenty
+            // notifications, and the desktop would collapse them into a
+            // heap anyway. One line saying how much arrived, opening that
+            // mailbox's Inbox -- and, because it covers every candidate,
+            // nothing is left behind for a watermark to write off unheard.
+            NewMailAnnouncement::Summary { count } => {
+                vec![feathermail_notifications::NotificationPayload::summary(
+                    account_id.as_str(),
+                    self.notification_account_title(account_id),
+                    new_mail_summary_body(count),
+                )]
+            }
+            NewMailAnnouncement::EachLetter => candidates
+                .iter()
+                .map(|candidate| {
+                    feathermail_notifications::NotificationPayload::new(
+                        account_id.as_str(),
+                        candidate.thread_id.as_str(),
+                        &candidate.sender,
+                        &candidate.subject,
+                    )
+                })
+                .collect(),
+        };
+        for payload in &payloads {
             let notification = gio::Notification::new(&payload.title);
             notification.set_body(Some(&payload.subject));
+            // An empty thread id is the summary's: the arm this reaches
+            // (`Msg::OpenNotification`) focuses the mailbox and selects
+            // nothing, which is the Inbox of that account and no letter
+            // in particular.
             notification.set_default_action_and_target_value(
                 "app.open-notification",
                 Some(&format!("{}\n{}", payload.account_id, payload.thread_id).to_variant()),
@@ -5184,11 +5387,22 @@ impl App {
             // T-122: the shell owns this notification from here on, and
             // nothing takes it back on its own -- see
             // `withdraw_posted_notifications`.
-            self.posted_notifications.borrow_mut().record(&payload);
+            self.posted_notifications.borrow_mut().record(payload);
         }
         if self.prefs.notify_sound {
             self.play_sound("receive.mp3", include_bytes!("../../../sounds/receive.mp3"));
         }
+    }
+
+    /// T-159: what a summary notification is titled -- the mailbox it is
+    /// about, by the name the reader gave it, or its address when they
+    /// gave it none. Never a sender: a summary quotes nobody (D14).
+    fn notification_account_title(&self, account_id: &AccountId) -> String {
+        self.accounts_cache
+            .iter()
+            .find(|account| &account.id == account_id)
+            .map(|account| notification_account_title(&account.name, &account.email))
+            .unwrap_or_else(|| account_id.as_str().to_string())
     }
 
     /// Nudges the background sync worker to look at the queue now instead
@@ -5651,7 +5865,7 @@ impl App {
         });
     }
 
-    fn clear_imap_form(&self) {
+    fn clear_imap_form(&mut self) {
         self.email_entry.set_text("");
         self.password_entry.set_text("");
         self.imap_host.set_text("");
@@ -5665,13 +5879,69 @@ impl App {
         self.insecure.set_visible(false);
         self.preset_notice.set_label("");
         self.preset_notice.set_visible(false);
+        self.set_autoconfig_hint(None);
+        self.autoconfig_asked = None;
+    }
+
+    /// T-156: the form as an autoconfig answer finds it. Read once, at the
+    /// moment the answer lands, so the decision that follows is made
+    /// against what is on screen rather than what was there at spawn time.
+    fn autoconfig_form_state(&self) -> AutoconfigFormState {
+        AutoconfigFormState {
+            email: self.email_entry.text().to_string(),
+            imap_host: self.imap_host.text().to_string(),
+            imap_port: self.imap_port.text().to_string(),
+            smtp_host: self.smtp_host.text().to_string(),
+            smtp_port: self.smtp_port.text().to_string(),
+        }
+    }
+
+    /// Write the fields `autoconfig_effect` cleared for writing, and no
+    /// others. Everything stays editable: a guess from the ISPDB is a
+    /// starting point, and the user is the one who knows their provider.
+    ///
+    /// Setting a security dropdown fires its own `selected` notify, so the
+    /// "Allow unencrypted" checkbox is re-synced by `WizardSecurityChanged`
+    /// without this having to know about it.
+    fn apply_autoconfig_fill(&self, fill: AutoconfigFill) {
+        if let Some(host) = fill.imap_host {
+            self.imap_host.set_text(&host);
+        }
+        if let Some(port) = fill.imap_port {
+            self.imap_port.set_text(&port);
+        }
+        if let Some(security) = fill.imap_security {
+            self.imap_security.set_selected(security.index());
+        }
+        if let Some(host) = fill.smtp_host {
+            self.smtp_host.set_text(&host);
+        }
+        if let Some(port) = fill.smtp_port {
+            self.smtp_port.set_text(&port);
+        }
+        if let Some(security) = fill.smtp_security {
+            self.smtp_security.set_selected(security.index());
+        }
+    }
+
+    fn set_autoconfig_hint(&self, message: Option<&str>) {
+        match message {
+            Some(text) => {
+                self.autoconfig_hint.set_label(text);
+                self.autoconfig_hint.set_visible(true);
+            }
+            None => {
+                self.autoconfig_hint.set_label("");
+                self.autoconfig_hint.set_visible(false);
+            }
+        }
     }
 
     /// Manual presets are deliberately just values for the regular form:
     /// every account still uses `ProvisionRequest::Password`, never an OAuth
     /// browser flow. The provider-specific help prevents a filled form from
     /// falsely implying that a normal account password will always work.
-    fn apply_mailbox_preset(&self, preset: MailboxPreset) {
+    fn apply_mailbox_preset(&mut self, preset: MailboxPreset) {
         let values = mailbox_preset_values(preset);
         self.clear_imap_form();
         self.imap_host.set_text(values.imap_host);
@@ -5845,6 +6115,27 @@ impl App {
 
     /// Picks the folder a mailbox opens on: its Inbox by name, not
     /// whatever `list_folders` happened to return first.
+    /// T-121: which folder the shell is in once a nav answer lands.
+    ///
+    /// `refill_nav` stopped reading Core on the spot, so the two recovery
+    /// branches that asked `folders_cache` right after asking for a refill
+    /// were reading the folder set the just-deleted account (or folder) was
+    /// still in: the condition was always false and the fallback never
+    /// fired. The decision belongs where the fresh folder set arrives.
+    fn folder_after_nav(current: &str, folders: &[FolderSummary]) -> String {
+        // An empty answer is not "the folder is gone", it is "there are no
+        // folders to move to" -- a mailbox that has not listed yet, or one
+        // whose `list_folders` failed. Moving then would only trade one
+        // empty list for another and cost a reload.
+        if folders.is_empty()
+            || current.starts_with("unified:")
+            || folders.iter().any(|f| f.folder.id.as_str() == current)
+        {
+            return current.to_string();
+        }
+        Self::opening_folder(folders)
+    }
+
     fn opening_folder(folders: &[FolderSummary]) -> String {
         folders
             .iter()
@@ -5863,16 +6154,23 @@ impl App {
         self.reload_list(sender);
     }
 
-    /// T-034: the remaining synchronous reversible action (Trash) consumes
-    /// the Core receipt and exposes its durable Undo ticket to the toast.
-    /// Archive and Snooze have their own mail_writer doors since T-143.
+    /// T-034: the reversible bulk action (Trash) consumes the Core receipt
+    /// and exposes its durable Undo ticket to the toast.
     /// An empty id list is a silent no-op (no toast for "nothing to act on").
+    ///
+    /// T-143's follow-up: like Archive, the dispatch itself happens on
+    /// `mail_writer`. It used to be a synchronous `dispatch_grouped` --
+    /// one IMMEDIATE transaction per mailbox, on the GTK thread, behind
+    /// SQLite's five second `busy_timeout` -- so deleting a selection
+    /// while the backfill was committing parked the window. The rows are
+    /// hidden here, and `Msg::DeleteWritten` is the answer: the toast, the
+    /// Undo tickets and (only if the write was refused) the reload.
     fn act_on_ids(
         &mut self,
         ids: Vec<String>,
         sender: &ComponentSender<Self>,
         label: &'static str,
-        build: impl Fn(AccountId, Vec<ThreadId>) -> Command,
+        build: impl Fn(AccountId, Vec<ThreadId>) -> Command + Send + 'static,
     ) {
         if self.screen != Screen::Inbox {
             return;
@@ -5880,26 +6178,24 @@ impl App {
         if ids.is_empty() {
             return;
         }
-        let result = self.dispatch_grouped(&ids, build);
-        // T-078 (c): see `select_thread`'s wake comment.
-        match result {
-            Ok(receipt) => {
-                self.wake_sync();
-                let tickets: Vec<_> = receipt
-                    .operations
-                    .iter()
-                    .map(|operation| operation.undo_ticket())
-                    .collect();
-                if !tickets.is_empty() {
-                    self.show_undo_toasts(label, tickets, sender);
-                } else {
-                    self.show_toast(label, sender);
-                }
-                self.clear_bulk_selection();
-                self.reload_list(sender);
-            }
-            Err(_) => self.show_toast("Couldn’t apply that change.", sender),
+        let queued = self.dispatch_grouped_async(
+            &ids,
+            build,
+            move |tickets, _operation_ids, error| Msg::DeleteWritten {
+                label,
+                tickets,
+                error,
+            },
+            sender,
+        );
+        if !queued {
+            self.show_toast("Couldn’t apply that change.", sender);
+            return;
         }
+        for id in &ids {
+            self.bulk_selection.remove(id);
+        }
+        self.hide_rows(&ids, sender);
     }
 
     /// T-035/T-143: dispatch one local snooze deadline through the normal
@@ -5971,31 +6267,25 @@ impl App {
         if targets.is_empty() {
             return;
         }
-        let core = Arc::clone(&self.core);
-        let outcome = core.lock().map(|mut core| {
+        // T-143's follow-up: `unsnooze_thread` opens a transaction per
+        // thread, and the whole loop used to run under one `core` lock on
+        // the GTK thread -- so bringing a selection back from Snoozed
+        // during a backfill parked the window for as long as SQLite's
+        // `busy_timeout` allowed, once per thread. The pairing above is
+        // primary-key lookups and stays here; the loop leaves.
+        let tx = sender.input_sender().clone();
+        self.mail_writer.run(move |core| {
             let mut woken = 0usize;
             let mut failed = false;
             for (account_id, thread_id) in targets {
-                match core.unsnooze_thread(&account_id, &thread_id) {
+                match with_retries(core, |core| core.unsnooze_thread(&account_id, &thread_id)) {
                     Ok(true) => woken += 1,
                     Ok(false) => {}
                     Err(_) => failed = true,
                 }
             }
-            (woken, failed)
+            tx.emit(Msg::UnsnoozeWritten { woken, failed });
         });
-        match outcome {
-            Ok((_, true)) | Err(_) => {
-                self.show_toast("Couldn’t apply that change.", sender);
-            }
-            Ok((0, false)) => self.show_toast("Nothing to unsnooze.", sender),
-            Ok((1, false)) => {
-                self.finish_unsnooze("Back in Inbox", sender);
-            }
-            Ok((_, false)) => {
-                self.finish_unsnooze("Threads are back in Inbox", sender);
-            }
-        }
     }
 
     fn finish_unsnooze(&mut self, label: &'static str, sender: &ComponentSender<Self>) {
@@ -6008,26 +6298,36 @@ impl App {
     }
 
     /// Permanent deletion is deliberately outside T-034: it bypasses Trash
-    /// and must never create an Undo ticket.
+    /// and must never create an Undo ticket. `Msg::PermanentDeleteWritten`
+    /// carries no tickets at all, so the receipt's are dropped on the
+    /// writer thread rather than reaching a toast that could offer them.
+    ///
+    /// T-143's follow-up: same move as `act_on_ids` above, for the same
+    /// reason -- this was an IMMEDIATE transaction on the GTK thread.
     fn act_on_ids_irreversible(
         &mut self,
         ids: Vec<String>,
         sender: &ComponentSender<Self>,
         label: &'static str,
-        build: impl Fn(AccountId, Vec<ThreadId>) -> Command,
+        build: impl Fn(AccountId, Vec<ThreadId>) -> Command + Send + 'static,
     ) {
         if self.screen != Screen::Inbox || ids.is_empty() {
             return;
         }
-        let result = self.dispatch_grouped(&ids, build);
-        if result.is_ok() {
-            self.wake_sync();
-            self.show_toast(label, sender);
-            self.clear_bulk_selection();
-            self.reload_list(sender);
-        } else {
+        let queued = self.dispatch_grouped_async(
+            &ids,
+            build,
+            move |_tickets, _operation_ids, error| Msg::PermanentDeleteWritten { label, error },
+            sender,
+        );
+        if !queued {
             self.show_toast("Couldn’t apply that change.", sender);
+            return;
         }
+        for id in &ids {
+            self.bulk_selection.remove(id);
+        }
+        self.hide_rows(&ids, sender);
     }
 
     /// T-033/T-143: Archive is optimistic in the Inbox. Core is still the
@@ -6076,9 +6376,14 @@ impl App {
     }
 
     fn account(&self) -> Account {
-        self.current_account
-            .as_ref()
-            .and_then(|id| self.accounts_cache.iter().find(|a| &a.id == id))
+        self.account_or_placeholder(self.current_account.as_ref())
+    }
+
+    /// The account row behind an id, or the "No account" placeholder the
+    /// empty shell paints. Compose asks for the mailbox that owns its
+    /// draft, which in the merged view is not `current_account`.
+    fn account_or_placeholder(&self, id: Option<&AccountId>) -> Account {
+        id.and_then(|id| self.accounts_cache.iter().find(|a| &a.id == id))
             .cloned()
             .unwrap_or_else(|| Account {
                 id: AccountId(String::new()),
@@ -6097,7 +6402,7 @@ impl App {
         response_draft: Option<Draft>,
         sender: &ComponentSender<Self>,
     ) {
-        let account = self.account();
+        let account = self.account_or_placeholder(self.compose_account.as_ref());
         self.ignore_compose_changes.set(true);
         self.compose_from.set_text(&account.email);
         self.compose_cc.set_text("");
@@ -6109,7 +6414,7 @@ impl App {
         self.forward_attachment_candidates.clear();
         let restored = response_draft.or_else(|| {
             if kind == ComposeKind::New {
-                self.current_account
+                self.compose_account
                     .as_ref()
                     .and_then(|account_id| self.core.lock().unwrap().latest_draft(account_id).ok())
                     .flatten()
@@ -6136,6 +6441,14 @@ impl App {
         }
         self.compose_dirty = false;
         self.compose_save_inflight = false;
+        // A window that is being filled in now owns nothing the previous
+        // one parked: a Send waiting behind its save, a close or a discard
+        // waiting for the same answer. The session bump (after the draft id
+        // above, so the new session already owns its own row) is what makes
+        // those answers land as no-ops instead of rebinding this window.
+        self.compose_send_pending = false;
+        self.compose_close_pending = false;
+        self.compose_session = self.compose_session.wrapping_add(1);
         self.ignore_compose_changes.set(false);
         self.refill_compose_attachments(sender);
         self.refill_forward_attachment_choices(sender);
@@ -6173,6 +6486,7 @@ impl App {
         let quote = compose_quote(&self.body_state);
         let core = Arc::clone(&self.core);
         let tx = sender.input_sender().clone();
+        let owner = account_id.clone();
         std::thread::spawn(move || {
             let result = core
                 .lock()
@@ -6181,6 +6495,7 @@ impl App {
                 .map_err(|err| err.message);
             tx.emit(Msg::ResponseDraftReady {
                 kind,
+                account_id: owner,
                 source_message_id: message_id,
                 result,
             });
@@ -6332,16 +6647,23 @@ impl App {
         }
     }
 
+    /// A hidden window normally has nothing worth writing, but the close
+    /// itself is a save: `Msg::CloseCompose` hides the window and only then
+    /// finds out that a previous autosave is still in flight, so the retry
+    /// arrives after the window is gone. `compose_close_pending` is that
+    /// retry's permission to run.
     fn save_current_draft(&mut self, gen: u64, sender: &ComponentSender<Self>) {
-        if self.compose_save_inflight || !self.compose.is_visible() {
+        if self.compose_save_inflight || (!self.compose.is_visible() && !self.compose_close_pending)
+        {
             return;
         }
-        let Some(account_id) = self.current_account.clone() else {
+        let Some(account_id) = self.compose_account.clone() else {
             return;
         };
         self.compose_save_inflight = true;
         self.compose_dirty = false;
         let core = Arc::clone(&self.core);
+        let session = self.compose_session;
         let draft_id = self.compose_draft_id.clone();
         let content = self.compose_content();
         let tx = sender.input_sender().clone();
@@ -6351,16 +6673,25 @@ impl App {
                 .unwrap()
                 .save_draft(&account_id, draft_id.as_ref(), content)
                 .map_err(|err| err.message);
-            tx.emit(Msg::DraftSaved { gen, result });
+            tx.emit(Msg::DraftSaved {
+                session,
+                gen,
+                result,
+            });
         });
     }
 
     fn folder_label(&self, id: &str) -> String {
-        self.folders_cache
-            .iter()
-            .find(|f| f.folder.id.as_str() == id)
-            .map(|f| f.folder.label.clone())
-            .unwrap_or_else(|| "Inbox".into())
+        folder_label_from(&self.folders_cache, id)
+    }
+
+    /// T-108/T-119: which of `empty_copy`'s copies the folder on screen
+    /// gets. Folder ids are account-scoped ("acc1:inbox") and the merged
+    /// view's are "unified:inbox", so comparing the id itself with the
+    /// literals `empty_copy` matches on never hit -- Inbox and Sent showed
+    /// the anonymous "No messages." like any other folder.
+    fn empty_copy_key(&self) -> &'static str {
+        empty_copy_key_for(&self.folder, &self.folders_cache)
     }
 
     /// Mirrors FakeMailStore's old `cache_empty` skeleton flag, now backed
@@ -7056,7 +7387,9 @@ struct SearchChangedEffect {
 /// could mean "and also write to `search_history`" or "and also start a
 /// search". `Core::record_search_history` is only ever reachable from
 /// [`should_record_search_history`]'s caller, in the `Msg::
-/// SearchDebounced` arm -- T-049 (д) is therefore true not merely
+/// SearchDebounced` arm -- which since T-143's follow-up hands it to
+/// `App::record_search_history`, i.e. to the mailbox writer thread, and
+/// still to nowhere else. T-049 (д) is therefore true not merely
 /// because nobody happens to call it from here today, but because this
 /// function's return type has nowhere to put that call.
 fn search_changed_effect(
@@ -7123,6 +7456,127 @@ fn provisioned_effect(
     }
 }
 
+/// T-156: the Other-IMAP form as one autoconfig answer finds it. Plain
+/// strings, so the two decisions below can be tested without a display.
+///
+/// No `Debug`: `email` is the user's address, and D14 keeps it out of
+/// printed lines even in a struct nobody logs today.
+#[derive(Clone, Default)]
+struct AutoconfigFormState {
+    email: String,
+    imap_host: String,
+    imap_port: String,
+    smtp_host: String,
+    smtp_port: String,
+}
+
+/// Which fields an autoconfig answer may write. `None` is "the user
+/// already put something there, and it wins".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AutoconfigFill {
+    imap_host: Option<String>,
+    imap_port: Option<String>,
+    imap_security: Option<MailSecurity>,
+    smtp_host: Option<String>,
+    smtp_port: Option<String>,
+    smtp_security: Option<MailSecurity>,
+}
+
+/// What one autoconfig reply is allowed to do to the wizard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AutoconfigEffect {
+    /// The address moved on while the lookup was in flight.
+    Stale,
+    /// Nothing was found, or nothing is left to fill: the manual form
+    /// stands as it is, with no message. A provider simply not being in
+    /// the ISPDB is not an error the user did anything about.
+    Silent,
+    Fill(AutoconfigFill),
+    /// Something went wrong that is worth one line under the form -- never
+    /// a modal, because the manual form behind it is still perfectly usable.
+    Hint(String),
+}
+
+/// T-156: whether leaving the address field is worth a network lookup, and
+/// for which address.
+///
+/// Deliberately not per keystroke: every `Some` here is one HTTPS request
+/// to the ISPDB plus two DNS queries. It also refuses once a server field
+/// has been filled in by hand -- the answer would have nothing left to
+/// write -- and refuses to ask twice for the same address, so tabbing back
+/// and forth through the form costs nothing.
+fn autoconfig_trigger(
+    email: &str,
+    imap_host: &str,
+    smtp_host: &str,
+    asked: Option<&str>,
+) -> Option<String> {
+    let email = email.trim();
+    let (local, domain) = email.split_once('@')?;
+    if local.is_empty() || domain.is_empty() {
+        return None;
+    }
+    if !imap_host.trim().is_empty() || !smtp_host.trim().is_empty() {
+        return None;
+    }
+    if asked.is_some_and(|prev| prev.eq_ignore_ascii_case(email)) {
+        return None;
+    }
+    Some(email.to_string())
+}
+
+/// T-156. Two hazards live here, and neither is visible from the widgets:
+///
+/// * the lookup is a network round-trip that cannot be cancelled, so the
+///   address it was started for has to be compared against the address in
+///   the field when it answers -- otherwise a slow reply for the mailbox
+///   the user gave up on overwrites the one being typed now. Same shape as
+///   `provisioned_effect`'s `gen`, with the address standing in for the
+///   counter because that is what the lookup is keyed by;
+/// * the answer is a *suggestion*, not a correction. Anything already in
+///   the form outranks it, so a field is filled only while it is empty --
+///   and a protocol's security dropdown, which has no "empty", only while
+///   that protocol's host is empty, since the host is what says whether
+///   the user has touched that half of the form at all.
+fn autoconfig_effect(
+    started_for: &WizardEmail,
+    form: &AutoconfigFormState,
+    outcome: AutoconfigOutcome,
+) -> AutoconfigEffect {
+    if !started_for.matches(&form.email) {
+        return AutoconfigEffect::Stale;
+    }
+    match outcome {
+        AutoconfigOutcome::NotFound => AutoconfigEffect::Silent,
+        AutoconfigOutcome::Failed(message) => AutoconfigEffect::Hint(message),
+        AutoconfigOutcome::Found(found) => {
+            let imap_free = form.imap_host.trim().is_empty();
+            let smtp_free = form.smtp_host.trim().is_empty();
+            let fill = AutoconfigFill {
+                imap_host: imap_free.then(|| found.imap_host.clone()),
+                imap_port: form
+                    .imap_port
+                    .trim()
+                    .is_empty()
+                    .then(|| found.imap_port.to_string()),
+                imap_security: imap_free.then_some(found.imap_security),
+                smtp_host: smtp_free.then(|| found.smtp_host.clone()),
+                smtp_port: form
+                    .smtp_port
+                    .trim()
+                    .is_empty()
+                    .then(|| found.smtp_port.to_string()),
+                smtp_security: smtp_free.then_some(found.smtp_security),
+            };
+            if fill == AutoconfigFill::default() {
+                AutoconfigEffect::Silent
+            } else {
+                AutoconfigEffect::Fill(fill)
+            }
+        }
+    }
+}
+
 /// Whether this event means the thread rows themselves may have changed. A failed
 /// inbound pass only updates its retry bookkeeping, so it must not erase and
 /// refill the visible list. A successful folder pass and a due Snooze wake both
@@ -7172,6 +7626,26 @@ fn merge_warmup_queue(
     }
 }
 
+/// Same rule as [`marked_folder_read_toast`]: a profile whose index has
+/// exactly one message left to do is where "1 messages" is most visible.
+fn indexing_queued_toast(count: usize) -> String {
+    if count == 1 {
+        "Queued 1 message for indexing".to_string()
+    } else {
+        format!("Queued {count} messages for indexing")
+    }
+}
+
+/// Same rule as [`marked_folder_read_toast`]: a profile with exactly one
+/// cached body is where "1 messages" is most visible.
+fn cache_cleared_toast(count: usize) -> String {
+    if count == 1 {
+        "Cleared 1 cached message".to_string()
+    } else {
+        format!("Cleared {count} cached messages")
+    }
+}
+
 /// T-106: what the toast says after a whole folder was marked read. Plural
 /// spelled out rather than "1 conversation(s)": the count is the only thing
 /// that tells the owner the click did what they meant, and a folder with
@@ -7182,6 +7656,71 @@ fn marked_folder_read_toast(count: usize) -> String {
         "Marked 1 conversation as read".to_string()
     } else {
         format!("Marked {count} conversations as read")
+    }
+}
+
+/// T-159: how many letters one sync tick will announce one by one before
+/// it stops naming them and says how many there were instead.
+///
+/// The same 20 the candidate query has always been asked for; it is named
+/// here because it is now two decisions and not one -- how many rows to
+/// fetch, and where "a burst" starts.
+const NEW_MAIL_NOTIFICATION_LIMIT: usize = 20;
+
+/// T-159: what one sync tick's new mail is announced as.
+///
+/// The decision is pulled out of `notify_new_mail` for the reason
+/// [`search_changed_effect`] gives about its own: the function takes two
+/// numbers and returns a verdict, so it can be checked at the boundary
+/// without a display, a database or a bus -- and the watermark rule below
+/// it, which differs between the two cases, is checked against the same
+/// verdict rather than against a re-derived one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewMailAnnouncement {
+    /// Nothing arrived above the watermark. Say nothing, post nothing.
+    Nothing,
+    /// One notification per letter, naming its sender and subject: the
+    /// ordinary case, and the only one that tells the reader anything
+    /// about the mail itself.
+    EachLetter,
+    /// One notification for the whole tick. `count` is every candidate
+    /// there was, including the ones the fetch limit never returned --
+    /// which is exactly why the summary may clear all of them.
+    Summary { count: usize },
+}
+
+fn new_mail_announcement(candidate_count: usize, limit: usize) -> NewMailAnnouncement {
+    match candidate_count {
+        0 => NewMailAnnouncement::Nothing,
+        count if count > limit => NewMailAnnouncement::Summary { count },
+        _ => NewMailAnnouncement::EachLetter,
+    }
+}
+
+/// T-159: the body of a summary notification. Same rule as
+/// [`marked_folder_read_toast`] (T-106): the plural is spelled out rather
+/// than "N message(s)". A count of one cannot reach here today -- the
+/// summary only stands in past the limit -- and the singular is written
+/// anyway, because the day the limit is lowered is not the day to discover
+/// that this string was only ever right by arithmetic.
+fn new_mail_summary_body(count: usize) -> String {
+    if count == 1 {
+        "1 new message".to_string()
+    } else {
+        format!("{count} new messages")
+    }
+}
+
+/// T-159: the title of a summary notification -- the mailbox's own name,
+/// falling back to its address when the account has none. Split out of
+/// [`App::notification_account_title`] so the choice is testable without
+/// an `App`.
+fn notification_account_title(name: &str, email: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        email.trim().to_string()
+    } else {
+        name.to_string()
     }
 }
 
@@ -7807,6 +8346,64 @@ fn body_reply_is_current(current_gen: u64, incoming_gen: u64) -> bool {
     current_gen == incoming_gen
 }
 
+/// Same shape as [`body_reply_is_current`], for the three background
+/// answers that rebind the compose window to a draft: a save, an attach
+/// and a queued send. A window closed and reopened while one of them was
+/// out is a different session, and its answer must not reach the new one.
+fn compose_reply_is_current(current_session: u64, incoming_session: u64) -> bool {
+    current_session == incoming_session
+}
+
+/// T-163: the same shape again, for the folder-CRUD and account answers
+/// that now come back from the mailbox writer thread. "Current" here is
+/// not a counter but a place -- see [`reader_place_stamp`].
+fn place_reply_is_current(current_place: u64, incoming_place: u64) -> bool {
+    current_place == incoming_place
+}
+
+/// T-163: where the reader is, boiled down to one number.
+///
+/// Four fields, because between pressing a folder or account button and
+/// the writer thread answering, any of them can have moved: the mailbox
+/// (`account`), the folder inside it, the Settings row whose name is being
+/// edited, and the Settings row with a removal armed. An answer is applied
+/// to the place it was issued from and to no other.
+///
+/// Free function rather than a method so the rule can be checked without
+/// a display: [`App::reader_place`] is the one caller and does nothing
+/// but read the four fields into it.
+fn reader_place_stamp(
+    account: Option<&str>,
+    folder: &str,
+    editing: Option<&str>,
+    pending_remove: Option<&str>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    account.hash(&mut hasher);
+    folder.hash(&mut hasher);
+    editing.hash(&mut hasher);
+    pending_remove.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether the answer to an in-flight save should start another one. A
+/// window that is closing is still worth writing -- `Msg::CloseCompose`
+/// hides it before the retry can run, so visibility alone would drop the
+/// edits made while the previous save was out.
+fn draft_save_retry(dirty: bool, visible: bool, close_pending: bool) -> bool {
+    dirty && (visible || close_pending)
+}
+
+/// A draft the reader threw away while a save of it was still in flight.
+/// D14: identifiers only -- no subject, no body, nothing to log.
+#[derive(Clone)]
+struct PendingDiscard {
+    session: u64,
+    account: AccountId,
+    draft: Option<DraftId>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ComposeKind {
     New,
@@ -7815,11 +8412,23 @@ enum ComposeKind {
     Forward,
 }
 
+/// T-046: the plaintext quote GTK puts under a response.
+///
+/// An HTML letter has no text part to quote -- and with `prefer_plain` off
+/// (the default) that is how a `multipart/alternative` is prepared, i.e.
+/// almost every letter. Quoting only `PreparedBody::Plain` therefore meant
+/// almost every reply left without the conversation it answers. The
+/// sanitized markup is already in hand, so the quote comes from the same
+/// tag-stripping Core uses for previews.
 fn compose_quote(state: &BodyState) -> String {
-    let text = match state {
-        BodyState::Ready(PreparedBody::Plain { text, .. }) => text.trim(),
-        _ => "",
+    let text: String = match state {
+        BodyState::Ready(PreparedBody::Plain { text, .. }) => text.trim().to_string(),
+        BodyState::Ready(PreparedBody::Html { sanitized, .. }) => {
+            quote_text_from_html(sanitized).trim().to_string()
+        }
+        _ => String::new(),
     };
+    let text = truncate_quote(&text);
     if text.is_empty() {
         String::new()
     } else {
@@ -7830,6 +8439,161 @@ fn compose_quote(state: &BodyState) -> String {
             .join("\n");
         format!("\n\n{quoted}")
     }
+}
+
+/// The plaintext behind sanitized markup, laid out for a quote.
+///
+/// `feathermail_core::plain_body` is the *preview's* extractor: it strips
+/// tags and entities and then collapses every whitespace run -- line
+/// breaks included -- into single spaces, which is exactly right for a
+/// one-line snippet and exactly wrong for a quote (the letter would come
+/// back as one paragraph, with words glued across the tag boundaries that
+/// separated them). So the markup is cut on its block elements first and
+/// each piece goes through that same shared extractor: one tag stripper in
+/// the project, and the paragraphs the sender wrote still on their own
+/// lines.
+fn quote_text_from_html(html: &str) -> String {
+    let body = strip_raw_text_elements(html);
+    let joined = html_block_chunks(&body)
+        .into_iter()
+        .map(feathermail_core::model::plain_body)
+        .collect::<Vec<_>>()
+        .join("\n");
+    collapse_blank_lines(&joined)
+}
+
+/// Elements whose content is not text to read. The CSS the sanitizer keeps
+/// in a `<style>` block is markup for the renderer; quoted into a reply it
+/// is noise the reader never wrote.
+fn strip_raw_text_elements(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    'outer: loop {
+        let lower = rest.to_ascii_lowercase();
+        for tag in ["style", "script"] {
+            let open = format!("<{tag}");
+            if let Some(start) = lower.find(&open) {
+                let close = format!("</{tag}");
+                let after = match lower[start..].find(&close) {
+                    Some(rel) => match lower[start + rel..].find('>') {
+                        Some(end) => start + rel + end + 1,
+                        None => rest.len(),
+                    },
+                    None => rest.len(),
+                };
+                out.push_str(&rest[..start]);
+                out.push(' ');
+                rest = &rest[after..];
+                continue 'outer;
+            }
+        }
+        break;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The tags a quote's line breaks come from: everything that stands for
+/// "a new line starts here" in the markup a mail composer emits.
+const QUOTE_BLOCK_TAGS: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "br",
+    "dd",
+    "div",
+    "dl",
+    "dt",
+    "figure",
+    "footer",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "li",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "tbody",
+    "td",
+    "th",
+    "tr",
+    "ul",
+];
+
+/// Cut markup where its block elements say a line ends. The pieces are
+/// still markup -- inline tags and entities are left for `plain_body`.
+fn html_block_chunks(html: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut cursor = 0usize;
+    while let Some(rel) = html[cursor..].find('<') {
+        let open = cursor + rel;
+        let Some(rel_end) = html[open..].find('>') else {
+            break;
+        };
+        let close = open + rel_end;
+        let name: String = html[open + 1..close]
+            .trim_start_matches('/')
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        if QUOTE_BLOCK_TAGS.contains(&name.as_str()) {
+            chunks.push(&html[start..open]);
+            start = close + 1;
+        }
+        cursor = close + 1;
+    }
+    chunks.push(&html[start..]);
+    chunks
+}
+
+/// Cutting on every block element leaves ladders of blank lines where the
+/// nesting was. Two or more in a row become one, which is what a
+/// hand-written plaintext part would have had.
+fn collapse_blank_lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut blanks = 0usize;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            blanks += 1;
+            if blanks > 1 {
+                continue;
+            }
+        } else {
+            blanks = 0;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// A sanitized HTML newsletter can be hundreds of kilobytes of text, and
+/// all of it would be written into the draft on every autosave. The quote
+/// is context, not an archive: past the ceiling it is cut on a line
+/// boundary and says so.
+const MAX_QUOTE_CHARS: usize = 8_000;
+
+fn truncate_quote(text: &str) -> String {
+    if text.chars().count() <= MAX_QUOTE_CHARS {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(MAX_QUOTE_CHARS).collect();
+    let cut = match cut.rfind('\n') {
+        Some(at) if at > 0 => &cut[..at],
+        _ => cut.as_str(),
+    };
+    format!("{}\n[...]", cut.trim_end())
 }
 
 /// T-032: what a Delete entry does about `prefs.confirm_delete`. Every
@@ -8048,17 +8812,25 @@ fn fit_thread_cards(cards: &gtk::Box) {
     }
 }
 
-fn collapsed_thread_card(msg: &ThreadMessage, sender: &ComponentSender<App>) -> gtk::Button {
+fn collapsed_thread_card(
+    msg: &ThreadMessage,
+    now: i64,
+    sender: &ComponentSender<App>,
+) -> gtk::Button {
     let btn = gtk::Button::new();
     btn.add_css_class("thread-card");
     btn.add_css_class("collapsed");
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let name = gtk::Label::new(Some(&msg.from.name));
+    // The row this name came from can hold a raw `=?UTF-8?B?...?=`: only
+    // `CoreSyncStore::upsert_one` decodes on the way in, and a profile that
+    // predates it still has the wire form in `messages.sender_name`. The
+    // meta line above these cards already decodes when it paints.
+    let name = gtk::Label::new(Some(&decode_encoded_words(&msg.from.name)));
     name.add_css_class("meta-name");
     name.set_xalign(0.0);
     name.set_hexpand(true);
     name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    let time = gtk::Label::new(Some(&format_clock(msg.date, FIXTURE_NOW)));
+    let time = gtk::Label::new(Some(&format_clock(msg.date, now)));
     time.add_css_class("meta-time");
     row.append(&name);
     row.append(&time);
@@ -8069,17 +8841,21 @@ fn collapsed_thread_card(msg: &ThreadMessage, sender: &ComponentSender<App>) -> 
     btn
 }
 
-fn expanded_thread_card(msg: &ThreadMessage) -> gtk::Box {
+fn expanded_thread_card(msg: &ThreadMessage, now: i64) -> gtk::Box {
     let col = gtk::Box::new(gtk::Orientation::Vertical, 12);
     col.add_css_class("thread-card");
     col.add_css_class("expanded");
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let name = gtk::Label::new(Some(&msg.from.name));
+    // The row this name came from can hold a raw `=?UTF-8?B?...?=`: only
+    // `CoreSyncStore::upsert_one` decodes on the way in, and a profile that
+    // predates it still has the wire form in `messages.sender_name`. The
+    // meta line above these cards already decodes when it paints.
+    let name = gtk::Label::new(Some(&decode_encoded_words(&msg.from.name)));
     name.add_css_class("meta-name");
     name.set_xalign(0.0);
     name.set_hexpand(true);
     name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    let time = gtk::Label::new(Some(&format_clock(msg.date, FIXTURE_NOW)));
+    let time = gtk::Label::new(Some(&format_clock(msg.date, now)));
     time.add_css_class("meta-time");
     time.set_valign(gtk::Align::Start);
     row.append(&name);
@@ -8587,7 +9363,10 @@ fn display_folder_label(input: &str) -> String {
             return out;
         };
         let token = &encoded[..end];
-        let wire = &rest[..start + end + 2];
+        // The prefix before `&` is already in `out`; a literal fallback must
+        // therefore start at the `&` itself, or every undecodable token
+        // writes the prefix a second time ("Work&a b-c" -> "WorkWork&a b-c").
+        let wire = &rest[start..start + end + 2];
         if token.is_empty() {
             out.push('&');
         } else if token
@@ -8617,6 +9396,69 @@ fn display_folder_label(input: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// See [`App::empty_copy_key`].
+fn empty_copy_key_for(folder: &str, folders: &[FolderSummary]) -> &'static str {
+    unified_folder_kind(folder)
+        .or_else(|| {
+            folders
+                .iter()
+                .find(|f| f.folder.id.as_str() == folder)
+                .map(|f| f.folder.kind)
+        })
+        .map(FolderKind::as_str)
+        .unwrap_or("")
+}
+
+/// The list column's heading and the sidebar row must spell one folder one
+/// way: both decode a historic pre-T-077 modified UTF-7 label, and the
+/// heading used to print the raw wire form.
+fn folder_label_from(folders: &[FolderSummary], id: &str) -> String {
+    folders
+        .iter()
+        .find(|f| f.folder.id.as_str() == id)
+        .map(|f| display_folder_label(&f.folder.label))
+        .unwrap_or_else(|| "Inbox".into())
+}
+
+/// DESIGN.md ("Message preview"): the chip beside the subject names the
+/// folder the letter is in. `Thread.labels` is empty for every row Core
+/// maps out of SQLite, so the chip's fallback was the only branch that ever
+/// ran and every letter -- in Trash, in Sent -- was labelled "Inbox".
+fn preview_chip_label(thread: Option<&Thread>, folders: &[FolderSummary]) -> String {
+    thread
+        .and_then(|t| folders.iter().find(|f| f.folder.id == t.folder))
+        .map(|f| display_folder_label(&f.folder.label))
+        .unwrap_or_else(|| "Inbox".into())
+}
+
+/// T-161: the chip on a list row, or `None` when the row must not wear one.
+///
+/// DESIGN.md ("Message row") promised a chip on the top line. It was built
+/// from `Thread.labels`, which `Core::map_thread` fills with an empty
+/// vector for every row it maps out of SQLite, so the chip never once
+/// painted in a real profile -- the same defect [`preview_chip_label`]
+/// already had to work around for the reading pane.
+///
+/// What the chip is actually for is a list that mixes folders: Starred and
+/// Snoozed are virtual, the merged view is every mailbox at once, and in
+/// both a row's own folder is news. In an ordinary folder every row would
+/// repeat the column heading, so there is nothing to say and nothing is
+/// drawn. A folder `folders` has no label for -- a mailbox whose sidebar
+/// has not answered yet -- is also nothing to say, rather than a guess.
+fn row_chip_label(
+    list_folder: &str,
+    thread_folder: &str,
+    folders: &[FolderSummary],
+) -> Option<String> {
+    if list_folder == thread_folder {
+        return None;
+    }
+    folders
+        .iter()
+        .find(|f| f.folder.id.as_str() == thread_folder)
+        .map(|f| display_folder_label(&f.folder.label))
 }
 
 fn compose_send_ready(from: &str, to: &str) -> bool {
@@ -9601,6 +10443,7 @@ struct ImapFormWidgets {
     smtp_security: gtk::DropDown,
     insecure: gtk::CheckButton,
     preset_notice: gtk::Label,
+    autoconfig_hint: gtk::Label,
 }
 
 struct MailboxPresetValues {
@@ -9816,6 +10659,17 @@ fn build_imap_form(sender: &ComponentSender<App>) -> ImapFormWidgets {
     preset_notice.set_xalign(0.0);
     preset_notice.set_wrap(true);
     preset_notice.set_visible(false);
+    // T-156: an autoconfig lookup that could not be completed says so
+    // here, one line under the form, and nowhere else. A modal would put
+    // a dismiss click in front of a form that is already usable -- the
+    // manual fields are the fallback, not a consolation prize. It borrows
+    // `preset-notice`'s styling because it is the same kind of line in the
+    // same place, only ever one of the two visible at a time.
+    let autoconfig_hint = gtk::Label::new(None);
+    autoconfig_hint.add_css_class("preset-notice");
+    autoconfig_hint.set_xalign(0.0);
+    autoconfig_hint.set_wrap(true);
+    autoconfig_hint.set_visible(false);
 
     root.append(&labeled("Email", &email));
     root.append(&password_field(&password));
@@ -9833,12 +10687,24 @@ fn build_imap_form(sender: &ComponentSender<App>) -> ImapFormWidgets {
     ));
     root.append(&insecure);
     root.append(&preset_notice);
+    root.append(&autoconfig_hint);
 
     let add = gtk::Button::with_label("Add mailbox");
     add.add_css_class("btn-primary");
     let tx = sender.input_sender().clone();
     add.connect_clicked(move |_| tx.emit(Msg::AddMailbox));
     root.append(&add);
+
+    // T-156: the address is looked up when the user is done with the
+    // field, not while they are still typing it -- `connect_changed` here
+    // would put an HTTPS request and two DNS queries behind every
+    // keystroke. Leaving the field is the cheapest honest signal GTK has
+    // that the address is finished; asking twice for the same one is
+    // refused further in, in `autoconfig_trigger`.
+    let focus = gtk::EventControllerFocus::new();
+    let tx = sender.input_sender().clone();
+    focus.connect_leave(move |_| tx.emit(Msg::WizardEmailEntered));
+    email.add_controller(focus);
 
     ImapFormWidgets {
         root,
@@ -9852,6 +10718,7 @@ fn build_imap_form(sender: &ComponentSender<App>) -> ImapFormWidgets {
         smtp_security,
         insecure,
         preset_notice,
+        autoconfig_hint,
     }
 }
 
@@ -11365,16 +12232,16 @@ impl SimpleComponent for App {
                                             gtk::Label {
                                                 add_css_class: "title",
                                                 #[watch]
-                                                set_label: &empty_copy(&model.folder, false).title,
+                                                set_label: &empty_copy(model.empty_copy_key(), false).title,
                                                 set_wrap: true,
                                                 set_xalign: 0.0,
                                             },
                                             gtk::Label {
                                                 add_css_class: "body",
                                                 #[watch]
-                                                set_label: &empty_copy(&model.folder, false).body,
+                                                set_label: &empty_copy(model.empty_copy_key(), false).body,
                                                 #[watch]
-                                                set_visible: !empty_copy(&model.folder, false).body.is_empty(),
+                                                set_visible: !empty_copy(model.empty_copy_key(), false).body.is_empty(),
                                                 set_wrap: true,
                                                 set_xalign: 0.0,
                                             },
@@ -11525,7 +12392,12 @@ impl SimpleComponent for App {
                                             gtk::Label {
                                                 add_css_class: "chip",
                                                 #[watch]
-                                                set_label: &model.selected_thread().and_then(|t| t.labels.first().cloned()).unwrap_or_else(|| "Inbox".into()),
+                                                set_label: &preview_chip_label(model.selected_thread().as_ref(), &model.folders_cache),
+                                                // T-101: a long folder name
+                                                // may not raise the reading
+                                                // pane's minimum width.
+                                                set_ellipsize: gtk::pango::EllipsizeMode::End,
+                                                set_max_width_chars: 14,
                                                 set_valign: gtk::Align::Start,
                                             },
                                             // T-032: preview-head star + More
@@ -11606,7 +12478,7 @@ impl SimpleComponent for App {
                                                 gtk::Label {
                                                     add_css_class: "meta-time",
                                                     #[watch]
-                                                    set_label: &model.selected_thread().map(|t| format_clock(t.date, FIXTURE_NOW)).unwrap_or_default(),
+                                                    set_label: &model.selected_thread().map(|t| format_clock(t.date, wall_clock_now())).unwrap_or_default(),
                                                     set_valign: gtk::Align::Start,
                                                 },
                                             },
@@ -12231,6 +13103,11 @@ impl SimpleComponent for App {
             list_save_gen: 0,
             current_account,
             accounts_cache,
+            // T-161: the merged view's own chip table arrives with the
+            // first `Msg::NavLoaded`; until then a startup on the merged
+            // view simply has no chip to draw, which is the same answer
+            // an empty folder list gives everywhere else in this file.
+            chip_folders: folders_cache.clone(),
             folders_cache,
             threads_gen: 0,
             nav_gen: 0,
@@ -12250,10 +13127,14 @@ impl SimpleComponent for App {
             compose_message_id: None,
             compose_kind: ComposeKind::New,
             compose_draft_id: None,
+            compose_account: None,
+            compose_session: 0,
             compose_save_gen: 0,
             compose_dirty: false,
             compose_save_inflight: false,
             compose_send_pending: false,
+            compose_close_pending: false,
+            compose_discard_pending: None,
             ignore_compose_changes,
             compose_attachments: Vec::new(),
             forward_attachment_candidates: Vec::new(),
@@ -12340,6 +13221,8 @@ impl SimpleComponent for App {
             smtp_security: form.smtp_security,
             insecure: form.insecure,
             preset_notice: form.preset_notice,
+            autoconfig_hint: form.autoconfig_hint,
+            autoconfig_asked: None,
             search_open: false,
             search_draft: String::new(),
             search_gen: 0,
@@ -12939,23 +13822,27 @@ impl SimpleComponent for App {
                 if self.toast_tickets.is_empty() {
                     return;
                 }
+                // The tickets are consumed here and now: taking them is
+                // what makes a second press a no-op while the first is
+                // still in flight, and clearing `pending_archive_ops` is
+                // pure in-memory bookkeeping that must not wait on SQLite.
+                // T-143's follow-up: only the `undo` calls leave -- one
+                // IMMEDIATE transaction per ticket, which is what made
+                // Undo after a large "Mark all as read" park the window.
                 let tickets = std::mem::take(&mut self.toast_tickets);
-                let mut failed = false;
-                for ticket in tickets {
+                for ticket in &tickets {
                     self.pending_archive_ops.remove(&ticket.operation_id);
-                    if self.core.lock().unwrap().undo(&ticket).is_err() {
-                        failed = true;
+                }
+                let tx = sender.input_sender().clone();
+                self.mail_writer.run(move |core| {
+                    let mut failed = false;
+                    for ticket in &tickets {
+                        if with_retries(core, |core| core.undo(ticket)).is_err() {
+                            failed = true;
+                        }
                     }
-                }
-                if failed {
-                    self.show_toast("Couldn’t undo that change.", &sender);
-                } else {
-                    self.toast = None;
-                    self.toast_undo = false;
-                    self.toast_generation = self.toast_generation.wrapping_add(1);
-                    self.wake_sync();
-                    self.reload_list(&sender);
-                }
+                    tx.emit(Msg::UndoWritten { failed });
+                });
             }
             Msg::HideToast { gen } if toast_generation_is_current(gen, self.toast_generation) => {
                 self.toast = None;
@@ -13353,6 +14240,11 @@ impl SimpleComponent for App {
                 self.compose_kind = ComposeKind::New;
                 self.compose_thread_id = None;
                 self.compose_message_id = None;
+                // A new letter is written from the mailbox on screen; a
+                // response is written from the mailbox the letter is in
+                // (`Msg::ResponseDraftReady`). Either way compose reads
+                // this and never the account menu again.
+                self.compose_account = self.current_account.clone();
                 self.present_compose(ComposeKind::New, None, &sender);
             }
             Msg::Reply if inbox => {
@@ -13366,6 +14258,7 @@ impl SimpleComponent for App {
             }
             Msg::ResponseDraftReady {
                 kind,
+                account_id,
                 source_message_id,
                 result,
             } => match result {
@@ -13377,6 +14270,11 @@ impl SimpleComponent for App {
                     };
                     self.compose_thread_id = draft.thread_id.clone();
                     self.compose_message_id = draft.in_reply_to.clone();
+                    // Core created this draft under the mailbox the letter
+                    // is in, and refuses every later write from any other
+                    // one. In the merged view that is not the mailbox the
+                    // account menu shows.
+                    self.compose_account = Some(account_id);
                     self.present_compose(self.compose_kind, Some(draft), &sender);
                     self.forward_attachment_candidates = if kind == ResponseKind::Forward
                         && self.expanded_message_id.as_ref() == Some(&source_message_id)
@@ -13482,7 +14380,56 @@ impl SimpleComponent for App {
                 self.compose_dirty = true;
                 self.save_current_draft(self.compose_save_gen, &sender);
             }
-            Msg::DraftSaved { gen, result } => {
+            Msg::DraftSaved {
+                session,
+                gen,
+                result,
+            } => {
+                // Discard beats everything else this answer could mean:
+                // the write it reports is exactly the one that would put
+                // the thrown-away draft back. Handled before the session
+                // guard, because the reader may already be writing the
+                // next letter -- only the flags below are session-scoped.
+                let discarding = self
+                    .compose_discard_pending
+                    .as_ref()
+                    .filter(|pending| pending.session == session)
+                    .cloned();
+                if let Some(pending) = discarding {
+                    self.compose_discard_pending = None;
+                    let doomed = match &result {
+                        Ok(draft) => Some(draft.id.clone()),
+                        Err(_) => pending.draft,
+                    };
+                    if let Some(draft) = doomed {
+                        // T-143's follow-up: the delete is a SQLite write
+                        // like any other, and this arm runs on the GTK
+                        // thread. `Msg::DraftDiscarded` carries a refusal
+                        // back; the window is already gone either way.
+                        let account = pending.account;
+                        let tx = sender.input_sender().clone();
+                        self.mail_writer.run(move |core| {
+                            let error =
+                                with_retries(core, |core| core.delete_draft(&account, &draft))
+                                    .err()
+                                    .map(|err| err.message);
+                            tx.emit(Msg::DraftDiscarded { error });
+                        });
+                    }
+                    if compose_reply_is_current(self.compose_session, session) {
+                        self.compose_save_inflight = false;
+                        self.compose_close_pending = false;
+                        self.compose_dirty = false;
+                        self.compose_draft_id = None;
+                    }
+                    return;
+                }
+                if !compose_reply_is_current(self.compose_session, session) {
+                    // A window that no longer exists asked for this write.
+                    // Its flags belong to the session on screen now, so
+                    // nothing here may touch them.
+                    return;
+                }
                 self.compose_save_inflight = false;
                 match result {
                     Ok(draft) => {
@@ -13494,30 +14441,75 @@ impl SimpleComponent for App {
                             self.show_toast("Draft saved", &sender);
                         }
                     }
-                    Err(message) => self.show_toast(&message, &sender),
+                    Err(message) => {
+                        // The retry the close was waiting for failed; do not
+                        // leave the flag armed for the next window.
+                        self.compose_close_pending = false;
+                        self.show_toast(&message, &sender);
+                    }
                 }
-                if self.compose_dirty && self.compose.is_visible() {
+                if draft_save_retry(
+                    self.compose_dirty,
+                    self.compose.is_visible(),
+                    self.compose_close_pending,
+                ) {
                     let next = self.compose_save_gen;
                     self.save_current_draft(next, &sender);
+                } else {
+                    self.compose_close_pending = false;
                 }
             }
             Msg::CloseCompose => {
                 if self.compose_dirty {
                     self.compose_save_gen = self.compose_save_gen.wrapping_add(1);
-                    self.save_current_draft(self.compose_save_gen, &sender);
+                    if self.compose_save_inflight {
+                        // The door that saves refuses while a write is out,
+                        // so record that the close is waiting on it: the
+                        // retry in `Msg::DraftSaved` is what writes the
+                        // edits made since that write started.
+                        self.compose_close_pending = true;
+                    } else {
+                        self.save_current_draft(self.compose_save_gen, &sender);
+                    }
                 }
                 self.compose.set_visible(false);
             }
             Msg::DiscardDraft => {
-                if let (Some(account), Some(draft)) = (
-                    self.current_account.as_ref(),
-                    self.compose_draft_id.as_ref(),
-                ) {
-                    let result = self.core.lock().unwrap().delete_draft(account, draft);
-                    if let Err(err) = result {
-                        self.show_toast(&err.message, &sender);
-                        return;
+                if self.compose_save_inflight {
+                    // A background save is on its way to writing this very
+                    // draft id back. Park the delete on its answer instead
+                    // of racing it for the `core` lock.
+                    if let Some(account) = self.compose_account.clone() {
+                        self.compose_discard_pending = Some(PendingDiscard {
+                            session: self.compose_session,
+                            account,
+                            draft: self.compose_draft_id.clone(),
+                        });
                     }
+                    self.compose_close_pending = false;
+                    self.compose_dirty = false;
+                    self.compose.set_visible(false);
+                    self.show_toast("Draft discarded", &sender);
+                    return;
+                }
+                if let (Some(account), Some(draft)) =
+                    (self.compose_account.clone(), self.compose_draft_id.clone())
+                {
+                    // T-143's follow-up: the delete goes to the mailbox
+                    // writer, so Discard cannot park the window behind the
+                    // backfill's transaction. The window closes on the
+                    // click either way -- the parked branch above already
+                    // closes it before its delete has run -- and a refusal
+                    // arrives as `Msg::DraftDiscarded`, which says so
+                    // rather than leaving the reader with a closed window
+                    // and a draft still in Drafts.
+                    let tx = sender.input_sender().clone();
+                    self.mail_writer.run(move |core| {
+                        let error = with_retries(core, |core| core.delete_draft(&account, &draft))
+                            .err()
+                            .map(|err| err.message);
+                        tx.emit(Msg::DraftDiscarded { error });
+                    });
                 }
                 self.compose_draft_id = None;
                 self.compose_dirty = false;
@@ -13539,12 +14531,13 @@ impl SimpleComponent for App {
                 });
             }
             Msg::AttachmentPicked(path) => {
-                let Some(account_id) = self.current_account.clone() else {
+                let Some(account_id) = self.compose_account.clone() else {
                     return;
                 };
                 self.compose_save_inflight = true;
                 self.compose_dirty = false;
                 let core = Arc::clone(&self.core);
+                let session = self.compose_session;
                 let draft_id = self.compose_draft_id.clone();
                 let content = self.compose_content();
                 let tx = sender.input_sender().clone();
@@ -13562,10 +14555,13 @@ impl SimpleComponent for App {
                             .map_err(|err| err.message)?;
                         Ok((draft.id, attachments))
                     })();
-                    tx.emit(Msg::AttachmentAdded(result));
+                    tx.emit(Msg::AttachmentAdded { session, result });
                 });
             }
-            Msg::AttachmentAdded(result) => {
+            Msg::AttachmentAdded { session, result } => {
+                if !compose_reply_is_current(self.compose_session, session) {
+                    return;
+                }
                 self.compose_save_inflight = false;
                 match result {
                     Ok((draft_id, attachments)) => {
@@ -13584,7 +14580,7 @@ impl SimpleComponent for App {
                 attachment,
                 selected,
             } => {
-                let Some(account_id) = self.current_account.clone() else {
+                let Some(account_id) = self.compose_account.clone() else {
                     return;
                 };
                 let Some(draft_id) = self.compose_draft_id.clone() else {
@@ -13611,6 +14607,7 @@ impl SimpleComponent for App {
                     }
                     self.compose_save_inflight = true;
                     let core = Arc::clone(&self.core);
+                    let session = self.compose_session;
                     let tx = sender.input_sender().clone();
                     std::thread::spawn(move || {
                         let result = (|| {
@@ -13623,7 +14620,7 @@ impl SimpleComponent for App {
                                 .map_err(|err| err.message)?;
                             Ok((draft_id, attachments))
                         })();
-                        tx.emit(Msg::AttachmentAdded(result));
+                        tx.emit(Msg::AttachmentAdded { session, result });
                     });
                 } else {
                     let Some(draft_attachment) = self
@@ -13653,29 +14650,50 @@ impl SimpleComponent for App {
                 }
             }
             Msg::RemoveAttachment(id) => {
-                let Some(account_id) = self.current_account.as_ref() else {
+                let Some(account_id) = self.compose_account.clone() else {
                     return;
                 };
-                let Some(draft_id) = self.compose_draft_id.as_ref() else {
+                let Some(draft_id) = self.compose_draft_id.clone() else {
                     return;
                 };
-                let result = self
-                    .core
-                    .lock()
-                    .unwrap()
-                    .remove_draft_attachment(account_id, draft_id, &id);
-                match result {
-                    Ok(_) => {
-                        self.compose_attachments.retain(|item| item.id != id);
-                        self.refill_compose_attachments(&sender);
-                        self.refill_forward_attachment_choices(&sender);
-                    }
-                    Err(err) => {
-                        self.show_toast(&err.message, &sender);
-                        self.refill_forward_attachment_choices(&sender);
-                    }
-                }
+                // T-143's follow-up: a DELETE on `draft_attachments` is a
+                // profile write like any other. `Msg::AttachmentRemoved`
+                // is the answer, and it carries the compose session so a
+                // reply for a window the reader has already replaced
+                // cannot edit the letter now on screen.
+                let session = self.compose_session;
+                let removed = id.clone();
+                let tx = sender.input_sender().clone();
+                self.mail_writer.run(move |core| {
+                    let error = with_retries(core, |core| {
+                        core.remove_draft_attachment(&account_id, &draft_id, &id)
+                    })
+                    .err()
+                    .map(|err| err.message);
+                    tx.emit(Msg::AttachmentRemoved {
+                        session,
+                        id: removed,
+                        error,
+                    });
+                });
             }
+            Msg::AttachmentRemoved { session, id, error } => {
+                if !compose_reply_is_current(self.compose_session, session) {
+                    return;
+                }
+                match error {
+                    Some(message) => self.show_toast(&message, &sender),
+                    None => self.compose_attachments.retain(|item| item.id != id),
+                }
+                self.refill_compose_attachments(&sender);
+                self.refill_forward_attachment_choices(&sender);
+            }
+            // The window closed on the click; there is nothing to repaint,
+            // only a refusal to admit to.
+            Msg::DraftDiscarded {
+                error: Some(message),
+            } => self.show_toast(&message, &sender),
+            Msg::DraftDiscarded { error: None } => {}
             Msg::OpenAttachment(attachment) => self.open_attachment(attachment, &sender),
             Msg::SaveAttachmentAs(attachment) => self.save_attachment_as(attachment, &sender),
             Msg::AttachmentSavePicked {
@@ -13703,12 +14721,13 @@ impl SimpleComponent for App {
                     self.compose_send_pending = true;
                     return;
                 }
-                let Some(account_id) = self.current_account.clone() else {
+                let Some(account_id) = self.compose_account.clone() else {
                     return;
                 };
                 self.compose_save_inflight = true;
                 self.compose_dirty = false;
                 let core = Arc::clone(&self.core);
+                let session = self.compose_session;
                 let draft_id = self.compose_draft_id.clone();
                 let content = self.compose_content();
                 let tx = sender.input_sender().clone();
@@ -13723,10 +14742,13 @@ impl SimpleComponent for App {
                             .map_err(|err| err.message)?;
                         Ok((draft.id, operation))
                     })();
-                    tx.emit(Msg::SendQueued { result });
+                    tx.emit(Msg::SendQueued { session, result });
                 });
             }
-            Msg::SendQueued { result } => {
+            Msg::SendQueued { session, result } => {
+                if !compose_reply_is_current(self.compose_session, session) {
+                    return;
+                }
                 self.compose_save_inflight = false;
                 match result {
                     Ok((draft_id, operation_id)) => {
@@ -13810,7 +14832,7 @@ impl SimpleComponent for App {
                 self.search_draft = query;
                 let q = self.search_draft.trim().to_string();
                 if should_record_search_history(&q) {
-                    let _ = self.core.lock().unwrap().record_search_history(&q);
+                    self.record_search_history(q.clone());
                 }
                 if q.is_empty() {
                     self.search_results.clear();
@@ -13818,12 +14840,7 @@ impl SimpleComponent for App {
                     self.search_pending_index = 0;
                     self.search_error = None;
                     self.search_loading = false;
-                    self.search_history = self
-                        .core
-                        .lock()
-                        .unwrap()
-                        .list_search_history(8)
-                        .unwrap_or_default();
+                    self.reload_search_history(&sender);
                     self.refill_search(&sender);
                     return;
                 }
@@ -13918,6 +14935,18 @@ impl SimpleComponent for App {
             // `Msg::SearchChanged` pipeline instead of a second dispatch
             // path -- see `Msg::SearchHistoryPick`'s doc comment in
             // `msg.rs`.
+            Msg::SearchHistoryLoaded(history) => {
+                // T-049 (д): the recent queries, read off the GTK thread.
+                // There is no generation guard here on purpose -- the list
+                // is the eight newest queries of one profile, so a reply
+                // that lost its race against a later one differs by at
+                // most the query the reader has just typed, and the next
+                // open reads it again.
+                self.search_history = history;
+                if self.search_open {
+                    self.refill_search(&sender);
+                }
+            }
             Msg::SearchHistoryPick(query) => {
                 self.search_entry.set_text(&query);
                 self.search_entry.set_position(-1);
@@ -13927,12 +14956,7 @@ impl SimpleComponent for App {
                 self.search_popover.popup();
                 self.search_entry.grab_focus();
                 if self.search_draft.trim().is_empty() {
-                    self.search_history = self
-                        .core
-                        .lock()
-                        .unwrap()
-                        .list_search_history(8)
-                        .unwrap_or_default();
+                    self.reload_search_history(&sender);
                 }
                 self.refill_search(&sender);
             }
@@ -13953,6 +14977,17 @@ impl SimpleComponent for App {
                     .cloned();
                 self.close_search();
                 if let Some(t) = hit {
+                    // In the merged view the hits come from every mailbox,
+                    // and the folder id below is scoped to the hit's own
+                    // one. Move the shell there first: after `self.folder`
+                    // stops naming a `unified:` view, `account_for_thread`
+                    // answers with `current_account`, so a stale one would
+                    // send this selection's MarkRead to the wrong mailbox
+                    // and ask Core for "account A, folder of account B".
+                    if self.current_account.as_ref() != Some(&t.account_id) {
+                        self.current_account = Some(t.account_id.clone());
+                        self.paint_account_active();
+                    }
                     self.folder = t.folder.as_str().to_string();
                     self.selected = id;
                     // T-028: same policy as clicking the row -- a search
@@ -14065,9 +15100,29 @@ impl SimpleComponent for App {
                     sender.input(Msg::PrefetchFolderBodies);
                 }
             }
-            Msg::NavLoaded { gen, folders } => {
+            Msg::NavLoaded {
+                gen,
+                folders,
+                chip_folders,
+            } => {
                 if gen == self.nav_gen {
-                    self.apply_nav(folders, &sender);
+                    self.apply_nav(folders, chip_folders, &sender);
+                    // The folder the shell is in may have gone with the
+                    // account or folder that was just deleted; this is the
+                    // first moment that is knowable. Under the generation
+                    // check, so a stale answer cannot move the reader.
+                    let next = Self::folder_after_nav(&self.folder, &self.folders_cache);
+                    if next != self.folder {
+                        self.folder = next;
+                        self.selected.clear();
+                        self.clear_bulk_selection();
+                        self.paint_nav_active();
+                        // `reload_messages`, not `reload_list`: the sidebar
+                        // is what has just been rebuilt, and refilling it
+                        // again from here would only loop back through
+                        // `Msg::NavLoaded`.
+                        self.reload_messages(&sender);
+                    }
                 }
             }
             // T-125: the mailbox the click asked for is now known in full.
@@ -14088,7 +15143,10 @@ impl SimpleComponent for App {
                     // only throw that answer away and re-ask for it.
                     let already_open = self.focus_opened && self.folder == folder;
                     self.folder = folder;
-                    self.apply_nav(folders, &sender);
+                    // T-161: one mailbox's folders are also the only ones
+                    // its rows can name, so the chip table is that list.
+                    let chip_folders = folders.clone();
+                    self.apply_nav(folders, chip_folders, &sender);
                     if !already_open {
                         self.reload_messages(&sender);
                     }
@@ -14325,6 +15383,44 @@ impl SimpleComponent for App {
                 self.wizard.step = WizardStep::OtherForm;
                 self.refresh_wizard_view();
             }
+            // T-156: the address field is done being edited. Whether that
+            // is worth a network lookup is `autoconfig_trigger`'s call --
+            // it refuses an address with no domain, a form whose servers
+            // are already filled in by hand, and a repeat of the address
+            // just asked about.
+            Msg::WizardEmailEntered => {
+                let Some(email) = autoconfig_trigger(
+                    self.email_entry.text().as_str(),
+                    self.imap_host.text().as_str(),
+                    self.smtp_host.text().as_str(),
+                    self.autoconfig_asked.as_deref(),
+                ) else {
+                    return;
+                };
+                self.autoconfig_asked = Some(email.clone());
+                self.set_autoconfig_hint(None);
+                // D11: `spawn_autoconfig` returns at once and does the
+                // HTTPS/DNS work on a thread of its own, capped at
+                // `feathermail_service::LOOKUP_TIMEOUT`. D9: the shell asks
+                // the service, and has never heard of the ISPDB.
+                let started_for = WizardEmail::new(email.clone());
+                let tx = sender.input_sender().clone();
+                feathermail_service::spawn_autoconfig(email, move |outcome| {
+                    tx.emit(Msg::AutoconfigResolved {
+                        email: started_for,
+                        outcome,
+                    });
+                });
+            }
+            Msg::AutoconfigResolved { email, outcome } => {
+                match autoconfig_effect(&email, &self.autoconfig_form_state(), outcome) {
+                    // The address in the field is not the one this answer
+                    // is about any more, or there was nothing to say.
+                    AutoconfigEffect::Stale | AutoconfigEffect::Silent => {}
+                    AutoconfigEffect::Fill(fill) => self.apply_autoconfig_fill(fill),
+                    AutoconfigEffect::Hint(message) => self.set_autoconfig_hint(Some(&message)),
+                }
+            }
             Msg::WizardSecurityChanged => {
                 let none = MailSecurity::from_index(self.imap_security.selected())
                     == MailSecurity::None
@@ -14393,6 +15489,36 @@ impl SimpleComponent for App {
                         // led back to the old mailbox and the new Gmail
                         // account looked empty however much it synced.
                         let added = AccountId(id);
+                        // `notification_watermarks` was seeded once, in
+                        // `init`, from the accounts that already existed. A
+                        // mailbox added by the wizard in this session had no
+                        // entry, so the first `FolderSynced { ok: true }`
+                        // read a watermark of 0 and
+                        // `notification_candidates(.., 0, 20)` answered with
+                        // twenty of the inbox's unread mail -- months-old
+                        // letters announced as new, with the chime, on every
+                        // mailbox anyone adds. One indexed `SELECT
+                        // COALESCE(MAX(date), 0)`, the same query `init`
+                        // already runs here for every account, and it is done
+                        // before the `accounts_cache` check below: an account
+                        // the cache has not caught up with still syncs, and
+                        // would still announce.
+                        //
+                        // Known and accepted gap, not a bug to close here: a
+                        // watermark is one scalar per mailbox, while
+                        // `notification_candidates` keeps only the newest
+                        // `limit` rows of a burst (core-domain-04: `ORDER BY
+                        // date DESC` inside, ascending outside). A burst
+                        // larger than the limit therefore loses the letters
+                        // under the cut for notification purposes, whatever
+                        // scalar the watermark holds. That is a product
+                        // decision.
+                        if let Ok(watermark) =
+                            self.core.lock().unwrap().notification_watermark(&added)
+                        {
+                            self.notification_watermarks
+                                .insert(added.clone(), watermark);
+                        }
                         if self.accounts_cache.iter().any(|a| a.id == added) {
                             self.selected.clear();
                             self.clear_bulk_selection();
@@ -14443,24 +15569,27 @@ impl SimpleComponent for App {
             // `&impl MailConnector` parameter, confirmed unreachable by
             // Core's own `update_account_display_name_only_does_not_probe`
             // test. Error text is `CoreError.message`, shown verbatim.
+            //
+            // T-163: and it happens on the mailbox writer thread. Renaming
+            // an account is one small UPDATE, but SQLite serialises
+            // writers -- under an active backfill this waited out
+            // `busy_timeout` in front of the reader like every other door
+            // T-139/T-143 moved. The answer is `Msg::AccountNameSaved`.
             Msg::SaveAccountName { id, name } => {
-                let edit = AccountEdit {
-                    display_name: Some(name),
-                    ..Default::default()
-                };
-                let result = self.core.lock().unwrap().update_account(
-                    &AccountId(id),
-                    &edit,
-                    &NoProbeConnector,
-                );
-                match result {
-                    Ok(()) => {
-                        self.account_editing = None;
-                        self.refill_nav(&sender);
-                    }
-                    Err(err) => self.show_toast(&err.message, &sender),
-                }
-                self.refill_settings(&sender);
+                let gen = self.reader_place();
+                let tx = sender.input_sender().clone();
+                self.mail_writer.run(move |core| {
+                    let edit = AccountEdit {
+                        display_name: Some(name),
+                        ..Default::default()
+                    };
+                    let error = with_retries(core, |core| {
+                        core.update_account(&AccountId(id.clone()), &edit, &NoProbeConnector)
+                    })
+                    .err()
+                    .map(|err| err.message);
+                    tx.emit(Msg::AccountNameSaved { gen, id, error });
+                });
             }
             // High-risk action (D-rule): ask before acting, never a silent
             // success. RemoveAccountRequest only arms the confirmation UI;
@@ -14481,59 +15610,52 @@ impl SimpleComponent for App {
             // the report means local SQLite removal still committed, so
             // the account disappears from the UI either way -- the toast
             // is only a heads-up that a stray keyring entry may remain.
+            //
+            // T-163: the whole door now runs on the mailbox writer thread,
+            // `SecretStore::connect()` included. That call is a D-Bus round
+            // trip to the Secret Service and it happened *in front of* the
+            // SQLite write, on the GTK thread: a keyring that is slow to
+            // answer -- or a session bus with no keyring on it at all, which
+            // fails only after its own timeout -- froze the window before
+            // the removal had even begun. The order the user's session sees
+            // is preserved exactly: the confirmation comes down first, on
+            // the press, and everything the removal itself implies waits
+            // for `Msg::AccountRemoved`.
             Msg::RemoveAccountConfirm(id) => {
                 self.account_pending_remove = None;
+                // The armed confirmation is UI state and comes down now,
+                // not when SQLite gets round to it -- the same optimism
+                // `paint_rows_read` applies to the unread dot.
+                if self.screen == Screen::Settings {
+                    self.refill_settings(&sender);
+                }
                 let account_id = AccountId(id);
+                let gen = self.reader_place();
                 // T-088: whichever store this session actually uses --
                 // see `App::secrets`'s doc comment. `Ephemeral` never
                 // fails to connect, so `UnavailableSecretStore` below is
                 // reached only when the real keyring (an on-disk session)
                 // could not be reached.
-                let report = match self.secrets.connect() {
-                    Ok(secrets) => self
-                        .core
-                        .lock()
-                        .unwrap()
-                        .remove_account(&account_id, &secrets),
-                    Err(_) => self
-                        .core
-                        .lock()
-                        .unwrap()
-                        .remove_account(&account_id, &UnavailableSecretStore),
-                };
-                match report {
-                    Ok(report) => {
-                        // T-125: this mailbox's sections are gone with it.
-                        self.invalidate_list_cache();
-                        self.refill_accounts(&sender);
-                        if let Some(err) = report.keyring_error {
-                            self.show_toast(
-                                &format!("Removed, but keyring cleanup failed: {err}"),
-                                &sender,
-                            );
+                let secrets = self.secrets.clone();
+                let removed = account_id.clone();
+                let tx = sender.input_sender().clone();
+                self.mail_writer.run(move |core| {
+                    let result = match secrets.connect() {
+                        Ok(secrets) => {
+                            with_retries(core, |core| core.remove_account(&removed, &secrets))
                         }
-                        if self.accounts_cache.is_empty() {
-                            self.go(Screen::Welcome, &sender);
-                            return;
-                        }
-                        if !self
-                            .folders_cache
-                            .iter()
-                            .any(|f| f.folder.id.as_str() == self.folder)
-                        {
-                            self.folder = self
-                                .folders_cache
-                                .first()
-                                .map(|f| f.folder.id.as_str().to_string())
-                                .unwrap_or_else(|| "inbox".into());
-                        }
-                        self.reload_list(&sender);
-                    }
-                    Err(err) => self.show_toast(&err.message, &sender),
-                }
-                if self.screen == Screen::Settings {
-                    self.refill_settings(&sender);
-                }
+                        Err(_) => with_retries(core, |core| {
+                            core.remove_account(&removed, &UnavailableSecretStore)
+                        }),
+                    };
+                    tx.emit(Msg::AccountRemoved {
+                        gen,
+                        account_id: removed.clone(),
+                        result: result
+                            .map(|report| report.keyring_error)
+                            .map_err(|err| err.message),
+                    });
+                });
             }
             // T-074: account switching is UI state (`self.current_account`)
             // plus a full reload from Core for the new account's folders
@@ -14652,28 +15774,27 @@ impl SimpleComponent for App {
                     swatch.set_active(true);
                 }
             }
+            // T-163: on the mailbox writer thread, like every other write.
+            // Creating a folder is an INSERT plus a queued CREATE, and it
+            // waited behind whatever the sync worker was committing --
+            // with the New-folder popover still open in front of the
+            // reader. `Msg::FolderCreated` carries the answer back.
             Msg::CreateFolder if inbox => {
                 let name = self.folder_entry.text().to_string();
                 let Some(account_id) = self.current_account.clone() else {
                     return;
                 };
                 let color = self.chosen_folder_color();
-                let result =
-                    self.core
-                        .lock()
-                        .unwrap()
-                        .create_folder_with_color(&account_id, &name, color);
-                match result {
-                    Ok(id) => {
-                        self.folder_entry.set_text("");
-                        self.folder_btn.popdown();
-                        self.folder = id.as_str().to_string();
-                        self.refill_nav(&sender);
-                        self.reload_list(&sender);
-                    }
-                    Err(err) if err.message == CreateFolderError::Empty.as_str() => {}
-                    Err(err) => self.show_toast(&err.message, &sender),
-                }
+                let gen = self.reader_place();
+                let tx = sender.input_sender().clone();
+                self.mail_writer.run(move |core| {
+                    let result = with_retries(core, |core| {
+                        core.create_folder_with_color(&account_id, &name, color)
+                    })
+                    .map(|id| id.as_str().to_string())
+                    .map_err(|err| err.message);
+                    tx.emit(Msg::FolderCreated { gen, result });
+                });
             }
             // T-060t: renaming goes through `Core::rename_folder`, which
             // owns every rule -- reserved names, duplicates, whether the
@@ -14692,6 +15813,8 @@ impl SimpleComponent for App {
                 self.rename_folder_entry.set_text("");
                 self.rename_folder_btn.popdown();
             }
+            // T-163: same move, same reason -- `Msg::FolderRenamed` is
+            // where the popover is put away and the sidebar recounted.
             Msg::RenameFolder if inbox => {
                 let Some(folder_id) = self
                     .current_custom_folder()
@@ -14703,25 +15826,15 @@ impl SimpleComponent for App {
                     return;
                 };
                 let name = self.rename_folder_entry.text().to_string();
-                let result =
-                    self.core
-                        .lock()
-                        .unwrap()
-                        .rename_folder(&account_id, &folder_id, &name);
-                match result {
-                    Ok(queued) => {
-                        self.rename_folder_entry.set_text("");
-                        self.rename_folder_btn.popdown();
-                        if queued {
-                            // T-078 (c): the RENAME is durable in the queue;
-                            // wake the worker rather than wait for the tick.
-                            self.wake_sync();
-                            self.refill_nav(&sender);
-                        }
-                    }
-                    Err(err) if err.message == RenameFolderError::Empty.as_str() => {}
-                    Err(err) => self.show_toast(&err.message, &sender),
-                }
+                let gen = self.reader_place();
+                let tx = sender.input_sender().clone();
+                self.mail_writer.run(move |core| {
+                    let result = with_retries(core, |core| {
+                        core.rename_folder(&account_id, &folder_id, &name)
+                    })
+                    .map_err(|err| err.message);
+                    tx.emit(Msg::FolderRenamed { gen, result });
+                });
             }
             // T-060u: deleting a folder is irreversible on the server and
             // has no Undo step, so the GTK path is two messages: this one
@@ -14916,6 +16029,251 @@ impl SimpleComponent for App {
                 }
                 self.refill_nav(&sender);
             }
+            Msg::StarWritten {
+                ids,
+                starred,
+                error,
+            } => {
+                if error.is_some() {
+                    // The star is repainted from Core either way, so a
+                    // refused toggle springs back visibly -- next to a
+                    // toast that says why, instead of the silent bounce
+                    // `let _ = dispatch(..)` used to give.
+                    self.show_toast("Couldn’t change the star.", &sender);
+                    for id in &ids {
+                        self.rebind_thread(id, &sender);
+                    }
+                } else {
+                    // T-078 (c): see `select_thread`'s wake comment.
+                    self.wake_sync();
+                    // T-054: a starred-only list must not keep a thread the
+                    // user just unstarred. `rebind_thread` alone left it on
+                    // screen with a hollow star -- a Starred list claiming a
+                    // thread is starred when Core says it is not -- and the
+                    // only way back was a folder switch. `starred` is the
+                    // *pre*-toggle flag, so it being true means the write
+                    // that just succeeded was the Unstar.
+                    if starred && self.viewing_starred_only() {
+                        self.hide_rows(&ids, &sender);
+                    } else {
+                        for id in &ids {
+                            self.rebind_thread(id, &sender);
+                        }
+                    }
+                }
+                self.refill_nav(&sender);
+            }
+            Msg::DeleteWritten {
+                label,
+                tickets,
+                error,
+            } => {
+                // T-034/T-143: the rows were taken off the list on the
+                // click, so the reader never sees "deleted, and still
+                // there". The reload stays -- the synchronous door always
+                // did one, and it is what puts a row back that Trash left
+                // in the folder it was already in.
+                if error.is_some() {
+                    self.show_toast("Couldn’t apply that change.", &sender);
+                } else {
+                    // T-078 (c): see `select_thread`'s wake comment.
+                    self.wake_sync();
+                    if tickets.is_empty() {
+                        self.show_toast(label, &sender);
+                    } else {
+                        self.show_undo_toasts(label, tickets, &sender);
+                    }
+                }
+                self.reload_list(&sender);
+                self.refill_nav(&sender);
+            }
+            Msg::PermanentDeleteWritten { label, error } => {
+                // No tickets reach this arm by construction (T-034):
+                // permanent deletion bypasses Trash and must never offer
+                // an Undo.
+                if error.is_some() {
+                    self.show_toast("Couldn’t apply that change.", &sender);
+                } else {
+                    self.wake_sync();
+                    self.show_toast(label, &sender);
+                }
+                self.reload_list(&sender);
+                self.refill_nav(&sender);
+            }
+            Msg::UnsnoozeWritten { woken, failed } => {
+                // T-061e: this is the snooze timer's own transition run
+                // early, so there is no ticket to offer and nothing was
+                // queued for IMAP. Threads that were not snoozed are
+                // skipped, which is why zero woken is its own answer.
+                if failed {
+                    self.show_toast("Couldn’t apply that change.", &sender);
+                } else if woken == 0 {
+                    self.show_toast("Nothing to unsnooze.", &sender);
+                } else if woken == 1 {
+                    self.finish_unsnooze("Back in Inbox", &sender);
+                } else {
+                    self.finish_unsnooze("Threads are back in Inbox", &sender);
+                }
+            }
+            Msg::UndoWritten { failed } => {
+                // The tickets were consumed when the button was pressed;
+                // this only settles the toast and re-reads the list.
+                if failed {
+                    self.show_toast("Couldn’t undo that change.", &sender);
+                } else {
+                    self.toast = None;
+                    self.toast_undo = false;
+                    self.toast_generation = self.toast_generation.wrapping_add(1);
+                    self.wake_sync();
+                    self.reload_list(&sender);
+                }
+            }
+            // T-163: the folder-CRUD and account answers, landing back on
+            // the GTK thread. Each of them splits the same way, and it is
+            // worth saying once: what the *database* now holds is applied
+            // unconditionally (the sidebar is recounted, the account list
+            // re-read, the sync worker woken, a refusal said out loud),
+            // because those are true regardless of where the reader has
+            // got to. What belongs to the *place the door was pressed
+            // from* -- the popover the reader was typing in, the folder
+            // they get moved into, the list under them -- is applied only
+            // while `gen` still matches `reader_place()`. Without that
+            // split a folder created just before the reader clicked away
+            // would drag them back into it, and a popover they have since
+            // opened somewhere else would have its text wiped.
+            Msg::FolderCreated { gen, result } => {
+                match result {
+                    Ok(id) => {
+                        if place_reply_is_current(self.reader_place(), gen) {
+                            self.folder_entry.set_text("");
+                            self.folder_btn.popdown();
+                            self.folder = id;
+                            self.reload_list(&sender);
+                        }
+                        self.refill_nav(&sender);
+                    }
+                    // Core's own "a folder needs a name": the reader
+                    // pressed Create on an empty box, which is not an
+                    // error to announce -- it is nothing at all.
+                    Err(message) if message == CreateFolderError::Empty.as_str() => {}
+                    Err(message) => self.show_toast(&message, &sender),
+                }
+            }
+            Msg::FolderRenamed { gen, result } => {
+                match result {
+                    Ok(queued) => {
+                        if place_reply_is_current(self.reader_place(), gen) {
+                            self.rename_folder_entry.set_text("");
+                            self.rename_folder_btn.popdown();
+                        }
+                        if queued {
+                            // T-078 (c): the RENAME is durable in the queue;
+                            // wake the worker rather than wait for the tick.
+                            self.wake_sync();
+                            self.refill_nav(&sender);
+                        }
+                    }
+                    Err(message) if message == RenameFolderError::Empty.as_str() => {}
+                    Err(message) => self.show_toast(&message, &sender),
+                }
+            }
+            Msg::FolderDeleted { result } => match result {
+                Ok(queued) => {
+                    // T-125: the folder's threads are somewhere else now --
+                    // and `wake_sync` only runs for a folder the server has
+                    // heard of.
+                    self.invalidate_list_cache();
+                    if queued {
+                        self.wake_sync();
+                    }
+                    // The user was looking at the folder they just deleted,
+                    // and `list_folders` no longer returns it. The move onto
+                    // a surviving folder happens where that answer lands
+                    // (`Msg::NavLoaded`) -- the cache here still holds the
+                    // folder that is going away. No `gen` here on
+                    // purpose -- see `Msg::FolderDeleted`: the folder is
+                    // gone for every place the reader could be, and the
+                    // one move that would need a stamp is NavLoaded's.
+                    self.refill_nav(&sender);
+                }
+                Err(message) => self.show_toast(&message, &sender),
+            },
+            Msg::AccountNameSaved { gen, id, error } => {
+                match error {
+                    Some(message) => self.show_toast(&message, &sender),
+                    None => {
+                        // Closed only if it is still that account's editor
+                        // that is open: `gen` covers `account_editing`, so
+                        // a reader who has since opened another account's
+                        // row keeps it open.
+                        if place_reply_is_current(self.reader_place(), gen)
+                            && self.account_editing.as_deref() == Some(&id)
+                        {
+                            self.account_editing = None;
+                        }
+                        self.refill_nav(&sender);
+                    }
+                }
+                self.refill_settings(&sender);
+            }
+            Msg::AccountRemoved {
+                gen,
+                account_id,
+                result,
+            } => {
+                match result {
+                    Ok(keyring_error) => {
+                        // T-125: this mailbox's sections are gone with it.
+                        self.invalidate_list_cache();
+                        self.refill_accounts(&sender);
+                        if let Some(err) = keyring_error {
+                            self.show_toast(
+                                &format!("Removed, but keyring cleanup failed: {err}"),
+                                &sender,
+                            );
+                        }
+                        if self.accounts_cache.is_empty() {
+                            self.go(Screen::Welcome, &sender);
+                            return;
+                        }
+                        // A compose window still open on the mailbox that
+                        // just went away has no mailbox to save into.
+                        if self.compose_account.as_ref() == Some(&account_id) {
+                            self.compose_account = self.current_account.clone();
+                        }
+                        // `refill_accounts` moved to the surviving mailbox;
+                        // its folders are fetched, not on hand, so the
+                        // folder fallback lands in `Msg::NavLoaded`. Gated:
+                        // a reader who has switched mailboxes since is
+                        // already looking at a list of their own choosing,
+                        // and `refill_accounts` above has kept it valid.
+                        if place_reply_is_current(self.reader_place(), gen) {
+                            self.reload_list(&sender);
+                        }
+                    }
+                    Err(message) => self.show_toast(&message, &sender),
+                }
+                if self.screen == Screen::Settings {
+                    self.refill_settings(&sender);
+                }
+            }
+            // T-163: a Move the mailbox writer has finished. The same
+            // shape `Msg::DeleteWritten` has: the receipt is what the Undo
+            // toast is built from, and a refusal re-reads the list.
+            Msg::MoveWritten { tickets, error } => {
+                // Nothing was painted optimistically -- unlike Archive or
+                // Trash, a Move leaves the rows where they are until Core
+                // agrees -- so a refusal has nothing to undo on screen and
+                // the list is only re-read when the mail actually moved.
+                if error.is_some() {
+                    self.show_toast("Couldn’t move that change.", &sender);
+                } else {
+                    self.wake_sync();
+                    self.show_undo_toasts("Moved", tickets, &sender);
+                    self.clear_bulk_selection();
+                    self.reload_list(&sender);
+                }
+            }
             Msg::FolderMarkedRead {
                 folder_id,
                 account_id,
@@ -14952,47 +16310,21 @@ impl SimpleComponent for App {
                 }
                 self.refill_nav(&sender);
             }
+            // T-163: deleting a folder walks its mail before it commits,
+            // so it is the longest of the three -- and it ran on the GTK
+            // thread. `Msg::FolderDeleted` is the answer.
             Msg::DeleteFolderConfirmed(folder_id) => {
                 let Some(account_id) = self.current_account.clone() else {
                     return;
                 };
-                let result = self
-                    .core
-                    .lock()
-                    .unwrap()
-                    .delete_folder(&account_id, &FolderId(folder_id));
-                match result {
-                    Ok(queued) => {
-                        // T-125: the folder's threads are somewhere else
-                        // now -- and `wake_sync` below only runs for a
-                        // folder the server has heard of.
-                        self.invalidate_list_cache();
-                        if queued {
-                            self.wake_sync();
-                        }
-                        self.refill_nav(&sender);
-                        // The user was looking at the folder they just
-                        // deleted, and `list_folders` no longer returns it.
-                        // Same fallback as an account switch: first folder,
-                        // which for every real profile is the Inbox.
-                        if !self
-                            .folders_cache
-                            .iter()
-                            .any(|f| f.folder.id.as_str() == self.folder)
-                        {
-                            self.folder = self
-                                .folders_cache
-                                .first()
-                                .map(|f| f.folder.id.as_str().to_string())
-                                .unwrap_or_else(|| "inbox".into());
-                            self.selected.clear();
-                            self.clear_bulk_selection();
-                            self.refill_nav(&sender);
-                            self.reload_list(&sender);
-                        }
-                    }
-                    Err(err) => self.show_toast(&err.message, &sender),
-                }
+                let tx = sender.input_sender().clone();
+                self.mail_writer.run(move |core| {
+                    let result = with_retries(core, |core| {
+                        core.delete_folder(&account_id, &FolderId(folder_id.clone()))
+                    })
+                    .map_err(|err| err.message);
+                    tx.emit(Msg::FolderDeleted { result });
+                });
             }
             Msg::Diagnostics(code) => {
                 if code == "sync" {
@@ -15026,12 +16358,12 @@ impl SimpleComponent for App {
                             .lock()
                             .unwrap()
                             .rebuild_search_index()
-                            .map(|count| format!("Queued {count} messages for indexing")),
+                            .map(indexing_queued_toast),
                         "cache" => core
                             .lock()
                             .unwrap()
-                            .clear_body_cache()
-                            .map(|count| format!("Cleared {count} cached messages")),
+                            .clear_body_cache(&default_bodies_dir())
+                            .map(cache_cleared_toast),
                         _ => Err(feathermail_core::CoreError::new(
                             feathermail_core::ErrorCode::InvalidArgument,
                             "Unknown diagnostics action.",
@@ -15151,8 +16483,117 @@ mod tests {
         );
         assert!(
             notify.contains("application.send_notification(Some(&payload.id), &notification);")
-                && notify.contains("self.posted_notifications.borrow_mut().record(&payload);"),
+                && notify.contains("self.posted_notifications.borrow_mut().record(payload);"),
             "a notification handed to the shell without recording its id can never be taken back"
+        );
+    }
+
+    /// T-159: a sync tick that lands more unread mail than the shell will
+    /// name one by one is announced as a single line, not as a heap of
+    /// twenty -- and the twenty-first letter is not lost for it.
+    ///
+    /// The defect this closes, verified by simulation before the fix: with
+    /// 25 unread and a limit of 20 the batch kept the newest 20, the
+    /// watermark moved past them, and the five the limit cut sat below it
+    /// for ever -- no later tick could ever return them as candidates. The
+    /// summary is the way out: it covers every candidate there was, so the
+    /// watermark may clear all of them honestly.
+    #[test]
+    fn a_burst_bigger_than_the_limit_is_announced_once_and_not_lost() {
+        assert_eq!(
+            new_mail_announcement(0, 20),
+            NewMailAnnouncement::Nothing,
+            "an empty tick posts nothing"
+        );
+        assert_eq!(
+            new_mail_announcement(1, 20),
+            NewMailAnnouncement::EachLetter,
+            "one letter is named, with its sender and its subject"
+        );
+        assert_eq!(
+            new_mail_announcement(20, 20),
+            NewMailAnnouncement::EachLetter,
+            "the limit itself still fits -- nothing is cut, so nothing is \
+             summarised away"
+        );
+        assert_eq!(
+            new_mail_announcement(21, 20),
+            NewMailAnnouncement::Summary { count: 21 },
+            "one past the limit is a burst, and the count is every candidate \
+             there was and not the truncated batch"
+        );
+        assert_eq!(
+            new_mail_announcement(25, 20),
+            NewMailAnnouncement::Summary { count: 25 },
+        );
+    }
+
+    /// T-106's rule, again: a summary that said "1 new messages" would be
+    /// the most visible sloppy plural in the product, because it is the
+    /// whole text of the notification.
+    #[test]
+    fn a_summary_counts_its_letters_in_words_that_agree_with_the_number() {
+        assert_eq!(new_mail_summary_body(1), "1 new message");
+        assert_eq!(new_mail_summary_body(25), "25 new messages");
+        assert_eq!(new_mail_summary_body(0), "0 new messages");
+    }
+
+    /// D14: a summary is about a mailbox, so it is titled with the mailbox
+    /// -- never with a sender, and never with a subject.
+    #[test]
+    fn a_summary_is_titled_with_the_mailbox_and_falls_back_to_its_address() {
+        assert_eq!(notification_account_title("Work", "me@work.test"), "Work");
+        assert_eq!(
+            notification_account_title("   ", "me@work.test"),
+            "me@work.test",
+            "an account the reader never named still has an address"
+        );
+    }
+
+    /// T-159, the two halves the pure function above cannot state on its
+    /// own: which watermark each verdict moves to, and that muting stops
+    /// the notification without stopping the mark.
+    ///
+    /// Silence has to mean silence. If the watermark stood still while an
+    /// account was muted, unmuting it would empty the whole backlog onto
+    /// the reader at the next tick -- which is the opposite of what asking
+    /// for quiet means. What was missed is in the list, where unread mail
+    /// already lives.
+    #[test]
+    fn muting_stops_the_notification_and_never_the_watermark() {
+        let src = include_str!("shell.rs");
+        let notify = extract_brace_body(
+            src,
+            "fn notify_new_mail(&mut self, account_id: &AccountId) {",
+        );
+        let marked = notify
+            .find(
+                "self.notification_watermarks\n            .insert(account_id.clone(), advanced);",
+            )
+            .expect("the watermark is written");
+        let muted = notify
+            .find("self.muted_notification_accounts.contains(account_id)")
+            .expect("mute is checked");
+        assert!(
+            marked < muted,
+            "a muted mailbox must still have its watermark moved, or unmuting \
+             empties the backlog onto the reader in one go"
+        );
+        assert!(
+            notify.contains(
+                "(Some(seed), NewMailAnnouncement::Summary { .. }) => watermark.max(seed),"
+            ),
+            "a summary covers every candidate, so it clears the inbox maximum \
+             -- including the letters the fetch limit never returned"
+        );
+        assert!(
+            notify.contains("NewMailAnnouncement::Summary { count } => {")
+                && notify.contains("NotificationPayload::summary("),
+            "past the limit the tick posts one notification, not a heap"
+        );
+        assert!(
+            notify.contains("new_mail_summary_body(count)"),
+            "and its body is the count, not a letter"
         );
     }
 
@@ -15775,6 +17216,12 @@ mod tests {
         );
         assert_eq!(display_folder_label("R&-D"), "R&D");
         assert_eq!(display_folder_label("&truncated"), "&truncated");
+        // A token that cannot be decoded stays literal -- and the prefix
+        // before it is written once, not twice. Every vector above has an
+        // empty prefix, so none of them could see the doubling.
+        assert_eq!(display_folder_label("Work&a b-c"), "Work&a b-c");
+        assert_eq!(display_folder_label("Sent&AB-x"), "Sent&AB-x");
+        assert_eq!(display_folder_label("A&B&-C"), "A&B&-C");
         assert_eq!(display_subject("=?utf-8?B?0KLQtdC80LA=?="), "Тема");
     }
 
@@ -18144,6 +19591,11 @@ mod tests {
         const ALLOWED_SELF_MEMBERS: &[&str] = &[
             "search_results",
             "close_search",
+            // The hit carries its own mailbox: opening it moves the shell
+            // there before the D27 adapter runs, or the selection's
+            // MarkRead would go to whichever mailbox the menu last had.
+            "current_account",
+            "paint_account_active",
             "folder",
             "selected",
             "apply_mark_read_on_select",
@@ -18894,6 +20346,29 @@ mod tests {
         parts.concat()
     }
 
+    /// The one grouped dispatch door, spelled out once: several contracts
+    /// below anchor on it and rustfmt owns where its parameter list breaks.
+    const GROUPED_ASYNC_SIGNATURE: &str = concat!(
+        "fn dispatch_grouped_async(\n        &mut self,\n        ids: &[String],\n",
+        "        build: impl Fn(AccountId, Vec<ThreadId>) -> Command + Send + 'static,\n",
+        "        reply: impl FnOnce(Vec<UndoTicket>, Vec<OperationId>, Option<String>) -> Msg + Send + 'static,\n",
+        "        sender: &ComponentSender<Self>,\n    ) -> bool {"
+    );
+
+    /// The sidebar recount's landing arm. Same reason as above: rustfmt
+    /// owns where a three-field struct pattern breaks.
+    const NAV_LOADED_ARM: &str = concat!(
+        "Msg::NavLoaded {\n                gen,\n                folders,\n",
+        "                chip_folders,\n            } => {"
+    );
+
+    /// The Trash door. Same reason as above.
+    const ACT_ON_IDS_SIGNATURE: &str = concat!(
+        "fn act_on_ids(\n        &mut self,\n        ids: Vec<String>,\n",
+        "        sender: &ComponentSender<Self>,\n        label: &'static str,\n",
+        "        build: impl Fn(AccountId, Vec<ThreadId>) -> Command + Send + 'static,\n    ) {"
+    );
+
     fn extract_brace_body<'a>(src: &'a str, marker: &str) -> &'a str {
         let start = src
             .find(marker)
@@ -19417,8 +20892,11 @@ mod tests {
             arm.contains("rename_folder(&account_id, &folder_id, &name)"),
             "Msg::RenameFolder must call Core::rename_folder"
         );
+        // T-163: the refusal now travels back from the writer thread, so
+        // the text is Core's in the arm that shows it.
+        let landed = extract_brace_body(src, "Msg::FolderRenamed { gen, result } => {");
         assert!(
-            arm.contains("Err(err) => self.show_toast(&err.message, &sender)"),
+            landed.contains("Err(message) => self.show_toast(&message, &sender)"),
             "the refusal text is Core's, shown verbatim"
         );
         for forbidden in [
@@ -19468,12 +20946,14 @@ mod tests {
 
         let confirmed = extract_brace_body(src, "Msg::DeleteFolderConfirmed(folder_id) => {");
         assert!(
-            confirmed.contains("delete_folder(&account_id, &FolderId(folder_id))"),
+            confirmed.contains("core.delete_folder(&account_id, &FolderId(folder_id.clone()))"),
             "the confirmed arm must delete the folder the dialog named, not \
              whatever folder is on screen when the answer comes back"
         );
+        // T-163: the refusal comes back from the writer thread now.
+        let landed = extract_brace_body(src, "Msg::FolderDeleted { result } => match result {");
         assert!(
-            confirmed.contains("Err(err) => self.show_toast(&err.message, &sender)"),
+            landed.contains("Err(message) => self.show_toast(&message, &sender)"),
             "the refusal text is Core's, shown verbatim"
         );
         for forbidden in [
@@ -19932,30 +21412,28 @@ mod tests {
              is the letter that never loads"
         );
 
-        let grouped = extract_brace_body(
-            src,
-            concat!(
-                "fn dispatch_grouped(\n        &mut self,\n        ids: &[String],\n",
-                "        build: impl Fn(AccountId, Vec<ThreadId>) -> Command,\n",
-                "    ) -> Result<DispatchReceipt, ()> {"
-            ),
-        );
+        // The synchronous `dispatch_grouped` this used to read is gone --
+        // every grouped door now dispatches on the mailbox writer thread --
+        // so the grouping contract is stated where it lives now.
+        let grouped = extract_brace_body(src, GROUPED_ASYNC_SIGNATURE);
         assert!(
             grouped.contains("self.group_ids_by_account(ids)")
-                && grouped.contains("dispatch_with_receipt(build(account_id, thread_ids))"),
+                && grouped.contains(
+                    "dispatch_with_receipt(build(account_id.clone(), thread_ids.clone()))"
+                ),
             "one dispatch per mailbox, through the same Core door as before"
         );
 
         for (marker, label) in [
             ("fn mark_ids(&mut self, ids: Vec<String>, read: bool, sender: &ComponentSender<Self>) {", "mark read/unread"),
             ("fn archive_ids(&mut self, ids: Vec<String>, sender: &ComponentSender<Self>) {", "archive"),
+            (ACT_ON_IDS_SIGNATURE, "trash"),
         ] {
             let body = extract_brace_body(src, marker);
-            // T-139: mark-read groups the same way and then dispatches on
-            // the mailbox writer thread, so either door counts here.
+            // T-139/T-143: every grouped door groups here and dispatches on
+            // the mailbox writer thread.
             assert!(
-                body.contains("self.dispatch_grouped(")
-                    || body.contains("self.dispatch_grouped_async("),
+                body.contains("self.dispatch_grouped_async("),
                 "{label} must go through the grouped door"
             );
             assert!(
@@ -20322,7 +21800,7 @@ mod tests {
             nav.contains("std::thread::spawn")
                 && nav.contains("reader.list_unified_folders()")
                 && nav.contains("reader.list_folders(account_id)")
-                && nav.contains("Msg::NavLoaded { gen, folders }"),
+                && nav.contains("tx.emit(Msg::NavLoaded {"),
             "the recount is the same spawn shape as fetch_page, not a GTK \
              lock of self.core"
         );
@@ -20349,7 +21827,7 @@ mod tests {
             "paint_nav_box finds the row by the folder id stamped here"
         );
 
-        let landed = extract_brace_body(src, "Msg::NavLoaded { gen, folders } => {");
+        let landed = extract_brace_body(src, NAV_LOADED_ARM);
         assert!(
             landed.contains("if gen == self.nav_gen") && landed.contains("self.apply_nav(folders"),
             "a recount for an account the user already left is dropped"
@@ -20624,7 +22102,7 @@ mod tests {
             "a list the click already started must not be thrown away and             re-asked for -- and two folders reading `inbox` by fallback are             not evidence that it was started"
         );
         assert!(
-            arm.contains("self.apply_nav(folders, &sender)"),
+            arm.contains("self.apply_nav(folders, chip_folders, &sender)"),
             "the sidebar still comes from this reply either way"
         );
 
@@ -20805,6 +22283,31 @@ mod tests {
                 "fn snooze_ids_until(\n        &mut self,\n        ids: Vec<String>,\n        until: i64,\n        label: &'static str,\n        sender: &ComponentSender<Self>,\n    ) {",
                 "snooze",
             ),
+            // The doors T-143 had named as out of scope, closed since.
+            (ACT_ON_IDS_SIGNATURE, "trash"),
+            (
+                concat!(
+                    "fn act_on_ids_irreversible(\n        &mut self,\n        ids: Vec<String>,\n",
+                    "        sender: &ComponentSender<Self>,\n        label: &'static str,\n",
+                    "        build: impl Fn(AccountId, Vec<ThreadId>) -> Command + Send + 'static,\n    ) {",
+                ),
+                "permanent delete",
+            ),
+            (
+                "fn unsnooze_ids(&mut self, ids: Vec<String>, sender: &ComponentSender<Self>) {",
+                "unsnooze",
+            ),
+            ("Msg::Undo => {", "undo"),
+            ("Msg::DiscardDraft => {", "discard a draft"),
+            ("Msg::RemoveAttachment(id) => {", "remove an attachment"),
+            // T-163: folder CRUD, the two account doors and Move -- the
+            // last writes this file did on the GTK thread.
+            ("fn move_ids(&mut self, ids: Vec<String>, folder_id: String, sender: &ComponentSender<Self>) {", "move"),
+            ("Msg::CreateFolder if inbox => {", "create a folder"),
+            ("Msg::RenameFolder if inbox => {", "rename a folder"),
+            ("Msg::DeleteFolderConfirmed(folder_id) => {", "delete a folder"),
+            ("Msg::SaveAccountName { id, name } => {", "rename an account"),
+            ("Msg::RemoveAccountConfirm(id) => {", "remove an account"),
         ] {
             let body = extract_brace_body(src, marker);
             assert!(
@@ -20812,15 +22315,7 @@ mod tests {
                 "{what} must not take the profile's write lock on this thread"
             );
         }
-        let grouped = extract_brace_body(
-            src,
-            concat!(
-                "fn dispatch_grouped_async(\n        &mut self,\n        ids: &[String],\n",
-                "        build: impl Fn(AccountId, Vec<ThreadId>) -> Command + Send + 'static,\n",
-                "        reply: impl FnOnce(Vec<UndoTicket>, Vec<OperationId>, Option<String>) -> Msg + Send + 'static,\n",
-                "        sender: &ComponentSender<Self>,\n    ) -> bool {"
-            ),
-        );
+        let grouped = extract_brace_body(src, GROUPED_ASYNC_SIGNATURE);
         assert!(
             grouped.contains("self.group_ids_by_account(ids)")
                 && grouped.contains("self.mail_writer.run("),
@@ -21210,21 +22705,23 @@ mod tests {
     }
 
     /// T-032 fail-closed (Core door, mutation pin 3's other half):
-    /// `act_on_ids` remains the Core door for synchronous mutations that
-    /// have not moved to mail_writer. Mutating a Row* arm to skip it breaks
-    /// the arm test above; mutating the door itself to drop dispatch is red.
+    /// `act_on_ids` remains the Core door for Trash. Mutating a Row* arm to
+    /// skip it breaks the arm test above; mutating the door itself to drop
+    /// dispatch is red.
     #[test]
     fn act_on_ids_is_the_core_dispatch_door() {
         let src = include_str!("shell.rs");
-        let body = extract_brace_body(
-            src,
-            "fn act_on_ids(\n        &mut self,\n        ids: Vec<String>,\n        sender: &ComponentSender<Self>,\n        label: &'static str,\n        build: impl Fn(AccountId, Vec<ThreadId>) -> Command,\n    ) {",
-        );
+        let body = extract_brace_body(src, ACT_ON_IDS_SIGNATURE);
         // T-108: still exactly one dispatch door, only now it is the one
-        // that splits a merged selection per mailbox before dispatching.
+        // that splits a merged selection per mailbox before dispatching --
+        // and since T-143's follow-up it dispatches on mail_writer.
         assert!(
-            body.contains("self.dispatch_grouped(&ids, build)"),
+            body.contains("self.dispatch_grouped_async("),
             "act_on_ids must dispatch to Core -- UI never calls IMAP (D9)"
+        );
+        assert!(
+            !body.contains("self.core.lock()"),
+            "and it must not take the profile's write lock on the GTK thread"
         );
     }
 
@@ -21267,17 +22764,32 @@ mod tests {
     /// screen. The pointer suite caught the opposite: the row stayed in the
     /// Starred folder with a hollow star, so the list showed a thread that
     /// Core no longer counts as starred.
+    ///
+    /// The decision moved to `Msg::StarWritten` when the write moved to
+    /// mail_writer, and that is the point: taking the row off screen on the
+    /// *pre*-toggle flag hid a thread whose Unstar the database had refused.
     #[test]
     fn unstarring_in_a_starred_only_list_takes_the_row_off_screen() {
         let src = include_str!("shell.rs");
         let body = extract_brace_body(
             src,
-            "fn toggle_star(&mut self, id: &str, sender: &ComponentSender<Self>) {",
+            "Msg::StarWritten {\n                ids,\n                starred,\n                error,\n            } => {",
         );
         assert!(
             body.contains("if starred && self.viewing_starred_only() {")
-                && body.contains("self.hide_rows(&[id.to_string()], sender);"),
+                && body.contains("self.hide_rows(&ids, &sender);"),
             "an Unstar in a starred-only list must drop the row, not just rebind it"
+        );
+        let hide = body
+            .find("self.hide_rows(")
+            .expect("the starred-only list drops the row");
+        let refused = body
+            .find("if error.is_some() {")
+            .expect("a refused star has its own branch");
+        assert!(
+            refused < hide,
+            "the row may only leave a starred-only list once Core has \
+             actually taken the star off"
         );
         assert!(
             !body.contains("reload_list"),
@@ -21711,7 +23223,7 @@ mod tests {
             "fn rebind_thread(&mut self, id: &str, sender: &ComponentSender<Self>) {",
         );
         assert!(
-            body.contains("rows::repaint_live_row(&t, pending);"),
+            body.contains("rows::repaint_live_row(&t, chip.as_deref(), pending, now);"),
             "the card on screen is written through in place"
         );
         assert!(
@@ -21951,6 +23463,261 @@ mod tests {
             provisioned_effect(2, 2, Err("boom".into())),
             ProvisionedEffect::Fail(message) if message == "boom"
         ));
+    }
+
+    /// T-156: the address field is looked up when it is finished, not
+    /// while it is being typed. `connect_changed` here would put one HTTPS
+    /// request to the ISPDB and two DNS queries behind every keystroke of
+    /// an address -- twenty round trips to type one mailbox.
+    #[test]
+    fn autoconfig_asks_when_the_address_field_is_left_not_on_every_keystroke() {
+        let src = include_str!("shell.rs");
+        let form = source_block(src, "fn build_imap_form(");
+        assert!(
+            form.contains("gtk::EventControllerFocus::new()")
+                && form.contains("focus.connect_leave(move |_| tx.emit(Msg::WizardEmailEntered));"),
+            "the lookup must hang off focus leaving the address entry"
+        );
+        assert!(
+            !form.contains(".connect_changed("),
+            "a keystroke must not be able to start a network lookup"
+        );
+        let arm = compact_source(source_block(src, "Msg::WizardEmailEntered => {"));
+        assert!(
+            arm.contains("autoconfig_trigger("),
+            "the arm must ask whether this address is worth a lookup at all"
+        );
+        assert!(
+            arm.contains("feathermail_service::spawn_autoconfig(email,move|outcome|{"),
+            "D9/D11: the lookup goes through the service door, off the GTK thread"
+        );
+    }
+
+    /// The trigger is the only thing standing between a focus change and a
+    /// network round trip, so each of its refusals is a separate promise.
+    #[test]
+    fn autoconfig_refuses_half_addresses_a_filled_form_and_repeats() {
+        assert_eq!(
+            autoconfig_trigger("  you@example.org ", "", "", None),
+            Some("you@example.org".to_string()),
+            "a finished address on an untouched form is worth asking about"
+        );
+        assert_eq!(autoconfig_trigger("you", "", "", None), None, "no domain");
+        assert_eq!(autoconfig_trigger("you@", "", "", None), None, "no domain");
+        assert_eq!(autoconfig_trigger("@example.org", "", "", None), None);
+        assert_eq!(autoconfig_trigger("", "", "", None), None);
+        assert_eq!(
+            autoconfig_trigger("you@example.org", "imap.example.org", "", None),
+            None,
+            "a host typed by hand outranks anything the ISPDB would say"
+        );
+        assert_eq!(
+            autoconfig_trigger("you@example.org", "", "smtp.example.org", None),
+            None
+        );
+        assert_eq!(
+            autoconfig_trigger("you@example.org", "", "", Some("You@Example.ORG")),
+            None,
+            "tabbing back into a field must not buy the same answer twice"
+        );
+        assert_eq!(
+            autoconfig_trigger("other@example.org", "", "", Some("you@example.org")),
+            Some("other@example.org".to_string()),
+            "a different address is a different question"
+        );
+    }
+
+    fn autoconfig_found(email: &str) -> AutoconfigOutcome {
+        AutoconfigOutcome::Found(MailboxForm {
+            email: email.to_string(),
+            imap_host: "imap.example.org".into(),
+            imap_port: 993,
+            imap_security: MailSecurity::Ssl,
+            smtp_host: "smtp.example.org".into(),
+            smtp_port: 587,
+            smtp_security: MailSecurity::StartTls,
+        })
+    }
+
+    /// The lookup cannot be cancelled, so the answer for a mailbox the
+    /// user has already given up on is still on its way while they type
+    /// the next one. Applied blindly it would write another provider's
+    /// servers into the form under the address now in the field -- the
+    /// same defect `provisioned_effect`'s `gen` closes one door along.
+    #[test]
+    fn a_late_autoconfig_answer_for_another_address_is_dropped() {
+        let form = AutoconfigFormState {
+            email: "second@other.example".into(),
+            ..AutoconfigFormState::default()
+        };
+        assert_eq!(
+            autoconfig_effect(
+                &WizardEmail::new("first@example.org"),
+                &form,
+                autoconfig_found("first@example.org")
+            ),
+            AutoconfigEffect::Stale
+        );
+        assert_eq!(
+            autoconfig_effect(
+                &WizardEmail::new("first@example.org"),
+                &form,
+                AutoconfigOutcome::Failed("boom".into())
+            ),
+            AutoconfigEffect::Stale,
+            "a stale failure must not put a hint under the address that replaced it"
+        );
+        // Neither trimming nor case makes it a different mailbox.
+        assert_eq!(
+            autoconfig_effect(
+                &WizardEmail::new("first@example.org"),
+                &AutoconfigFormState {
+                    email: " First@Example.ORG ".into(),
+                    ..AutoconfigFormState::default()
+                },
+                AutoconfigOutcome::NotFound
+            ),
+            AutoconfigEffect::Silent
+        );
+    }
+
+    /// An autoconfig answer is a suggestion. Whatever the user has already
+    /// put in the form outranks it -- and a security dropdown, which has no
+    /// empty state, is "untouched" exactly while its own host is empty.
+    #[test]
+    fn autoconfig_fills_only_the_fields_the_user_left_empty() {
+        let untouched = AutoconfigFormState {
+            email: "you@example.org".into(),
+            ..AutoconfigFormState::default()
+        };
+        assert_eq!(
+            autoconfig_effect(
+                &WizardEmail::new("you@example.org"),
+                &untouched,
+                autoconfig_found("you@example.org")
+            ),
+            AutoconfigEffect::Fill(AutoconfigFill {
+                imap_host: Some("imap.example.org".into()),
+                imap_port: Some("993".into()),
+                imap_security: Some(MailSecurity::Ssl),
+                smtp_host: Some("smtp.example.org".into()),
+                smtp_port: Some("587".into()),
+                smtp_security: Some(MailSecurity::StartTls),
+            })
+        );
+
+        let half_typed = AutoconfigFormState {
+            email: "you@example.org".into(),
+            imap_host: "mail.mine.example".into(),
+            smtp_port: "2525".into(),
+            ..AutoconfigFormState::default()
+        };
+        assert_eq!(
+            autoconfig_effect(
+                &WizardEmail::new("you@example.org"),
+                &half_typed,
+                autoconfig_found("you@example.org")
+            ),
+            AutoconfigEffect::Fill(AutoconfigFill {
+                imap_host: None,
+                imap_port: Some("993".into()),
+                imap_security: None,
+                smtp_host: Some("smtp.example.org".into()),
+                smtp_port: None,
+                smtp_security: Some(MailSecurity::StartTls),
+            }),
+            "the host and port the user typed stay, and the IMAP dropdown \
+             they may have set with them is left alone"
+        );
+
+        let full = AutoconfigFormState {
+            email: "you@example.org".into(),
+            imap_host: "mail.mine.example".into(),
+            imap_port: "143".into(),
+            smtp_host: "mail.mine.example".into(),
+            smtp_port: "587".into(),
+        };
+        assert_eq!(
+            autoconfig_effect(
+                &WizardEmail::new("you@example.org"),
+                &full,
+                autoconfig_found("you@example.org")
+            ),
+            AutoconfigEffect::Silent,
+            "an answer with nothing left to write says nothing"
+        );
+    }
+
+    /// A provider missing from the ISPDB is not the user's problem and
+    /// gets no message; a lookup that broke gets one line, never a modal --
+    /// the manual form behind it is already the way forward.
+    #[test]
+    fn a_missing_provider_is_silent_and_a_broken_lookup_is_one_hint() {
+        let form = AutoconfigFormState {
+            email: "you@example.org".into(),
+            ..AutoconfigFormState::default()
+        };
+        assert_eq!(
+            autoconfig_effect(
+                &WizardEmail::new("you@example.org"),
+                &form,
+                AutoconfigOutcome::NotFound
+            ),
+            AutoconfigEffect::Silent
+        );
+        assert_eq!(
+            autoconfig_effect(
+                &WizardEmail::new("you@example.org"),
+                &form,
+                AutoconfigOutcome::Failed(
+                    "Looking up this provider's settings failed. \
+                     Enter the server details below."
+                        .into()
+                )
+            ),
+            AutoconfigEffect::Hint(
+                "Looking up this provider's settings failed. \
+                 Enter the server details below."
+                    .into()
+            )
+        );
+        let src = include_str!("shell.rs");
+        let arm = compact_source(source_block(
+            src,
+            "Msg::AutoconfigResolved { email, outcome } => {",
+        ));
+        assert!(
+            arm.contains(
+                "AutoconfigEffect::Hint(message)=>self.set_autoconfig_hint(Some(&message))"
+            ),
+            "a failed lookup lands in the inline hint"
+        );
+        assert!(
+            !arm.contains("Dialog") && !arm.contains("AlertDialog"),
+            "a failed lookup must not raise a dialog over a usable form"
+        );
+    }
+
+    /// D14: `Msg` derives `Debug`, and every arm of this one carries the
+    /// user's address -- the one that was asked about, and the one the
+    /// answer echoes back inside `MailboxForm`.
+    #[test]
+    fn an_autoconfig_reply_never_prints_the_address() {
+        let printed = format!(
+            "{:?}",
+            Msg::AutoconfigResolved {
+                email: WizardEmail::new("private.person@example.org"),
+                outcome: autoconfig_found("private.person@example.org"),
+            }
+        );
+        assert!(
+            !printed.contains("private.person"),
+            "the address must not reach a printed line: {printed}"
+        );
+        assert!(
+            printed.contains("[redacted]"),
+            "and it must be visible that something was held back: {printed}"
+        );
     }
 
     #[test]
@@ -22274,5 +24041,1043 @@ mod tests {
         assert!(tap.contains("connect_before_paint"));
         assert!(tap.contains("connect_after_paint"));
         assert!(!tap.contains("add_tick_callback"));
+    }
+
+    /// rustfmt breaks the `DraftSaved` arm's pattern over five lines, and
+    /// the `tx.emit` in `save_current_draft` opens with exactly the same
+    /// two -- so a contract about the arm anchors on the whole pattern, up
+    /// to the `=>` only the arm has.
+    const DRAFT_SAVED_ARM: &str = concat!(
+        "Msg::DraftSaved {\n                session,\n                gen,\n",
+        "                result,\n            } => {"
+    );
+
+    /// Closing compose is the one point where an unsaved draft must reach
+    /// disk. `Msg::CloseCompose` calls `save_current_draft`, which returns
+    /// early while a previous autosave is still in flight, and the only
+    /// retry (`Msg::DraftSaved`) used to be gated on the window still being
+    /// visible -- which `CloseCompose` has just turned off.
+    #[test]
+    fn closing_compose_saves_even_while_an_autosave_is_in_flight() {
+        let src = include_str!("shell.rs");
+        let saved = source_block(src, DRAFT_SAVED_ARM);
+        assert!(
+            !saved.contains("self.compose_dirty && self.compose.is_visible()"),
+            "the retry after an in-flight save must not depend on the compose \
+             window still being open -- CloseCompose hides it first"
+        );
+        let close = extract_brace_body(src, "Msg::CloseCompose => {");
+        assert!(
+            close.contains("compose_save_inflight") || close.contains("compose_close_pending"),
+            "CloseCompose must record that a close is waiting on the in-flight \
+             save instead of calling a door that silently returns"
+        );
+    }
+
+    /// A response draft is created under the account the letter lives in
+    /// (`begin_response_draft` -> `account_for_thread`), so every compose
+    /// door has to act on that account. Reading `current_account` instead
+    /// makes Core's owner check (`save_draft` -> PermissionDenied) reject
+    /// both autosave and Send whenever the merged view is open.
+    #[test]
+    fn compose_doors_act_on_the_drafts_account_not_the_menus() {
+        let src = include_str!("shell.rs");
+        let save = extract_brace_body(
+            src,
+            "fn save_current_draft(&mut self, gen: u64, sender: &ComponentSender<Self>) {",
+        );
+        assert!(
+            !save.contains("self.current_account"),
+            "saving a draft must use the account that owns the draft"
+        );
+        let send = extract_brace_body(src, "Msg::Send => {");
+        assert!(
+            !send.contains("self.current_account"),
+            "sending must use the account that owns the draft"
+        );
+        let discard = extract_brace_body(src, "Msg::DiscardDraft => {");
+        assert!(
+            !discard.contains("self.current_account"),
+            "discarding must use the account that owns the draft"
+        );
+    }
+
+    /// A hit opened from the merged view carries its own mailbox. Moving
+    /// only `self.folder` leaves `current_account` on the previous mailbox,
+    /// and `fetch_page` then asks Core for "account A, folder of account B".
+    #[test]
+    fn open_search_hit_moves_to_the_hits_account() {
+        let src = include_str!("shell.rs");
+        let arm = extract_brace_body(src, "Msg::OpenSearchHit(id) => {");
+        assert!(
+            arm.contains("account_id"),
+            "opening a hit must move the shell to the mailbox the hit is in, \
+             not only to its folder id"
+        );
+    }
+
+    /// Every timestamp the shell paints has to be measured against the
+    /// same clock the group headers are stamped with. Against the fixture
+    /// clock anything newer than 2024-05-20 falls into `format_clock`'s
+    /// "Today" branch and prints a time of day, so a letter under an
+    /// "Older" header showed "3:42 PM".
+    #[test]
+    fn painted_timestamps_use_the_wall_clock() {
+        let src = include_str!("shell.rs");
+        let live = src.split("mod tests").next().unwrap();
+        assert!(
+            !live.contains("format_clock(t.date, FIXTURE_NOW)")
+                && !live.contains("format_clock(msg.date, FIXTURE_NOW)"),
+            "a painted timestamp must be measured against the wall clock, \
+             the same clock `stamp_headers` uses"
+        );
+        // And what the two clocks do to one real letter: 200 days back is
+        // a date against the wall clock, and a clock time against the
+        // fixture constant -- which is the whole defect, in one line.
+        let now = wall_clock_now();
+        let old = now - 200 * 86_400;
+        assert!(
+            !format_clock(old, now).contains(':'),
+            "a letter 200 days old must not be painted as a time of day, got {:?}",
+            format_clock(old, now)
+        );
+        assert!(
+            format_clock(old, FIXTURE_NOW).contains(':'),
+            "the fixture constant is in the past, so every real letter looks \
+             like it arrived today -- that is why it may not reach a label"
+        );
+    }
+
+    /// T-046: "GTK adds a plaintext quote". An HTML letter -- the default
+    /// rendering for `multipart/alternative`, since `prefer_plain` is off
+    /// by default -- produces no quote at all.
+    #[test]
+    fn replying_to_an_html_letter_quotes_it() {
+        let state = BodyState::Ready(PreparedBody::Html {
+            sanitized: "<p>hello</p><p>world</p>".to_string(),
+            report: feathermail_html::SanitizeReport::default(),
+            attachments: 0,
+            allow_remote_images: false,
+        });
+        let quote = compose_quote(&state);
+        assert!(
+            quote.contains("> hello"),
+            "a reply to an HTML letter must carry the quoted text, got {quote:?}"
+        );
+    }
+
+    /// T-121 made `refill_nav` asynchronous: `folders_cache` is refreshed
+    /// only when `Msg::NavLoaded` lands. Both recovery branches still ask
+    /// the cache on the spot, so they read the folder set that the just
+    /// deleted account/folder is still in and never fire.
+    #[test]
+    fn folder_fallback_does_not_read_the_stale_nav_cache() {
+        let src = include_str!("shell.rs");
+        for marker in [
+            "Msg::RemoveAccountConfirm(id) => {",
+            "Msg::DeleteFolderConfirmed(folder_id) => {",
+        ] {
+            let arm = extract_brace_body(src, marker);
+            assert!(
+                !arm.contains(".folders_cache"),
+                "{marker} decides on a folder set that `refill_nav` has not \
+                 fetched yet -- the fallback must live where NavLoaded lands"
+            );
+        }
+    }
+
+    /// Every other compose door refuses to act while a save is in flight
+    /// (`Msg::Send`, `Msg::PickAttachment`). Discard deletes the row
+    /// straight away, so a save thread that has not taken the `core` lock
+    /// yet re-inserts the draft it was told to throw away.
+    #[test]
+    fn discard_waits_for_the_in_flight_save() {
+        let src = include_str!("shell.rs");
+        let arm = extract_brace_body(src, "Msg::DiscardDraft => {");
+        assert!(
+            arm.contains("compose_save_inflight"),
+            "Discard must not race the background save that is about to \
+             write the same draft id back"
+        );
+        assert!(
+            arm.contains("PendingDiscard {"),
+            "the parked delete has to carry its own mailbox and row: by the \
+             time the save answers, the reader may be writing the next letter"
+        );
+    }
+
+    /// The subtle half of that fix: the reader can discard a draft and open
+    /// the next letter before the save answers. The session guard would
+    /// then drop the answer -- and with it the delete -- leaving the
+    /// thrown-away draft in Drafts, so the parked discard is settled first.
+    #[test]
+    fn a_parked_discard_outlives_the_window_that_asked_for_it() {
+        let src = include_str!("shell.rs");
+        let arm = source_block(src, DRAFT_SAVED_ARM);
+        let discard = arm
+            .find("compose_discard_pending")
+            .expect("DraftSaved settles a parked discard");
+        let guard = arm
+            .find("if !compose_reply_is_current")
+            .expect("DraftSaved drops a previous session's answer");
+        assert!(
+            discard < guard,
+            "a discard parked by a window that is already gone must be \
+             settled before the session guard returns"
+        );
+    }
+
+    /// The pure half of the close/save race. Closing hides the window
+    /// first, so a retry that asks whether the window is visible drops
+    /// exactly the edits the close was meant to write.
+    #[test]
+    fn a_closing_compose_window_still_earns_its_save() {
+        assert!(!draft_save_retry(false, true, false), "nothing to write");
+        assert!(!draft_save_retry(false, false, true), "nothing to write");
+        assert!(draft_save_retry(true, true, false), "the ordinary autosave");
+        assert!(
+            draft_save_retry(true, false, true),
+            "the window is hidden because it is closing -- that is the one \
+             moment an unsaved draft has to reach disk"
+        );
+        assert!(
+            !draft_save_retry(true, false, false),
+            "a hidden window nobody is closing has nothing to say"
+        );
+    }
+
+    /// Same guard as `body_reply_is_current`, stated where it is decided.
+    #[test]
+    fn a_previous_compose_sessions_answer_is_not_current() {
+        assert!(compose_reply_is_current(7, 7));
+        assert!(!compose_reply_is_current(8, 7), "the window was replaced");
+    }
+
+    /// The three doors that would otherwise have carried a stale account:
+    /// attachments are added to, and removed from, the draft's mailbox too.
+    #[test]
+    fn the_attachment_doors_also_act_on_the_drafts_account() {
+        let src = include_str!("shell.rs");
+        for marker in [
+            "Msg::AttachmentPicked(path) => {",
+            "Msg::RemoveAttachment(id) => {",
+        ] {
+            let arm = extract_brace_body(src, marker);
+            assert!(
+                !arm.contains("self.current_account"),
+                "{marker} must use the account that owns the draft"
+            );
+        }
+    }
+
+    /// T-046: an HTML letter keeps its paragraphs in tags, and the
+    /// preview's extractor collapses every whitespace run into spaces --
+    /// quoting through it alone would glue words across the tag boundary.
+    #[test]
+    fn an_html_quote_keeps_the_lines_the_markup_stands_for() {
+        let quote = compose_quote(&BodyState::Ready(PreparedBody::Html {
+            sanitized: "<p>Hello there</p><p>Second line</p>".to_string(),
+            report: feathermail_html::SanitizeReport::default(),
+            attachments: 0,
+            allow_remote_images: false,
+        }));
+        assert_eq!(
+            quote, "\n\n> Hello there\n> \n> Second line",
+            "two paragraphs stay two paragraphs, one blank quoted line apart"
+        );
+    }
+
+    /// A `<style>` block survives sanitizing, and its CSS is markup for the
+    /// renderer -- not text the sender wrote for the reader to answer.
+    #[test]
+    fn an_html_quote_leaves_the_stylesheet_out() {
+        let quote = compose_quote(&BodyState::Ready(PreparedBody::Html {
+            sanitized: "<style>p { color: red; }</style><p>Body text</p>".to_string(),
+            report: feathermail_html::SanitizeReport::default(),
+            attachments: 0,
+            allow_remote_images: false,
+        }));
+        assert_eq!(quote, "\n\n> Body text");
+    }
+
+    /// A plaintext letter still quotes the way it always did.
+    #[test]
+    fn a_plain_quote_is_unchanged_by_the_html_path() {
+        let quote = compose_quote(&BodyState::Ready(PreparedBody::Plain {
+            text: "  first\nsecond  ".to_string(),
+            attachments: 0,
+        }));
+        assert_eq!(quote, "\n\n> first\n> second");
+    }
+
+    #[test]
+    fn nested_blocks_do_not_pad_a_quote_with_blank_lines() {
+        assert_eq!(collapse_blank_lines("a\n\n\n\nb\n"), "a\n\nb\n");
+        assert_eq!(collapse_blank_lines("a\nb"), "a\nb\n");
+    }
+
+    /// A newsletter is hundreds of kilobytes of text, and every autosave
+    /// would write all of it back into the draft.
+    #[test]
+    fn a_quote_is_cut_at_a_line_and_says_so() {
+        let long = "line\n".repeat(MAX_QUOTE_CHARS);
+        let cut = truncate_quote(&long);
+        assert!(cut.chars().count() < long.chars().count());
+        assert!(cut.ends_with("\n[...]"), "the cut has to be visible");
+        assert_eq!(truncate_quote("short"), "short");
+    }
+
+    /// T-121: `refill_nav` answers later, so the folder the shell is in is
+    /// only checkable against the folder set that answer carries.
+    #[test]
+    fn the_folder_after_a_nav_answer_is_one_that_answer_holds() {
+        let folders = vec![
+            fixture_folder("a1:inbox", FolderKind::Inbox, false),
+            fixture_folder("a1:notes", FolderKind::Custom, false),
+        ];
+        assert_eq!(App::folder_after_nav("a1:notes", &folders), "a1:notes");
+        assert_eq!(
+            App::folder_after_nav("a1:gone", &folders),
+            "a1:inbox",
+            "a folder that is no longer there falls back to the Inbox"
+        );
+        assert_eq!(
+            App::folder_after_nav("unified:inbox", &[]),
+            "unified:inbox",
+            "the merged view is not in any account's folder list"
+        );
+        assert_eq!(
+            App::folder_after_nav("a1:gone", &[]),
+            "a1:gone",
+            "an empty folder list is a mailbox that has not answered yet, \
+             not a folder that was deleted"
+        );
+    }
+
+    /// DESIGN.md ("Message preview"): the chip beside the subject names the
+    /// folder the letter is in. `Thread.labels` is empty for every row Core
+    /// maps out of SQLite, so the literal fallback was the only branch that
+    /// ever ran -- letters in Trash were chipped "Inbox".
+    #[test]
+    fn the_preview_chip_names_the_folder_the_letter_is_in() {
+        let folders = vec![
+            named_folder("acc1:inbox", "Inbox", FolderKind::Inbox),
+            named_folder("acc1:trash", "Trash", FolderKind::Trash),
+        ];
+        let mut thread = stub_thread("t1");
+        thread.folder = FolderId("acc1:trash".to_string());
+        assert_eq!(preview_chip_label(Some(&thread), &folders), "Trash");
+        assert_eq!(preview_chip_label(Some(&thread), &[]), "Inbox");
+        assert_eq!(preview_chip_label(None, &folders), "Inbox");
+        let src = include_str!("shell.rs");
+        let live = src.split("mod tests").next().unwrap();
+        assert!(
+            !live.contains("t.labels.first()"),
+            "`labels` is empty on every row Core maps, so a chip built from \
+             it can only ever paint its fallback"
+        );
+    }
+
+    /// T-161: the chip DESIGN.md promises on a list row, decided where the
+    /// open folder is known.
+    ///
+    /// It used to be `rows::display_label`, reading `Thread.labels` --
+    /// which `Core::map_thread` fills with an empty vector for every row
+    /// it maps out of SQLite, so the chip never painted once in a real
+    /// profile. Four cases, and the first is the one that makes the chip
+    /// worth having at all: a list that mixes folders says which folder
+    /// each row came from, and an ordinary folder says nothing, because
+    /// every row would only repeat the column heading.
+    #[test]
+    fn a_row_chip_only_names_a_folder_the_list_is_not_showing() {
+        let folders = vec![
+            named_folder("acc1:inbox", "Inbox", FolderKind::Inbox),
+            named_folder("acc1:starred", "Starred", FolderKind::Starred),
+            named_folder("acc2:ideas", "Ideas", FolderKind::Custom),
+        ];
+        assert_eq!(
+            row_chip_label("acc1:starred", "acc1:inbox", &folders),
+            Some("Inbox".to_string()),
+            "a virtual list mixes folders, so the row has to say which one"
+        );
+        assert_eq!(
+            row_chip_label("unified:inbox", "acc2:ideas", &folders),
+            Some("Ideas".to_string()),
+            "the merged view names the row's own folder, from any mailbox"
+        );
+        assert_eq!(
+            row_chip_label("acc1:inbox", "acc1:inbox", &folders),
+            None,
+            "in an ordinary folder the chip would only repeat the heading"
+        );
+        assert_eq!(
+            row_chip_label("acc1:starred", "acc9:unknown", &folders),
+            None,
+            "a mailbox whose folders have not been fetched yet has nothing \
+             to say, and a guess would be worse than silence"
+        );
+        let src = include_str!("shell.rs");
+        let live = src.split("mod tests").next().unwrap();
+        assert!(
+            !live.contains("display_label("),
+            "`labels` is empty on every row Core maps, so a chip built from \
+             it can only ever be invisible"
+        );
+    }
+
+    /// T-161: and the chip reaches the row as a value, the way `now` does.
+    /// The row cannot look one up -- it has neither the open folder nor a
+    /// folder table -- which is what stops the dead `labels` branch from
+    /// growing back.
+    #[test]
+    fn the_list_row_is_handed_its_chip_rather_than_deriving_one() {
+        let src = include_str!("shell.rs");
+        let page = extract_brace_body(
+            src,
+            "fn render_page(&mut self, page: ThreadPage, sender: &ComponentSender<Self>) {",
+        );
+        assert!(
+            page.contains("row_chip_label(&self.folder, t.folder.as_str(), &self.chip_folders)"),
+            "the page decides the chip from the folder it is showing"
+        );
+        let nav = extract_brace_body(
+            src,
+            "fn refill_nav(&mut self, sender: &ComponentSender<Self>) {",
+        );
+        assert!(
+            nav.contains("let chip_folders = if unified {"),
+            "the merged view's chip table is every account's folders, and it \
+             is gathered on the background thread, not the GTK one"
+        );
+    }
+
+    /// The friendly empty state is keyed on what kind of folder this is,
+    /// not on its id: real ids are account-scoped ("acc1:inbox") and the
+    /// merged view's is "unified:inbox", so neither ever matched the
+    /// literals `empty_copy` compares against.
+    #[test]
+    fn the_empty_state_is_keyed_on_the_kind_of_folder() {
+        let folders = vec![
+            named_folder("acc1:inbox", "Inbox", FolderKind::Inbox),
+            named_folder("acc1:sent", "Sent", FolderKind::Sent),
+        ];
+        assert_eq!(empty_copy_key_for("acc1:inbox", &folders), "inbox");
+        assert_eq!(empty_copy_key_for("unified:inbox", &folders), "inbox");
+        assert_eq!(empty_copy_key_for("acc1:sent", &folders), "sent");
+        assert_eq!(empty_copy_key_for("acc1:gone", &folders), "");
+        assert_eq!(
+            empty_copy(empty_copy_key_for("acc1:inbox", &folders), false).title,
+            "You're all caught up."
+        );
+        assert_eq!(
+            empty_copy(empty_copy_key_for("acc1:inbox", &folders), false).body,
+            "No new messages."
+        );
+    }
+
+    /// The list column's heading spelled the raw wire label while the
+    /// sidebar row beside it spelled the decoded one.
+    #[test]
+    fn the_list_heading_spells_a_folder_the_way_the_sidebar_does() {
+        let folders = vec![named_folder(
+            "acc1:sent",
+            "&BBgEQQRFBD4ENARPBEkEOAQ1-",
+            FolderKind::Sent,
+        )];
+        assert_eq!(folder_label_from(&folders, "acc1:sent"), "Исходящие");
+        assert_eq!(folder_label_from(&folders, "acc1:gone"), "Inbox");
+        let (system, _) = nav_specs(&folders, "acc1:sent");
+        assert_eq!(
+            folder_label_from(&folders, "acc1:sent"),
+            system[0].label,
+            "one folder, one spelling"
+        );
+    }
+
+    /// The stack of history cards under an open letter reads the same
+    /// `messages.sender_name` the meta line above it does, and that column
+    /// can still hold a raw `=?UTF-8?B?...?=` on a profile that predates
+    /// `CoreSyncStore::upsert_one`.
+    #[test]
+    fn thread_history_cards_decode_the_sender_name() {
+        let src = include_str!("shell.rs");
+        for marker in ["fn collapsed_thread_card(", "fn expanded_thread_card("] {
+            let body = source_block(src, marker);
+            assert!(
+                body.contains("decode_encoded_words(&msg.from.name)"),
+                "{marker} paints a name the reading pane decodes one line above"
+            );
+        }
+    }
+
+    /// T-106's rule, stated for the two Diagnostics toasts that had fallen
+    /// out of it.
+    #[test]
+    fn the_diagnostics_toasts_count_in_the_singular_too() {
+        assert_eq!(indexing_queued_toast(1), "Queued 1 message for indexing");
+        assert_eq!(indexing_queued_toast(0), "Queued 0 messages for indexing");
+        assert_eq!(indexing_queued_toast(2), "Queued 2 messages for indexing");
+        assert_eq!(cache_cleared_toast(1), "Cleared 1 cached message");
+        assert_eq!(cache_cleared_toast(0), "Cleared 0 cached messages");
+        assert_eq!(cache_cleared_toast(9), "Cleared 9 cached messages");
+    }
+
+    fn named_folder(id: &str, label: &str, kind: FolderKind) -> FolderSummary {
+        FolderSummary {
+            folder: feathermail_core::Folder {
+                id: FolderId(id.to_string()),
+                label: label.to_string(),
+                kind,
+                color: None,
+                account_id: Some(AccountId("acc1".to_string())),
+                create_failed: false,
+            },
+            unread: 0,
+            total: 0,
+        }
+    }
+
+    /// Like `extract_brace_body`, but anchored on a name rather than on a
+    /// verbatim signature: it opens at the first `{` after the marker, so a
+    /// reformatted parameter list does not turn a contract test into a panic.
+    fn source_block<'a>(src: &'a str, marker: &str) -> &'a str {
+        let start = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("{marker} must exist verbatim"));
+        // A marker that already ends in the opening brace names its own
+        // block; anything else (a bare `fn name(`) opens at the next brace
+        // after the marker, so a struct pattern inside the marker -- `Msg::
+        // DraftSaved { gen, result } => {` -- cannot be mistaken for it.
+        let after = start + marker.len();
+        let open = if marker.ends_with('{') {
+            after - 1
+        } else {
+            after
+                + src[after..]
+                    .find('{')
+                    .unwrap_or_else(|| panic!("{marker} must open a block"))
+        };
+        let mut depth = 0i32;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open + 1..open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{marker} must have a matching closing brace")
+    }
+
+    /// rustfmt breaks a long `self.core.lock().unwrap().foo()` over four
+    /// lines; a contract about that call must not depend on where it broke.
+    fn compact_source(body: &str) -> String {
+        body.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// `present_compose` starts a fresh letter: it clears `compose_draft_id`
+    /// and drops `compose_save_inflight`, but nothing tells the save thread
+    /// of the *previous* compose session that its answer is no longer wanted.
+    /// `Msg::DraftSaved`/`AttachmentAdded`/`SendQueued` then rebind
+    /// `compose_draft_id` to the old draft, so the next autosave writes the
+    /// reply's text over a draft the user had already saved, and Send queues
+    /// the wrong row. Same shape as `body_gen`/`search_gen`, which every
+    /// other late reply in this file is already checked against.
+    #[test]
+    fn a_new_compose_session_ignores_the_previous_ones_save_reply() {
+        let src = include_str!("shell.rs");
+        let present = compact_source(source_block(src, "fn present_compose("));
+        assert!(
+            present.contains("compose_send_pending=false"),
+            "a new compose session must not inherit a Send that was parked \
+             behind the previous session's in-flight save"
+        );
+        for marker in [
+            DRAFT_SAVED_ARM,
+            "Msg::AttachmentAdded { session, result } => {",
+            "Msg::SendQueued { session, result } => {",
+        ] {
+            let arm = source_block(src, marker);
+            assert!(
+                arm.contains("compose_session"),
+                "{marker} reassigns compose_draft_id, so it must first check \
+                 that the reply belongs to the compose session on screen"
+            );
+        }
+    }
+
+    /// T-143 left Star out of the mail_writer move on purpose ("не входит:
+    /// Star/Trash/Move/папки"), so the star stayed an IMMEDIATE SQLite
+    /// transaction on the GTK thread behind a 5 s `busy_timeout`, with its
+    /// `Result` dropped by `let _ =`. The Starred list then hid the row on
+    /// the *pre*-toggle flag, so a refused Unstar took the thread off screen
+    /// while Core still held it starred.
+    ///
+    /// Reading the current flag through `get_thread` stays legal here: it is
+    /// the small indexed query the door's own doc comment sanctions.
+    #[test]
+    fn star_leaves_sqlite_to_the_mail_writer_and_reports_refusals() {
+        let src = include_str!("shell.rs");
+        let body = source_block(
+            src,
+            "fn toggle_star(&mut self, id: &str, sender: &ComponentSender<Self>) {",
+        );
+        let compact = compact_source(body);
+        assert!(
+            !compact.contains("self.core.lock().unwrap().dispatch("),
+            "Star/Unstar must not take the profile's write lock on the GTK \
+             thread -- that is the same wait T-139/T-143 removed"
+        );
+        assert!(
+            !compact.contains(concat!("let_", "=self.core")),
+            "a star the database refused has to reach the reader, not be \
+             dropped on the floor"
+        );
+        assert!(
+            body.contains("dispatch_grouped_async") || body.contains("self.mail_writer.run("),
+            "the write belongs on the mailbox writer thread, with retries"
+        );
+        let landed = source_block(
+            src,
+            "Msg::StarWritten {\n                ids,\n                starred,\n                error,\n            } => {",
+        );
+        assert!(
+            landed.contains("self.show_toast(\"Couldn’t change the star.\", &sender)"),
+            "and the refusal is said out loud, not left as a star that \
+             silently springs back"
+        );
+    }
+
+    /// The one profile *write* that used to sit in a typing path: every
+    /// settled search query INSERTed into `search_history` straight from
+    /// `update`, behind the same `busy_timeout` T-133 measured at 5012.8 ms,
+    /// and threw the `Result` away.
+    ///
+    /// The check is the arm, not the file: `Core::record_search_history` has
+    /// to be called from somewhere, and where it is called from is the whole
+    /// question. Nothing in `Msg::SearchDebounced` may take the profile lock
+    /// -- neither the INSERT nor the history read next to it.
+    #[test]
+    fn search_history_is_not_written_on_the_gtk_thread() {
+        let src = include_str!("shell.rs");
+        let arm = compact_source(source_block(
+            src,
+            "Msg::SearchDebounced { gen, query } => {",
+        ));
+        assert!(
+            !arm.contains("self.core.lock()"),
+            "a settled query must not take the profile lock on the GTK \
+             thread -- that is a write in the middle of typing"
+        );
+        let door = source_block(src, "fn record_search_history(&self, query: String) {");
+        assert!(
+            door.contains("self.mail_writer.run(") && door.contains("with_retries(core,"),
+            "the INSERT belongs on the mailbox writer thread, with retries"
+        );
+        // The read moved too: it is the reader handle, the same one
+        // `refill_nav` uses, and it answers with a `Msg`.
+        let history = source_block(
+            src,
+            "fn reload_search_history(&self, sender: &ComponentSender<Self>) {",
+        );
+        assert!(
+            history.contains("Arc::clone(&self.reader)")
+                && history.contains("Msg::SearchHistoryLoaded"),
+            "the recent-query list is read off the GTK thread as well"
+        );
+        let offenders: Vec<usize> = src
+            .split(concat!("\n", "mod tests {"))
+            .next()
+            .unwrap()
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let code = line.trim_start();
+                !code.starts_with("//")
+                    && !code.starts_with("///")
+                    && code.contains(concat!(".list_search_", "history("))
+            })
+            .map(|(n, _)| n + 1)
+            .collect();
+        assert_eq!(
+            offenders.len(),
+            1,
+            "exactly one place reads the history, and it is the reader \
+             thread -- lines {offenders:?}"
+        );
+    }
+
+    /// `notification_watermarks` used to be seeded once, in `init`, from the
+    /// accounts that already existed. A mailbox added by the wizard in this
+    /// session never got an entry, so the first `FolderSynced { ok: true }`
+    /// read a watermark of 0 and `notification_candidates(.., 0, 20)`
+    /// answered with twenty of the inbox's unread letters -- a burst of
+    /// desktop notifications about mail from months ago, with the chime.
+    #[test]
+    fn a_mailbox_added_this_session_gets_a_notification_watermark() {
+        let src = include_str!("shell.rs");
+        let added = source_block(src, "ProvisionedEffect::Added(id) => {");
+        assert!(
+            added.contains("notification_watermark"),
+            "the account the wizard just added must have its watermark set \
+             before its first sync event, or its old mail is announced as new"
+        );
+        let compact = compact_source(added);
+        let seed = compact
+            .find("notification_watermarks.insert")
+            .expect("the watermark is seeded");
+        let cached = compact
+            .find("self.accounts_cache.iter().any")
+            .expect("the arm still checks the accounts cache");
+        assert!(
+            seed < cached,
+            "an account the cache has not caught up with still syncs, and \
+             would still announce -- the seed cannot sit behind that check"
+        );
+    }
+
+    /// T-034: permanent deletion bypasses Trash and must never offer an
+    /// Undo. Now that the receipt comes back through a `Msg`, that promise
+    /// is a matter of which fields the message has: `PermanentDeleteWritten`
+    /// has no ticket to hand a toast, and the door drops the receipt's on
+    /// the writer thread.
+    #[test]
+    fn a_permanent_delete_has_no_ticket_to_offer() {
+        let src = include_str!("shell.rs");
+        let door = extract_brace_body(
+            src,
+            concat!(
+                "fn act_on_ids_irreversible(\n        &mut self,\n        ids: Vec<String>,\n",
+                "        sender: &ComponentSender<Self>,\n        label: &'static str,\n",
+                "        build: impl Fn(AccountId, Vec<ThreadId>) -> Command + Send + 'static,\n    ) {",
+            ),
+        );
+        assert!(
+            door.contains("move |_tickets, _operation_ids, error| Msg::PermanentDeleteWritten"),
+            "the receipt's Undo tickets must be dropped where they are made"
+        );
+        let landed = extract_brace_body(src, "Msg::PermanentDeleteWritten { label, error } => {");
+        for forbidden in ["show_undo_toasts", "toast_tickets"] {
+            assert!(
+                !landed.contains(forbidden),
+                "a permanent delete must not {forbidden}"
+            );
+        }
+    }
+
+    /// Undo is now asynchronous, and the ledger tickets are what stops a
+    /// second press from undoing the same operation twice. They are taken
+    /// on the GTK thread, before the write is queued -- and clearing
+    /// `pending_archive_ops` is in-memory bookkeeping that must not wait on
+    /// SQLite either.
+    #[test]
+    fn undo_consumes_its_tickets_before_the_write_leaves() {
+        let src = include_str!("shell.rs");
+        let arm = extract_brace_body(src, "Msg::Undo => {");
+        let taken = arm
+            .find("std::mem::take(&mut self.toast_tickets)")
+            .expect("Undo consumes the tickets");
+        let cleared = arm
+            .find("self.pending_archive_ops.remove(")
+            .expect("Undo forgets the archive operations it is undoing");
+        let queued = arm
+            .find("self.mail_writer.run(")
+            .expect("Undo queues its writes on the mailbox writer");
+        assert!(
+            taken < queued && cleared < queued,
+            "a second press must find an empty ticket list while the first \
+             undo is still in flight"
+        );
+    }
+
+    /// The rule `the_gtk_thread_never_marks_mail_read_itself` states, one
+    /// door at a time. T-143 moved Archive/Snooze/Mark and named the rest as
+    /// out of scope; this closes the mail half of that list.
+    ///
+    /// T-163: the gate itself, at the boundary the shell actually uses it.
+    ///
+    /// A stamp is a *place*, not a counter, so the property that matters
+    /// is not "it goes up" but "it is the same number only for the same
+    /// place". Each of the four things a folder or account answer can
+    /// land on top of moves it: the mailbox, the folder, the Settings row
+    /// being renamed, and the Settings row with a removal armed.
+    #[test]
+    fn a_reader_who_has_moved_gets_a_different_place_stamp() {
+        let here = reader_place_stamp(Some("acc1"), "acc1:inbox", None, None);
+        assert_eq!(
+            here,
+            reader_place_stamp(Some("acc1"), "acc1:inbox", None, None),
+            "the same place is the same stamp, or every answer would be \
+             thrown away"
+        );
+        for (what, moved) in [
+            (
+                "another folder",
+                reader_place_stamp(Some("acc1"), "acc1:ideas", None, None),
+            ),
+            (
+                "another mailbox",
+                reader_place_stamp(Some("acc2"), "acc1:inbox", None, None),
+            ),
+            (
+                "the merged view",
+                reader_place_stamp(None, "unified:inbox", None, None),
+            ),
+            (
+                "an account editor opened",
+                reader_place_stamp(Some("acc1"), "acc1:inbox", Some("acc2"), None),
+            ),
+            (
+                "a removal armed",
+                reader_place_stamp(Some("acc1"), "acc1:inbox", None, Some("acc2")),
+            ),
+        ] {
+            assert_ne!(here, moved, "{what} must not read as the same place");
+            assert!(
+                !place_reply_is_current(moved, here),
+                "an answer issued before {what} must not be applied after it"
+            );
+        }
+        assert!(
+            place_reply_is_current(here, here),
+            "and an answer for the place the reader is still in is applied"
+        );
+    }
+
+    /// T-163: every one of the six doors queues its write and answers
+    /// through a `Msg`, and every answer that would move the reader --
+    /// into a new folder, out of a settings editor, onto a reloaded list
+    /// -- is gated on the place it was issued from.
+    ///
+    /// The defect this is fail-closed against is the shape the whole
+    /// change creates: the moment `self.folder = id` happens milliseconds
+    /// later instead of inline, a reader who clicked away in between gets
+    /// dragged back into a folder they are no longer looking at, and a
+    /// popover they have since opened elsewhere has its text wiped.
+    #[test]
+    fn the_folder_and_account_doors_gate_their_answers_on_where_the_reader_is() {
+        let src = include_str!("shell.rs");
+        for (marker, what) in [
+            ("Msg::CreateFolder if inbox => {", "Create folder"),
+            ("Msg::RenameFolder if inbox => {", "Rename folder"),
+            (
+                "Msg::SaveAccountName { id, name } => {",
+                "Save account name",
+            ),
+            ("Msg::RemoveAccountConfirm(id) => {", "Remove account"),
+        ] {
+            let door = compact_source(source_block(src, marker));
+            assert!(
+                door.contains("letgen=self.reader_place();"),
+                "{what} must stamp the place it was pressed from before its \
+                 write leaves this thread"
+            );
+        }
+        for (marker, what) in [
+            (
+                "Msg::DeleteFolderConfirmed(folder_id) => {",
+                "Delete folder",
+            ),
+            ("Msg::CreateFolder if inbox => {", "Create folder"),
+            ("Msg::RenameFolder if inbox => {", "Rename folder"),
+            (
+                "Msg::SaveAccountName { id, name } => {",
+                "Save account name",
+            ),
+            ("Msg::RemoveAccountConfirm(id) => {", "Remove account"),
+        ] {
+            let door = compact_source(source_block(src, marker));
+            assert!(
+                door.contains("self.mail_writer.run(") && door.contains("with_retries(core,"),
+                "{what} must queue on the mailbox writer and retry a write \
+                 that only lost the race"
+            );
+        }
+        for (marker, what) in [
+            ("Msg::FolderCreated { gen, result } => {", "the new folder"),
+            (
+                "Msg::FolderRenamed { gen, result } => {",
+                "the rename popover",
+            ),
+            (
+                "Msg::AccountNameSaved { gen, id, error } => {",
+                "the settings editor",
+            ),
+            (
+                "account_id,\n                result,\n            } => {",
+                "the removal",
+            ),
+        ] {
+            let landed = compact_source(source_block(src, marker));
+            assert!(
+                landed.contains("place_reply_is_current(self.reader_place(),gen)"),
+                "{what} must only be applied to the place the door was \
+                 pressed from"
+            );
+        }
+        // And what the *database* holds is applied either way: the sidebar
+        // is recounted, the account list re-read, a refusal said out loud.
+        // Gating those on the reader's place would leave a folder that no
+        // longer exists in the sidebar of whoever navigated fastest.
+        let created = compact_source(source_block(src, "Msg::FolderCreated { gen, result } => {"));
+        let gate = created
+            .find("place_reply_is_current")
+            .expect("the gate is there");
+        let recount = created
+            .find("self.refill_nav(&sender);")
+            .expect("the sidebar is recounted");
+        assert!(
+            gate < recount,
+            "the recount must sit outside the gate -- the folder exists now \
+             wherever the reader has got to"
+        );
+        let removed = compact_source(source_block(
+            src,
+            "account_id,\n                result,\n            } => {",
+        ));
+        assert!(
+            removed.contains("self.refill_accounts(&sender);")
+                && removed.contains("self.go(Screen::Welcome,&sender);"),
+            "an account that is gone is gone for every screen, the empty \
+             profile included"
+        );
+    }
+
+    /// T-163: the confirmation comes down on the press, not when SQLite
+    /// gets round to it. Removing an account is now three thread hops
+    /// (writer, D-Bus, back), and leaving the armed "Remove account?" row
+    /// on screen for all of them would read as a button that did nothing.
+    #[test]
+    fn removing_an_account_disarms_its_confirmation_on_the_press() {
+        let src = include_str!("shell.rs");
+        let arm = compact_source(source_block(src, "Msg::RemoveAccountConfirm(id) => {"));
+        let disarmed = arm
+            .find("self.account_pending_remove=None;")
+            .expect("the confirmation is disarmed");
+        let repainted = arm
+            .find("self.refill_settings(&sender);")
+            .expect("and settings is repainted so the row goes back");
+        let queued = arm
+            .find("self.mail_writer.run(")
+            .expect("the removal is queued");
+        assert!(
+            disarmed < repainted && repainted < queued,
+            "the armed confirmation must come down before the write leaves, \
+             the same optimism `paint_rows_read` applies to the unread dot"
+        );
+    }
+
+    /// T-163: Move was the last door still taking an IMMEDIATE transaction
+    /// under `core.lock()` on the GTK thread, and it is the one bulk action
+    /// that can carry a whole selection. It now goes through the same
+    /// grouped door every other bulk mutation does.
+    #[test]
+    fn move_goes_through_the_grouped_writer_and_answers_with_its_tickets() {
+        let src = include_str!("shell.rs");
+        let door = compact_source(source_block(src, "fn move_ids("));
+        assert!(
+            door.contains("self.dispatch_grouped_async(")
+                && door.contains("Msg::MoveWritten{tickets,error}"),
+            "Move must enqueue its Core dispatch on mail_writer and hear the \
+             receipt back as a message"
+        );
+        assert!(
+            !door.contains("dispatch_with_receipt"),
+            "the synchronous receipt is what parked the window"
+        );
+        let landed = compact_source(source_block(
+            src,
+            "Msg::MoveWritten { tickets, error } => {",
+        ));
+        assert!(
+            landed.contains("self.show_undo_toasts(\"Moved\",tickets,&sender);"),
+            "the Undo the user was offered before must still be offered"
+        );
+        assert!(
+            landed.contains("self.show_toast(\"Couldn\u{2019}tmovethatchange.\",&sender);"),
+            "and a refusal is still said out loud, in the same words"
+        );
+    }
+
+    /// T-163 closed the rest of it. Folder CRUD (`Msg::CreateFolder`,
+    /// `Msg::RenameFolder`, `Msg::DeleteFolderConfirmed`), the two account
+    /// doors (`Msg::SaveAccountName`, `Msg::RemoveAccountConfirm` -- the
+    /// latter with the `self.secrets.connect()` D-Bus round trip that used
+    /// to happen on this thread in front of the write) and `move_ids` all
+    /// answer through a `Msg` now, each under the generation stamp
+    /// `App::reader_place` returns, so an id or a report cannot land on a
+    /// reader who has navigated away in the meantime. The list below is
+    /// the whole set: it grows when a door is moved, and never shrinks.
+    #[test]
+    fn the_remaining_mail_writes_also_leave_the_gtk_thread() {
+        let src = include_str!("shell.rs");
+        let mut offenders: Vec<&str> = Vec::new();
+        for (marker, what) in [
+            ("fn act_on_ids(", "Trash"),
+            ("fn act_on_ids_irreversible(", "Permanent delete"),
+            ("fn unsnooze_ids(", "Unsnooze"),
+            ("Msg::Undo => {", "Undo"),
+            ("Msg::DiscardDraft => {", "Discard draft"),
+            ("Msg::RemoveAttachment(id) => {", "Remove attachment"),
+            ("fn move_ids(", "Move"),
+            ("Msg::CreateFolder if inbox => {", "Create folder"),
+            ("Msg::RenameFolder if inbox => {", "Rename folder"),
+            (
+                "Msg::DeleteFolderConfirmed(folder_id) => {",
+                "Delete folder",
+            ),
+            (
+                "Msg::SaveAccountName { id, name } => {",
+                "Save account name",
+            ),
+            ("Msg::RemoveAccountConfirm(id) => {", "Remove account"),
+        ] {
+            let compact = compact_source(source_block(src, marker));
+            if compact.contains("self.core.lock()")
+                || compact.contains("=core.lock()")
+                || compact.contains("self.dispatch_grouped(")
+            {
+                offenders.push(what);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these doors still run an IMMEDIATE SQLite transaction on the GTK \
+             thread instead of the mailbox writer: {offenders:?}"
+        );
+        // The parked half of Discard: the delete `Msg::DraftSaved` settles
+        // is the same write, and it ran on this thread too.
+        let parked = compact_source(source_block(src, DRAFT_SAVED_ARM));
+        assert!(
+            !parked.contains("self.core.lock().unwrap().delete_draft("),
+            "the discard parked on an in-flight save is the same delete and \
+             belongs on the same writer"
+        );
+        // And the synchronous grouped door is gone, so a new mutating door
+        // cannot park the window with one line.
+        assert!(
+            !src.contains("fn dispatch_grouped(\n"),
+            "the synchronous grouped dispatch must not come back"
+        );
+        // T-163: the D-Bus half of Remove account left with the SQLite
+        // half. `SecretStore::connect()` on an on-disk session is a call
+        // to the Secret Service, and a bus with no keyring answering on it
+        // fails only after its own timeout -- which the reader used to
+        // spend looking at a frozen window.
+        let removal = compact_source(source_block(src, "Msg::RemoveAccountConfirm(id) => {"));
+        assert!(
+            !removal.contains("self.secrets.connect()"),
+            "the keyring round trip belongs on the writer thread with the \
+             write it precedes"
+        );
+        assert!(
+            removal.contains("letsecrets=self.secrets.clone();")
+                && removal.contains("secrets.connect()"),
+            "the store is handed to the writer, which connects there"
+        );
     }
 }

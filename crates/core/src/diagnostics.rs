@@ -145,8 +145,13 @@ impl Core {
     }
 
     /// Detaches cached RFC822 files from SQLite first, then removes only
-    /// those exact paths. A missing file is already a successful clear.
-    pub fn clear_body_cache(&self) -> Result<usize, CoreError> {
+    /// those exact paths, resolved against `bodies_dir` (the same root
+    /// `Core::store_body`/`Core::lookup_body` use — `messages.body_path`
+    /// only ever holds a path relative to it). A missing file is already a
+    /// successful clear; the count returned is the number of files actually
+    /// removed (including already-missing ones), not the number of rows
+    /// touched, so a stuck permission error is visible to the caller.
+    pub fn clear_body_cache(&self, bodies_dir: &Path) -> Result<usize, CoreError> {
         let conn = self.db.conn();
         let paths: Vec<PathBuf> = {
             let mut stmt = conn
@@ -173,17 +178,18 @@ impl Core {
         )
         .map_err(sql_err)?;
         tx.commit().map_err(sql_err)?;
+        let mut removed = 0usize;
         for path in &paths {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            match fs::remove_file(bodies_dir.join(path)) {
+                Ok(()) => removed += 1,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => removed += 1,
                 Err(_) => {
                     // The database is already fail-closed: no future read can
                     // expose this orphan. A later cache sweep may remove it.
                 }
             }
         }
-        Ok(paths.len())
+        Ok(removed)
     }
 
     /// Writes a small ZIP containing aggregate state only. No subjects,
@@ -357,6 +363,111 @@ mod tests {
         for forbidden in ["password", "oauth", "token", "subject", "body_path"] {
             assert!(!text.contains(forbidden), "leaked field name: {forbidden}");
         }
+    }
+
+    /// `messages.body_path` holds a path *relative to the bodies dir*
+    /// (`Core::store_body` writes `bodies_dir.join(rel)` and stores only
+    /// `rel`; `Core::lookup_body` reads `bodies_dir.join(rel)`). A cache
+    /// clear must therefore delete the same file the cache writer created,
+    /// not a same-named path relative to the process CWD.
+    #[test]
+    fn clear_cache_removes_the_cached_body_from_disk() {
+        use crate::model::MessageId;
+        let dir = tempfile::tempdir().unwrap();
+        let bodies = dir.path().join("bodies");
+        let mut core = Core::memory().unwrap();
+        {
+            let conn_seed = core.db.conn();
+            conn_seed.execute(
+            "INSERT INTO accounts (id, name, email, provider, status, download_policy, created_at, updated_at) VALUES ('a', 'A', 'a@example.com', 'generic', 'synced', 'recent', 0, 0)",
+            [],
+        )
+        .unwrap();
+            conn_seed.execute(
+            "INSERT INTO folders (id, account_id, name, kind) VALUES ('inbox', 'a', 'Inbox', 'inbox')",
+            [],
+        )
+        .unwrap();
+            conn_seed.execute(
+            "INSERT INTO threads (id, account_id, folder_id, subject, snippet, date) VALUES ('t', 'a', 'inbox', '', '', 0)",
+            [],
+        )
+        .unwrap();
+            conn_seed.execute(
+            "INSERT INTO messages (id, account_id, thread_id, folder_id, date) VALUES ('m', 'a', 't', 'inbox', 0)",
+            [],
+        )
+        .unwrap();
+        }
+
+        let id = MessageId("m".into());
+        core.store_body(&id, &bodies, b"Content-Type: text/plain\r\n\r\nhi")
+            .unwrap();
+        let rel: String = core
+            .db
+            .conn()
+            .query_row("SELECT body_path FROM messages WHERE id = 'm'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            bodies.join(&rel).exists(),
+            "fixture: the cached body must be on disk before the clear"
+        );
+
+        assert_eq!(core.clear_body_cache(&bodies).unwrap(), 1);
+        assert!(
+            !bodies.join(&rel).exists(),
+            "clear_body_cache reported success, but the cached RFC822 file is still on disk"
+        );
+    }
+
+    /// A file already removed by hand (or by a previous partial clear)
+    /// still counts as cleared: `clear_body_cache` must not report failure
+    /// or under-count just because the on-disk file is already gone.
+    #[test]
+    fn clear_cache_counts_an_already_missing_file_as_removed() {
+        use crate::model::MessageId;
+        let dir = tempfile::tempdir().unwrap();
+        let bodies = dir.path().join("bodies");
+        let mut core = Core::memory().unwrap();
+        {
+            let conn_seed = core.db.conn();
+            conn_seed.execute(
+                "INSERT INTO accounts (id, name, email, provider, status, download_policy, created_at, updated_at) VALUES ('a', 'A', 'a@example.com', 'generic', 'synced', 'recent', 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn_seed.execute(
+                "INSERT INTO folders (id, account_id, name, kind) VALUES ('inbox', 'a', 'Inbox', 'inbox')",
+                [],
+            )
+            .unwrap();
+            conn_seed.execute(
+                "INSERT INTO threads (id, account_id, folder_id, subject, snippet, date) VALUES ('t', 'a', 'inbox', '', '', 0)",
+                [],
+            )
+            .unwrap();
+            conn_seed.execute(
+                "INSERT INTO messages (id, account_id, thread_id, folder_id, date) VALUES ('m', 'a', 't', 'inbox', 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let id = MessageId("m".into());
+        core.store_body(&id, &bodies, b"Content-Type: text/plain\r\n\r\nhi")
+            .unwrap();
+        let rel: String = core
+            .db
+            .conn()
+            .query_row("SELECT body_path FROM messages WHERE id = 'm'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        fs::remove_file(bodies.join(&rel)).unwrap();
+
+        assert_eq!(core.clear_body_cache(&bodies).unwrap(), 1);
     }
 
     #[test]

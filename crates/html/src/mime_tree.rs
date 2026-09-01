@@ -81,6 +81,18 @@ fn split_multipart<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
         };
         let content = strip_cr(line);
         if let Some(after) = content.strip_prefix(delim_bytes) {
+            // RFC 2046 §5.1.1 allows `transport-padding := *LWSP-char`
+            // between the boundary (or its closing `--`) and the CRLF.
+            // Without trimming it, a `--boundary \r\n` line written by a
+            // standards-following sender matches nothing, `marks` stays
+            // empty and the whole multipart body is served as one opaque
+            // leaf — i.e. an empty message plus a bogus attachment.
+            // Only SP/HTAB are trimmed: `--boundaryXYZ` must stay a
+            // non-delimiter, or foreign text could cut the body apart.
+            let mut after = after;
+            while let [head @ .., b' ' | b'\t'] = after {
+                after = head;
+            }
             if after.is_empty() {
                 marks.push((pos, pos + line_len, false));
             } else if after == b"--" {
@@ -268,5 +280,38 @@ mod tests {
         let raw = b"Content-Type: multipart/mixed; boundary=\r\n\r\nsomething\r\n";
         let part = parse_part(raw, 0);
         assert!(matches!(part.body, PartBody::Leaf(_)));
+    }
+
+    #[test]
+    fn boundary_with_transport_padding_is_recognised() {
+        let raw = b"Content-Type: multipart/mixed; boundary=X\r\n\r\n--X \t\r\nContent-Type: text/plain\r\n\r\nfirst\r\n--X\t\r\nContent-Type: text/html\r\n\r\nsecond\r\n--X-- \r\n";
+        let part = parse_part(raw, 0);
+        match part.body {
+            PartBody::Multipart(children) => {
+                assert_eq!(children.len(), 2, "expected two parts");
+                assert_eq!(leaf_bytes(&children[0]), b"first");
+                assert_eq!(leaf_bytes(&children[1]), b"second");
+            }
+            _ => panic!("expected multipart, boundary with transport padding was not recognised"),
+        }
+    }
+
+    #[test]
+    fn a_boundary_line_with_a_non_lwsp_suffix_is_not_a_delimiter() {
+        // Only SP/HTAB is transport-padding. If any trailing text were
+        // tolerated, a sender could cut a message apart with a line of
+        // their own prose that merely starts like the boundary.
+        let raw = b"Content-Type: multipart/mixed; boundary=X\r\n\r\n--X\r\nContent-Type: text/plain\r\n\r\nfirst\r\n--Xtrailing\r\nstill first\r\n--X--\r\n";
+        let part = parse_part(raw, 0);
+        match part.body {
+            PartBody::Multipart(children) => {
+                assert_eq!(children.len(), 1, "--Xtrailing must not split the part");
+                assert_eq!(
+                    leaf_bytes(&children[0]),
+                    b"first\r\n--Xtrailing\r\nstill first"
+                );
+            }
+            _ => panic!("expected multipart"),
+        }
     }
 }

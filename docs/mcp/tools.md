@@ -28,9 +28,11 @@ every advertised JSON Schema or promise to reject unrelated extra properties.
 `false`. Clients should send only the fields listed below.
 
 All required string inputs must be non-empty. `after` is exactly
-`{date: integer, id: non-empty string}`; `limit` is optional, defaults to 50,
-and is clamped to 1…200. `?` means optional. Results are metadata-only: no
-thread preview or message/draft body is ever returned.
+`{date: integer, id: non-empty string}`; `limit` is optional and defaults to
+50, but if present it must be an integer in 1…200 -- anything else (0, 201,
+negative, fractional, non-numeric) is `INVALID_ARGUMENT`, not clamped. `?`
+means optional. Results are metadata-only: no thread preview or message/draft
+body is ever returned.
 
 | Tool | Inputs | Result / side effect | Level | Error boundary |
 |---|---|---|---|---|
@@ -71,8 +73,8 @@ thread preview or message/draft body is ever returned.
 | `delete_folder` | `account_id`, `folder_id` | `folder_id`, `deleted`, `queued` (false when the folder never reached the server) | Full (H) | access, account/folder, GTK approval |
 | `list_drafts` | `account_id` | unsent draft metadata list | Read | access, account |
 | `get_draft` | `account_id`, `draft_id` | one draft metadata object | Read | access, account/draft |
-| `create_draft` | `account_id`, `from`; `to?`, `cc?`, `bcc?`, `subject?`, `body?`, `thread_id?`, `in_reply_to?` | saves draft; returns draft metadata | Draft (D) | access, account/input |
-| `update_draft` | `account_id`, `draft_id`, `from`; `to?`, `cc?`, `bcc?`, `subject?`, `body?`, `thread_id?`, `in_reply_to?` | saves revision; returns draft metadata | Draft (D) | access, account/draft/input |
+| `create_draft` | `account_id`; `to?`, `cc?`, `bcc?`, `subject?`, `body?`, `thread_id?`, `in_reply_to?`, `from?` (accepted but ignored) | saves draft; returns draft metadata | Draft (D) | access, account/input |
+| `update_draft` | `account_id`, `draft_id`; `to?`, `cc?`, `bcc?`, `subject?`, `body?`, `thread_id?`, `in_reply_to?`, `from?` (accepted but ignored) | saves revision; returns draft metadata | Draft (D) | access, account/draft/input |
 | `delete_draft` | `account_id`, `draft_id` | `deleted` boolean | Draft (D) | access, account |
 | `reply_to_thread` | `account_id`, `thread_id`; `reply_all?` boolean | creates reply draft metadata | Draft (D) | access, account/thread |
 | `forward_message` | `account_id`, `message_id` | creates forward draft metadata | Draft (D) | access, account/message |

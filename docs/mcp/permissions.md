@@ -12,12 +12,12 @@ suite fails if a registered tool lacks one.
 
 | Matrix | Current tools | D57 level |
 |---|---|---|
-| R | `list_accounts`, `get_account`, `get_account_status`, `list_folders`, `get_folder_message_count`, `list_threads`, `list_snoozed`, `get_thread`, `list_thread_messages`, `get_message`, `search_mail`, `list_drafts`, `get_draft`, `list_attachments`, `get_attachment`, `download_attachment`, `save_attachment`, `list_draft_attachments` | Read |
+| R | `list_accounts`, `get_account`, `get_account_status`, `list_folders`, `get_folder`, `get_folder_message_count`, `list_threads`, `list_snoozed`, `get_thread`, `list_thread_messages`, `get_message`, `get_messages`, `search_mail`, `list_drafts`, `get_draft`, `list_attachments`, `get_attachment`, `download_attachment`, `save_attachment`, `list_draft_attachments` | Read |
 | D | `create_draft`, `update_draft`, `delete_draft`, `reply_to_thread`, `forward_message`, `attach_file_to_draft`, `remove_attachment_from_draft` | Draft |
-| W | `archive_message`, `bulk_archive`, `mark_read`, `bulk_mark_read`, `mark_unread`, `bulk_mark_unread`, `star_message`, `unstar_message`, `bulk_star`, `bulk_unstar` | Draft |
-| M | `snooze_message`, `bulk_snooze`, `move_message`, `bulk_move`, `restore_message`, `create_folder` | Draft |
-| H | `send_draft` | Send + GTK confirmation |
-| H | `delete_message`, `bulk_delete`, `bulk_permanent_delete`, `permanent_delete` | Full + GTK confirmation |
+| W | `archive_message`, `bulk_archive`, `mark_read`, `bulk_mark_read`, `mark_unread`, `bulk_mark_unread`, `star_message`, `unstar_message`, `bulk_star`, `bulk_unstar`, `sync_account` | Draft |
+| M | `snooze_message`, `unsnooze_message`, `bulk_snooze`, `move_message`, `bulk_move`, `restore_message`, `create_folder`, `rename_folder` | Draft |
+| H | `send_draft`, `send_email` | Send + GTK confirmation |
+| H | `delete_message`, `bulk_delete`, `bulk_permanent_delete`, `permanent_delete`, `delete_folder` | Full + GTK confirmation |
 
 After enabling MCP, Core provisions the known local `stdio` client at **Read
 + Draft**. Settings may change the persisted level only for that enabled

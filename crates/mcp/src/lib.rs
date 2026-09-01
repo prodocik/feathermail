@@ -358,10 +358,14 @@ fn cursor_schema() -> Value {
 }
 
 fn draft_schema(update: bool) -> Value {
-    let mut required = vec!["account_id", "from"];
+    let mut required = vec!["account_id"];
     if update {
         required.push("draft_id");
     }
+    // `from` stays in the schema for backward compatibility with callers
+    // that already send the account's own address, but Core always fills it
+    // in from the account -- see `save_draft_tool` -- so it is accepted and
+    // ignored rather than required.
     json!({"type":"object","properties":{"account_id":{"type":"string"},"draft_id":{"type":"string"},"from":{"type":"string"},"to":{"type":"string"},"cc":{"type":"string"},"bcc":{"type":"string"},"subject":{"type":"string"},"body":{"type":"string"},"thread_id":{"type":"string"},"in_reply_to":{"type":"string"}},"required":required,"additionalProperties":false})
 }
 
@@ -371,20 +375,28 @@ pub fn call_tool(
     name: &str,
     args: &Value,
 ) -> Result<Value, McpError> {
-    let account = args.get("account_id").and_then(Value::as_str);
-    let outcome = match name {
-        "send_draft" => send_draft_tool(core, access, args),
-        "send_email" => send_email_tool(core, access, args),
-        "bulk_delete" => bulk_delete_tool(core, access, args),
-        "bulk_permanent_delete" => bulk_permanent_delete_tool(core, access, args),
-        "delete_folder" => delete_folder_tool(core, access, args),
-        _ => authorize_tool(core, access, name, args, account)
-            .and_then(|()| call_tool_inner(core, access, name, args)),
-    };
+    let outcome = call_tool_unaudited(core, access, name, args);
+    record_call_audit(core, access, name, args, &outcome);
+    outcome
+}
+
+/// Writes exactly one `mcp_audit` row for an already-computed `call_tool`
+/// outcome. Split out of `call_tool` so `main::call_with_confirmation_until`
+/// can poll via `call_tool_unaudited` while a GTK confirmation is pending
+/// and still end up with exactly one audit row for the whole wait, instead
+/// of one row per 200ms poll.
+pub fn record_call_audit(
+    core: &mut Core,
+    access: &Access,
+    name: &str,
+    args: &Value,
+    outcome: &Result<Value, McpError>,
+) {
     // Audit only canonical tool names. Account metadata is useful after a
     // successful Core action, but failed/unknown requests must not turn their
     // caller-controlled identifiers into durable data. Targets are never
     // persisted: even valid-looking target strings may be submitted content.
+    let account = args.get("account_id").and_then(Value::as_str);
     let audit_account = outcome
         .as_ref()
         .ok()
@@ -400,7 +412,48 @@ pub fn call_tool(
             "denied_or_error"
         },
     );
-    outcome
+}
+
+/// Same dispatch as `call_tool`, but without the audit write. Callers that
+/// poll the same tool call repeatedly while a GTK confirmation is pending
+/// (see `main::call_with_confirmation_until`) must use this instead of
+/// `call_tool`, so each poll does not add its own `mcp_audit` row -- one
+/// logical call stays one audit entry regardless of how many times it is
+/// retried while waiting for the user.
+pub fn call_tool_unaudited(
+    core: &mut Core,
+    access: &Access,
+    name: &str,
+    args: &Value,
+) -> Result<Value, McpError> {
+    let account = args.get("account_id").and_then(Value::as_str);
+    match name {
+        "send_draft" => send_draft_tool(core, access, args),
+        "send_email" => send_email_tool(core, access, args),
+        "bulk_delete" => bulk_delete_tool(core, access, args),
+        "bulk_permanent_delete" => bulk_permanent_delete_tool(core, access, args),
+        "delete_folder" => delete_folder_tool(core, access, args),
+        "create_draft" | "update_draft" => {
+            // `authorize_tool` reads `draft_id` from `args` as this action's
+            // target id and treats an empty target id as a reason to deny
+            // (`PERMISSION_DENIED`) -- correct for identifiers that name
+            // something to authorize against, but a draft_id of "" is a
+            // malformed argument, not an authorization failure. Reject it
+            // here, before `authorize_tool` sees it, so callers get the same
+            // `INVALID_ARGUMENT` as every other empty required string
+            // (missing `draft_id` already reaches that error further down,
+            // via `save_draft_tool`'s own check, because a missing key
+            // leaves the target id `None` and `authorize_tool` only denies
+            // on a *present-but-empty* one).
+            if args.get("draft_id").and_then(Value::as_str) == Some("") {
+                return Err(McpError::invalid("draft_id must be a non-empty string."));
+            }
+            authorize_tool(core, access, name, args, account)
+                .and_then(|()| call_tool_inner(core, access, name, args))
+        }
+        _ => authorize_tool(core, access, name, args, account)
+            .and_then(|()| call_tool_inner(core, access, name, args)),
+    }
 }
 
 fn canonical_audit_tool(name: &str) -> &'static str {
@@ -696,8 +749,11 @@ fn send_email_tool(core: &mut Core, access: &Access, args: &Value) -> Result<Val
 
 /// Length-framed digest of exactly the fields that make up the message, so no
 /// separator ambiguity can make two different messages share one draft row and
-/// therefore one approval. `save_draft` trims the same fields it stores, so
-/// the digest is taken over the trimmed values it will actually keep.
+/// therefore one approval. `save_draft` only trims `from`/`to`/`cc`/`bcc`; it
+/// stores `subject`/`body` as given. The digest is still taken over trimmed
+/// values for every field -- that only decides which draft row a message maps
+/// to, not whether the row's content already matches (see
+/// `draft_matches_content`, which compares `subject`/`body` untrimmed).
 fn send_email_digest(account_id: &AccountId, content: &DraftContent) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -731,7 +787,9 @@ fn send_email_digest(account_id: &AccountId, content: &DraftContent) -> String {
 }
 
 /// True when the stored draft already is this exact message, in the same
-/// trimmed form `save_draft` persists.
+/// form `save_draft` persists: `save_draft` trims `from`/`to`/`cc`/`bcc` but
+/// stores `subject`/`body` as given, so this compares those two fields
+/// untrimmed to match what is actually in the row.
 fn draft_matches_content(stored: &feathermail_core::Draft, content: &DraftContent) -> bool {
     stored.thread_id == content.thread_id
         && stored.in_reply_to == content.in_reply_to
@@ -739,8 +797,8 @@ fn draft_matches_content(stored: &feathermail_core::Draft, content: &DraftConten
         && stored.to == content.to.trim()
         && stored.cc == content.cc.trim()
         && stored.bcc == content.bcc.trim()
-        && stored.subject == content.subject.trim()
-        && stored.body == content.body.trim()
+        && stored.subject == content.subject
+        && stored.body == content.body
 }
 
 fn call_tool_inner(
@@ -958,7 +1016,7 @@ fn call_tool_inner(
             )?;
             Ok(draft_metadata_json(&d))
         }
-        "create_draft" | "update_draft" => save_draft_tool(core, access, args),
+        "create_draft" | "update_draft" => save_draft_tool(core, access, name, args),
         "reply_to_thread" => {
             require_level(access, PermissionLevel::Draft)?;
             let account_id = account_arg(args)?;
@@ -1452,12 +1510,33 @@ fn bulk_message_ids_arg(args: &Value) -> Result<Vec<MessageId>, McpError> {
     Ok(message_ids)
 }
 
-fn save_draft_tool(core: &Core, access: &Access, args: &Value) -> Result<Value, McpError> {
+fn save_draft_tool(
+    core: &Core,
+    access: &Access,
+    name: &str,
+    args: &Value,
+) -> Result<Value, McpError> {
     require_level(access, PermissionLevel::Draft)?;
-    let draft_id = args
-        .get("draft_id")
-        .and_then(Value::as_str)
-        .map(|s| DraftId(s.into()));
+    let account_id = account_arg(args)?;
+    // `update_draft` must target an existing row: a missing/empty draft_id
+    // would otherwise silently create a new draft (or, for "", a row whose
+    // empty id no other MCP tool can address). `create_draft` leaves the key
+    // optional, but if the caller does supply it, it must be non-empty too.
+    let draft_id = if name == "update_draft" || args.get("draft_id").is_some() {
+        Some(DraftId(string_arg(args, "draft_id")?.into()))
+    } else {
+        None
+    };
+    // From is always the account's own address, the same as send_email_tool:
+    // MCP never chooses a sender identity, and the GUI's From field is
+    // non-editable, so a caller-supplied from here could not be corrected by
+    // the user before sending.
+    let from = core
+        .list_accounts()?
+        .into_iter()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| McpError::from(CoreError::from_code(ErrorCode::AccountNotFound)))?
+        .email;
     let content = DraftContent {
         thread_id: args
             .get("thread_id")
@@ -1467,7 +1546,7 @@ fn save_draft_tool(core: &Core, access: &Access, args: &Value) -> Result<Value, 
             .get("in_reply_to")
             .and_then(Value::as_str)
             .map(|s| MessageId(s.into())),
-        from: string_arg(args, "from")?.into(),
+        from,
         to: optional_string(args, "to"),
         cc: optional_string(args, "cc"),
         bcc: optional_string(args, "bcc"),
@@ -1475,7 +1554,7 @@ fn save_draft_tool(core: &Core, access: &Access, args: &Value) -> Result<Value, 
         body: optional_string(args, "body"),
     };
     Ok(draft_metadata_json(&core.save_draft(
-        &account_arg(args)?,
+        &account_id,
         draft_id.as_ref(),
         content,
     )?))
@@ -5939,6 +6018,175 @@ mod tests {
                 "persisted MCP audit metadata leaked submitted marker: {marker}"
             );
         }
+    }
+
+    #[test]
+    fn send_email_reuses_one_approval_for_a_body_with_edge_whitespace() {
+        let (mut core, account, _) = seeded_cursor_core();
+        assert!(core
+            .set_mcp_client_permission_level("stdio", PermissionLevel::Send)
+            .unwrap());
+        let access = Access {
+            ceiling: PermissionLevel::Send,
+            ..Access::default()
+        };
+        let args = json!({
+            "account_id": account.as_str(),
+            "to": "recipient@example.test",
+            "subject": "hello",
+            "body": "Hello there\n",
+        });
+        let first = call_tool(&mut core, &access, "send_email", &args).unwrap_err();
+        let request_id = first.pending_confirmation().unwrap();
+        let second = call_tool(&mut core, &access, "send_email", &args).unwrap_err();
+        assert_eq!(
+            second.pending_confirmation(),
+            Some(request_id),
+            "repeating send_email must reuse the same pending approval"
+        );
+        assert_eq!(core.list_drafts(&account).unwrap().len(), 1);
+        core.resolve_mcp_confirmation(request_id, McpConfirmationChoice::AllowOnce)
+            .unwrap();
+        let queued = call_tool(&mut core, &access, "send_email", &args).unwrap();
+        assert_eq!(queued["queued"], true);
+    }
+
+    #[test]
+    fn drafts_never_take_a_caller_chosen_sender() {
+        let (mut core, account, _) = seeded_cursor_core();
+        let access = Access::default();
+        let account_email = core
+            .list_accounts()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == account)
+            .unwrap()
+            .email;
+
+        let created = call_tool(
+            &mut core,
+            &access,
+            "create_draft",
+            &json!({
+                "account_id": account.as_str(),
+                "from": "security@bank.example",
+                "to": "victim@example.test",
+            }),
+        );
+        match created {
+            Err(error) => assert_eq!(error.code, "INVALID_ARGUMENT"),
+            Ok(value) => {
+                let id = DraftId(value["id"].as_str().unwrap().into());
+                assert_eq!(
+                    core.get_draft(&account, &id).unwrap().from,
+                    account_email,
+                    "create_draft must not let MCP choose a sender identity"
+                );
+            }
+        }
+
+        let own = core
+            .save_draft(
+                &account,
+                None,
+                DraftContent {
+                    thread_id: None,
+                    in_reply_to: None,
+                    from: account_email.clone(),
+                    to: "friend@example.test".into(),
+                    cc: String::new(),
+                    bcc: String::new(),
+                    subject: "mine".into(),
+                    body: "mine".into(),
+                },
+            )
+            .unwrap();
+        let updated = call_tool(
+            &mut core,
+            &access,
+            "update_draft",
+            &json!({
+                "account_id": account.as_str(),
+                "draft_id": own.id.as_str(),
+                "from": "security@bank.example",
+            }),
+        );
+        if let Err(error) = updated {
+            assert_eq!(error.code, "INVALID_ARGUMENT");
+        }
+        assert_eq!(
+            core.get_draft(&account, &own.id).unwrap().from,
+            account_email,
+            "update_draft must not rewrite the sender of the user's own draft"
+        );
+    }
+
+    #[test]
+    fn draft_id_must_be_present_and_non_empty() {
+        let (mut core, account, _) = seeded_cursor_core();
+        let access = Access::default();
+        let before = core.list_drafts(&account).unwrap().len();
+
+        let missing = call_tool(
+            &mut core,
+            &access,
+            "update_draft",
+            &json!({
+                "account_id": account.as_str(),
+                "from": "cursor@example.test",
+                "subject": "fix",
+            }),
+        );
+        assert!(
+            matches!(&missing, Err(error) if error.code == "INVALID_ARGUMENT"),
+            "update_draft without draft_id must be rejected, not turned into a create: {missing:?}"
+        );
+        assert_eq!(core.list_drafts(&account).unwrap().len(), before);
+
+        let empty = call_tool(
+            &mut core,
+            &access,
+            "create_draft",
+            &json!({
+                "account_id": account.as_str(),
+                "draft_id": "",
+                "from": "cursor@example.test",
+            }),
+        );
+        assert!(
+            matches!(&empty, Err(error) if error.code == "INVALID_ARGUMENT"),
+            "an empty draft_id must be rejected, not stored as a draft: {empty:?}"
+        );
+        assert!(
+            core.list_drafts(&account)
+                .unwrap()
+                .iter()
+                .all(|draft| !draft.id.as_str().is_empty()),
+            "an MCP call must never create a draft row with an empty id"
+        );
+    }
+
+    #[test]
+    fn every_registered_tool_has_a_documented_ceiling() {
+        let docs = include_str!("../../../docs/mcp/permissions.md");
+        let table = docs
+            .split("| Matrix | Current tools | D57 level |")
+            .nth(1)
+            .expect("permissions.md must carry the capability-ceiling table")
+            .split("\n\n")
+            .next()
+            .unwrap_or_default();
+        let mut missing = Vec::new();
+        for tool in tool_definitions() {
+            let name = tool["name"].as_str().unwrap_or_default().to_string();
+            if !table.contains(&format!("`{name}`")) {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "registered tools absent from the permissions ceiling table: {missing:?}"
+        );
     }
 
     #[test]

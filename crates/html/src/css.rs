@@ -170,18 +170,51 @@ pub(crate) fn declares_tiny_image_dimension(css: &str) -> bool {
         .any(|(name, value)| matches!(name, "width" | "height") && declares_tiny_dimension(value))
 }
 
+/// Narrows every `<style>` block in `html` to the allow-listed CSS subset.
+///
+/// The scan tolerates attributes on the start tag (`<style id="x">`) even
+/// though [`crate::sanitize`] strips them: a literal `"<style>"` match was
+/// the whole security boundary for stylesheets, so a single attribute used
+/// to hand the sender an un-narrowed stylesheet *and* an unclosed tag that
+/// swallowed the rest of the letter. Whatever attributes were there are
+/// dropped — the tag is always re-emitted bare.
+///
+/// Scanning to the first `>` is safe because the input is ammonia's own
+/// serialization, which escapes `>` inside attribute values (`id="a>b"`
+/// comes back as `id="a&gt;b"`), so a value cannot forge the tag's end.
 pub(crate) fn sanitize_style_blocks(html: &str) -> String {
     let mut output = String::with_capacity(html.len());
     let mut rest = html;
 
-    while let Some(start) = rest.find("<style>") {
-        output.push_str(&rest[..start]);
-        let content_start = start + "<style>".len();
-        let Some(relative_end) = rest[content_start..].find("</style>") else {
-            // `html` is ammonia's canonical serialization, so this should
-            // not happen.  Fail closed if that invariant ever changes.
+    while let Some(start) = rest.find("<style") {
+        // `<style` has to be followed by the end of the tag name for this
+        // to be a start tag at all; `<styles>` is some other element.
+        // Either way `rest` gets shorter by at least one byte per
+        // iteration, so the loop terminates on every input.
+        let after_name = start + "<style".len();
+        let ends_name = matches!(
+            rest.as_bytes().get(after_name),
+            Some(b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'\x0C')
+        );
+        if !ends_name {
+            output.push_str(&rest[..after_name]);
+            rest = &rest[after_name..];
+            continue;
+        }
+
+        // `html` is ammonia's canonical serialization, so neither the tag's
+        // `>` nor its `</style>` should ever be missing. Fail closed if
+        // that invariant ever changes: truncate rather than emit CSS this
+        // pass could not read.
+        let Some(relative_gt) = rest[after_name..].find('>') else {
             return output;
         };
+        let content_start = after_name + relative_gt + 1;
+        let Some(relative_end) = rest[content_start..].find("</style>") else {
+            return output;
+        };
+
+        output.push_str(&rest[..start]);
         let content_end = content_start + relative_end;
         let safe = sanitize_stylesheet(&rest[content_start..content_end]);
         if !safe.is_empty() {

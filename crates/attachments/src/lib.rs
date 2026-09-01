@@ -24,14 +24,10 @@ pub fn stream_to_file(
     max_bytes: Option<u64>,
 ) -> io::Result<u64> {
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
+        create_private_dir(parent)?;
     }
     let part = partial_path(destination);
-    let mut output = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&part)?;
+    let mut output = create_private_file(&part)?;
     let result = copy_bounded(&mut source, &mut output, max_bytes);
     match result {
         Ok(bytes) => {
@@ -66,14 +62,10 @@ pub fn decode_to_file(
     max_bytes: Option<u64>,
 ) -> io::Result<u64> {
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
+        create_private_dir(parent)?;
     }
     let part = partial_path(destination);
-    let output = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&part)?;
+    let output = create_private_file(&part)?;
     let mut output = BufWriter::new(output);
     let result = decode_bounded(source, &mut output, encoding, max_bytes);
     match result {
@@ -294,6 +286,46 @@ pub fn copy_bounded(
     Ok(total)
 }
 
+/// Creates (or truncates) a cache file that only its owner can read.
+///
+/// A cached attachment is the same private mail data `mail.db` is
+/// deliberately chmod-ed to 0600 for (`feathermail_db::chmod_owner_rw`), and
+/// it lands in a sibling directory of that very file -- so it gets the same
+/// mode instead of `0666 & ~umask` (0664 on a typical desktop). `.mode()`
+/// alone is not enough: it applies only when the file is *created*, and a
+/// `.part` left behind by an interrupted download would keep whatever mode
+/// it was born with, so the mode is also asserted on the open handle.
+fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+/// `create_dir_all` for the cache directory, then 0700 on it: a listable
+/// cache directory leaks recipients, filenames, and sizes even when every
+/// file inside it is 0600. Only the leaf is adjusted -- the profile
+/// directories above it are not this crate's to re-mode.
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 fn partial_path(destination: &Path) -> PathBuf {
     let mut name = destination
         .file_name()
@@ -388,5 +420,68 @@ mod tests {
         .unwrap();
         assert_eq!(bytes, 9);
         assert_eq!(decoded, "cafénext".as_bytes());
+    }
+
+    /// Cached attachment bodies are the same private mail data `mail.db` is
+    /// deliberately chmod-ed to 0600 for (`feathermail_db::chmod_owner_rw`,
+    /// with its own `db_file_is_owner_rw_only` test), and they live in a
+    /// sibling directory of that very file.
+    #[cfg(unix)]
+    #[test]
+    fn cached_attachment_and_its_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("sub").join("a.bin");
+        let source = ChunkGuard {
+            left: 16,
+            largest_request: 0,
+        };
+        stream_to_file(source, &target, None).unwrap();
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "cached attachment must not be readable beyond its owner"
+        );
+        let dir_mode = fs::metadata(target.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "the attachment cache directory must not be listable beyond its owner"
+        );
+    }
+
+    /// The decoding writer is the one real downloads go through, and a
+    /// `.part` left behind by an interrupted download must not hand its old
+    /// (world-readable) mode to the file that replaces it.
+    #[cfg(unix)]
+    #[test]
+    fn a_decoded_attachment_over_a_leftover_part_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("sub").join("b.bin");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let leftover = partial_path(&target);
+        fs::write(&leftover, b"interrupted").unwrap();
+        fs::set_permissions(&leftover, fs::Permissions::from_mode(0o664)).unwrap();
+
+        decode_to_file(
+            io::Cursor::new(b"Y2Fmw6k="),
+            &target,
+            TransferEncoding::Base64,
+            None,
+        )
+        .unwrap();
+
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a reused .part must not keep its old permissions"
+        );
+        assert_eq!(fs::read(&target).unwrap(), "café".as_bytes());
     }
 }

@@ -21,6 +21,7 @@ use html5ever::tokenizer::{BufferQueue, TagKind, Token, TokenSink, TokenSinkResu
 use html5ever::{local_name, Attribute};
 
 use crate::css::declares_tiny_image_dimension;
+use crate::hidden::raw_text_kind;
 use crate::tracking::{declares_tiny_dimension, is_known_tracker_host};
 
 #[derive(Default, Debug, Clone)]
@@ -79,12 +80,25 @@ impl TokenSink for Sink {
     type Handle = ();
 
     fn process_token(&self, token: Token, _line_number: u64) -> TokenSinkResult<()> {
-        if let Token::TagToken(tag) = &token {
-            if tag.kind == TagKind::StartTag && tag.name == local_name!("img") {
-                self.observe_img(&tag.attrs);
-            }
+        // Same raw-text table as `hidden.rs`/`text.rs`: this pass drives
+        // the tokenizer without a tree builder, so nothing else switches
+        // it into RAWTEXT for `<style>`/`<script>`. Without it an `<img>`
+        // spelled out inside a stylesheet or a script string would be
+        // tokenized as a real tag and counted as a blocked remote image
+        // the sanitizer is not actually going to remove.
+        let Token::TagToken(tag) = &token else {
+            return TokenSinkResult::Continue;
+        };
+        if tag.kind != TagKind::StartTag {
+            return TokenSinkResult::Continue;
         }
-        TokenSinkResult::Continue
+        if tag.name == local_name!("img") {
+            self.observe_img(&tag.attrs);
+        }
+        match raw_text_kind(&tag.name) {
+            Some(kind) => TokenSinkResult::RawData(kind),
+            None => TokenSinkResult::Continue,
+        }
     }
 
     fn end(&self) {}
@@ -150,6 +164,19 @@ impl Sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_img_spelled_out_inside_a_stylesheet_is_not_an_image() {
+        let html = r#"<style>.x{}/* <img src="https://cdn.example/a.png"> */</style><script>var s = '<img src="https://cdn.example/b.png">';</script><p>hi</p>"#;
+        let scan = prescan_images(html, false);
+        assert_eq!(scan.remote_image_blocked_count, 0);
+        assert_eq!(scan.tracking_pixel_count, 0);
+        assert!(scan.tracker_srcs.is_empty());
+
+        let real = r#"<style>.x{}</style><img src="https://cdn.example/a.png">"#;
+        let scan = prescan_images(real, false);
+        assert_eq!(scan.remote_image_blocked_count, 1);
+    }
 
     #[test]
     fn tracker_by_dimension_is_flagged_and_counted() {

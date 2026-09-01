@@ -527,6 +527,17 @@ fn build_sanitizer_with_tag_attributes(
         .link_rel(Some("noopener noreferrer nofollow"))
         .strip_comments(true)
         .attribute_filter(move |tag, attr, value| {
+            // `<style>` keeps no attributes at all. Its content is narrowed
+            // by `css::sanitize_style_blocks`, a post-pass over ammonia's
+            // serialization, and the only thing that makes that pass sound
+            // is the tag arriving in one canonical shape. `class`/`id`/
+            // `lang`/`title` are inert on `<style>` anyway (nothing selects
+            // the stylesheet element itself), so dropping them costs
+            // nothing and removes a whole class of parser-mismatch bugs.
+            if tag == "style" {
+                return None;
+            }
+
             if is_event_handler_attribute(attr) {
                 return None;
             }
@@ -1216,5 +1227,90 @@ mod tests {
                 let _ = (out.as_sanitized_str(), report);
             }
         }
+    }
+
+    #[test]
+    fn attributes_on_a_style_tag_do_not_bypass_the_css_allow_list() {
+        for attr in [r#"id="s""#, r#"class="a""#, r#"title="t""#, r#"lang="en""#] {
+            let raw = format!(
+                concat!(
+                    "<style {}>.fm-message{{position:fixed;top:0}}",
+                    "p::before{{content:\"x\"}}",
+                    "@import url(https://evil.example/x.css);",
+                    "</style><p>real</p>"
+                ),
+                attr
+            );
+            let (out, _) = sanitize(&html(&raw), &SanitizeOptions::default());
+            let s = out.as_sanitized_str();
+            assert!(s.contains("real"), "{attr}: {s}");
+            assert!(!s.contains("@import"), "{attr}: {s}");
+            assert!(!s.contains("position:fixed"), "{attr}: {s}");
+            assert!(!s.contains("evil.example"), "{attr}: {s}");
+            assert!(!s.contains("content:"), "{attr}: {s}");
+        }
+    }
+
+    #[test]
+    fn a_style_tag_with_attributes_does_not_swallow_the_message_body() {
+        let raw = r#"<style class="x">a{}<style>b{}</style><p>Important message text</p>"#;
+        let (out, _) = sanitize(&html(raw), &SanitizeOptions::default());
+        let s = out.as_sanitized_str();
+        assert!(s.contains("Important message text"), "{s}");
+        assert_eq!(
+            s.matches("<style").count(),
+            s.matches("</style>").count(),
+            "unbalanced style tags: {s}"
+        );
+    }
+
+    #[test]
+    fn a_child_combinator_in_a_style_block_survives_the_hidden_pass() {
+        let raw = concat!(
+            "<style>.a > .b{color:red}</style>",
+            r#"<p class="a"><span class="b">hi</span></p>"#
+        );
+        let (out, _) = sanitize(&html(raw), &SanitizeOptions::default());
+        let s = out.as_sanitized_str();
+        assert!(s.contains(".fm-message .a > .b{color:red;}"), "{s}");
+    }
+
+    #[test]
+    fn an_ampersand_in_a_style_block_is_not_escaped_into_the_stylesheet() {
+        let raw = r#"<style>.a{font-family:"A&B"}</style><p>hi</p>"#;
+        let (out, _) = sanitize(&html(raw), &SanitizeOptions::default());
+        let s = out.as_sanitized_str();
+        assert!(!s.contains("A&amp;B"), "{s}");
+        assert!(s.contains("\"A&B\""), "{s}");
+    }
+
+    #[test]
+    fn a_media_query_survives_the_hidden_pass_scoped_to_the_letter() {
+        // A single `>` anywhere inside an at-rule used to cost the sender
+        // the whole block: the hidden pass escaped it and the CSS parser
+        // then threw the rule away.
+        let raw = concat!(
+            "<style>@media screen{.a > td{color:red}}</style>",
+            r#"<table><tr><td class="a">hi</td></tr></table>"#
+        );
+        let (out, _) = sanitize(&html(raw), &SanitizeOptions::default());
+        let s = out.as_sanitized_str();
+        assert!(s.contains("@media screen"), "{s}");
+        assert!(s.contains(".fm-message .a > td"), "{s}");
+    }
+
+    #[test]
+    fn script_content_is_dropped_even_when_it_looks_like_markup() {
+        // The raw-text states the hidden pass now sets must not turn a
+        // script body into visible text: ammonia drops `<script>` with its
+        // content (CLEAN_CONTENT_TAGS), and that has to keep holding for a
+        // script whose body contains stray `<`.
+        let raw = "<script>if (a<b) { document.write('<p>ghost</p>'); }</script><p>real</p>";
+        let (out, _) = sanitize(&html(raw), &SanitizeOptions::default());
+        let s = out.as_sanitized_str();
+        assert!(s.contains("real"), "{s}");
+        assert!(!s.contains("ghost"), "{s}");
+        assert!(!s.contains("document.write"), "{s}");
+        assert!(!s.contains("<script"), "{s}");
     }
 }

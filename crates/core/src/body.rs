@@ -1115,6 +1115,30 @@ fn record_attachment_metadata(
     raw_message: &[u8],
 ) -> Result<(), CoreError> {
     let parsed = feathermail_html::parse_message(raw_message, true);
+
+    // Re-parsing the same immutable RFC822 source (e.g. after the cached
+    // body was evicted and the letter was opened again) must not forget
+    // that an attachment was already downloaded. The attachment id is
+    // deterministic (`message_id` + ordinal, see below), so the row this
+    // DELETE+INSERT recreates is the very same logical attachment -- carry
+    // its cache pointer across rather than dropping it to NULL, or the
+    // downloaded file becomes an orphan the cache sweep can never see
+    // (`enforce_attachment_cache_limit_keeping` only sweeps rows where
+    // `cache_path IS NOT NULL`).
+    let mut cached: std::collections::HashMap<String, (Option<String>, Option<i64>)> = {
+        let mut stmt = tx
+            .prepare("SELECT id, cache_path, cache_bytes FROM attachments WHERE message_id = ?1")
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![message_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, (row.get(1)?, row.get(2)?)))
+            })
+            .map_err(sql_err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(sql_err)?;
+        rows
+    };
+
     tx.execute(
         "DELETE FROM attachments WHERE message_id = ?1",
         params![message_id.as_str()],
@@ -1144,11 +1168,12 @@ fn record_attachment_metadata(
         // derived from a filename (message content) and never becomes a file
         // path.
         let attachment_id = format!("attachment:{}:{index}", message_id.as_str());
+        let (cache_path, cache_bytes) = cached.remove(&attachment_id).unwrap_or((None, None));
         tx.execute(
             "INSERT INTO attachments
                 (id, account_id, message_id, filename, mime, size_bytes,
-                 content_id, part_path, transfer_encoding)
-             SELECT ?1, account_id, id, ?2, ?3, ?4, ?5, ?6, ?7
+                 content_id, part_path, transfer_encoding, cache_path, cache_bytes)
+             SELECT ?1, account_id, id, ?2, ?3, ?4, ?5, ?6, ?7, ?9, ?10
              FROM messages WHERE id = ?8",
             params![
                 attachment_id,
@@ -1159,6 +1184,8 @@ fn record_attachment_metadata(
                 attachment.section,
                 encoding.as_str(),
                 message_id.as_str(),
+                cache_path,
+                cache_bytes,
             ],
         )
         .map_err(sql_err)?;
@@ -1263,10 +1290,11 @@ fn fnv1a_hex(s: &str) -> String {
 fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        chmod_owner_only_dir(parent)?;
     }
     let tmp = tmp_path_for(path);
     {
-        let mut f = File::create(&tmp)?;
+        let mut f = create_owner_only(&tmp)?;
         f.write_all(contents)?;
         f.sync_all()?;
     }
@@ -1278,6 +1306,42 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
     path.with_file_name(name)
+}
+
+/// Creates (or truncates) `path` for writing, owner-read/write only on
+/// unix. This is the same cache directory as `mail.db` (sibling under the
+/// profile dir), which is deliberately opened 0600 by `feathermail_db`'s
+/// `chmod_owner_rw` -- a cached RFC822 body is the same private content and
+/// gets the same protection, not the platform-default 0666 & ~umask.
+#[cfg(unix)]
+fn create_owner_only(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_owner_only(path: &Path) -> io::Result<File> {
+    File::create(path)
+}
+
+/// Sets `dir` to owner-only (0700) on unix, mirroring `create_owner_only`
+/// above -- a world/group-readable `bodies/` directory would let another
+/// local account list cached message ids even if it can't open the 0600
+/// files inside.
+#[cfg(unix)]
+fn chmod_owner_only_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn chmod_owner_only_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1436,6 +1500,45 @@ mod tests {
             .unwrap();
         assert_eq!(message_snippet, "Hello from the cached body");
         assert_eq!(thread_snippet, "Hello from the cached body");
+    }
+
+    /// `mail.db` is deliberately opened 0600 (`feathermail_db`'s
+    /// `chmod_owner_rw`, guarded by its own `db_file_is_owner_rw_only`
+    /// test); the cached RFC822 body sitting right next to it under the
+    /// profile dir carries the same private mail content and must get the
+    /// same owner-only protection, not whatever the process umask leaves
+    /// `File::create`'s platform-default 0666 at.
+    #[cfg(unix)]
+    #[test]
+    fn cached_body_file_and_its_shard_dir_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut core = core_with_message("m1", 0);
+        let id = MessageId("m1".into());
+
+        core.store_body(&id, dir.path(), b"Content-Type: text/plain\r\n\r\nhi")
+            .unwrap();
+
+        let rel: String = core
+            .db
+            .conn()
+            .query_row("SELECT body_path FROM messages WHERE id = 'm1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let full = dir.path().join(&rel);
+        let file_mode = fs::metadata(&full).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "cached body file must not be readable beyond its owner"
+        );
+        let shard_dir = full.parent().unwrap();
+        let dir_mode = fs::metadata(shard_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "body cache shard directory must not be listable beyond its owner"
+        );
     }
 
     /// T-068: a 10k metadata profile must not turn one cached-body write
@@ -2374,6 +2477,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_attachment, 1);
+    }
+
+    /// Re-parsing the very same immutable RFC822 source must not forget
+    /// that one of its attachments is already downloaded: the attachment
+    /// id is derived from `message_id` + ordinal, so the file on disk is
+    /// still the right file for the row. Losing `cache_path` both re-shows
+    /// a downloaded attachment as missing and orphans its file, which the
+    /// sweep (`WHERE a.cache_path IS NOT NULL`) can no longer see.
+    #[test]
+    fn recaching_a_body_keeps_a_downloaded_attachment_downloaded() {
+        let bodies = tempfile::tempdir().unwrap();
+        let atts = tempfile::tempdir().unwrap();
+        let mut core = core_with_message("m-attachments", 0);
+        let acc = crate::model::AccountId("acc1".into());
+        let id = MessageId("m-attachments".into());
+        let raw = b"Content-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nhello\r\n--B\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=report.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--B--\r\n";
+        core.store_body(&id, bodies.path(), raw).unwrap();
+
+        let att_id = core.list_attachments(&acc, &id).unwrap()[0].id.clone();
+        std::fs::create_dir_all(atts.path().join("aa")).unwrap();
+        std::fs::write(atts.path().join("aa/x.attachment"), b"hello").unwrap();
+        core.mark_attachment_cached(&acc, &att_id, Path::new("aa/x.attachment"), atts.path())
+            .unwrap();
+        assert!(
+            core.get_attachment(&acc, &att_id)
+                .unwrap()
+                .cache_path
+                .is_some(),
+            "fixture: the attachment must be marked cached before the re-parse"
+        );
+
+        // Same message, same bytes -- e.g. the body was evicted and the
+        // reader opened the letter again.
+        core.store_body(&id, bodies.path(), raw).unwrap();
+
+        assert!(
+            core.get_attachment(&acc, &att_id)
+                .unwrap()
+                .cache_path
+                .is_some(),
+            "re-caching the same body forgot the already-downloaded attachment"
+        );
+    }
+
+    /// The carry-over above must not resurrect a row for an attachment
+    /// that a later parse of a *different* body no longer has: the
+    /// DELETE+INSERT is still per-message, so re-parsing a shorter body
+    /// under the same message id leaves exactly the new attachment set,
+    /// not the old one padded with cache pointers.
+    #[test]
+    fn recaching_a_shorter_body_drops_the_attachment_that_is_no_longer_present() {
+        let bodies = tempfile::tempdir().unwrap();
+        let atts = tempfile::tempdir().unwrap();
+        let mut core = core_with_message("m-attachments", 0);
+        let acc = crate::model::AccountId("acc1".into());
+        let id = MessageId("m-attachments".into());
+        let two_parts = b"Content-Type: multipart/mixed; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nhello\r\n--B\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=report.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--B--\r\n";
+        core.store_body(&id, bodies.path(), two_parts).unwrap();
+
+        let att_id = core.list_attachments(&acc, &id).unwrap()[0].id.clone();
+        std::fs::create_dir_all(atts.path().join("aa")).unwrap();
+        std::fs::write(atts.path().join("aa/x.attachment"), b"hello").unwrap();
+        core.mark_attachment_cached(&acc, &att_id, Path::new("aa/x.attachment"), atts.path())
+            .unwrap();
+
+        let no_attachments = b"Content-Type: text/plain\r\n\r\nhello\r\n";
+        core.store_body(&id, bodies.path(), no_attachments).unwrap();
+
+        assert!(
+            core.list_attachments(&acc, &id).unwrap().is_empty(),
+            "a body that no longer has the attachment must not leave its row behind"
+        );
     }
 
     /// T-028: warm-cache preview budget. Isolates `Core::lookup_body`

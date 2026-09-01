@@ -186,12 +186,23 @@ impl<L: RemoteLocator> ImapMailProvider<L> {
         Ok(())
     }
 
+    /// `UID EXPUNGE` is the one thing here no Undo can walk back, so the
+    /// targets come from the snapshot the operation captured when the user
+    /// pressed the button (`thread_messages_for_operation`), never from a
+    /// live re-read of the thread. Between dispatch and apply -- offline, or
+    /// waiting out a network backoff -- a reply can land in the same thread;
+    /// resolving late would destroy a message the command never referred to.
+    /// An operation with no snapshot resolves to nothing and fails
+    /// `NotFound`, which is the safe direction for an irreversible delete.
     fn permanently_delete_thread(
         &mut self,
         account_id: &AccountId,
         thread_id: &str,
+        operation_id: &str,
     ) -> Result<(), ApplyError> {
-        let messages = self.locator.thread_messages(account_id, thread_id)?;
+        let messages =
+            self.locator
+                .thread_messages_for_operation(account_id, thread_id, operation_id)?;
         if messages.is_empty() {
             return Err(ApplyError::NotFound);
         }
@@ -283,7 +294,7 @@ impl<L: RemoteLocator> MailProvider for ImapMailProvider<L> {
                 op.id.as_str(),
             ),
             OpKind::PermanentDelete => {
-                self.permanently_delete_thread(&op.account_id, &op.target_id)
+                self.permanently_delete_thread(&op.account_id, &op.target_id, op.id.as_str())
             }
             OpKind::Archive => self.move_thread(
                 &op.account_id,
@@ -307,12 +318,14 @@ impl<L: RemoteLocator> MailProvider for ImapMailProvider<L> {
                 self.delete_folder(&mailbox)
             }
             OpKind::RenameFolder => {
-                // Both paths come from Core, which owns folder identity and
-                // the stored delimiter. Rebuilding either one here would be
-                // a second, drifting source of truth for where the mailbox
-                // lives.
+                // The source path comes from Core, which owns folder
+                // identity and the stored delimiter; rebuilding it here
+                // would be a second, drifting source of truth for where the
+                // mailbox lives. The destination is assembled from the
+                // parts Core queued -- see `rename_destination` for why
+                // that is not the same as taking a finished string.
                 let from = json_string(&op.payload, "from").ok_or(ApplyError::Unsupported)?;
-                let to = json_string(&op.payload, "to").ok_or(ApplyError::Unsupported)?;
+                let to = rename_destination(&op.payload).ok_or(ApplyError::Unsupported)?;
                 self.session
                     .rename_mailbox(&from, &to)
                     .map_err(connect_to_apply)
@@ -385,6 +398,38 @@ fn group_by_folder(messages: &[RemoteMessage]) -> Vec<(String, Vec<u32>)> {
 /// `feathermail_core::store` writes (see its `json_escape`: only `\` and
 /// `"` are ever escaped). Not a general JSON parser — this crate has no
 /// JSON dependency, and none of this module's payloads need one.
+/// T-158: the mailbox path a `RenameFolder` operation asks the server for.
+///
+/// The payload carries the destination in parts -- `parent_remote_id` (the
+/// prefix exactly as the server's own `LIST` reported it), `delimiter`, and
+/// the raw `label` the user typed -- and only the label is encoded to
+/// modified UTF-7. Core used to join them itself and hand over one string,
+/// which `ImapSession::rename_mailbox` then encoded as a whole: for a
+/// parent «Проекты» that escaped the prefix's `&` a second time and named a
+/// mailbox no server has.
+///
+/// A payload queued before that change carries a finished `to` and no
+/// `label`; it goes out the old way, whole-string encoding included, since
+/// that is what the path stored in it was built for.
+///
+/// [`feathermail_core::store::mailbox_remote_id`] is the joining function
+/// on purpose: `feathermail_core::queue::settle_folder_rename` writes the
+/// result of that same call into `folders.remote_id` when the server acks,
+/// so the local id can never name a different mailbox than the one this
+/// RENAME moved.
+fn rename_destination(payload: &str) -> Option<String> {
+    if let Some(label) = json_string(payload, "label") {
+        let parent = json_string(payload, "parent_remote_id").unwrap_or_default();
+        let delimiter = json_string(payload, "delimiter").unwrap_or_default();
+        return Some(feathermail_core::store::mailbox_remote_id(
+            &parent, &delimiter, &label,
+        ));
+    }
+    Some(crate::folders::encode_modified_utf7(&json_string(
+        payload, "to",
+    )?))
+}
+
 fn json_string(payload: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":\"");
     let start = payload.find(&needle)? + needle.len();
@@ -568,6 +613,57 @@ mod tests {
             status: OpStatus::Pending,
             undo_of: None,
         }
+    }
+
+    /// `UID EXPUNGE` cannot be undone, so the targets are the ones the
+    /// operation captured when the user asked for the delete -- not whatever
+    /// the thread holds by the time the worker gets to it.
+    #[test]
+    fn permanent_delete_expunges_only_the_snapshot_taken_at_dispatch() {
+        let (port, state) = spawn_fake_server(vec![("INBOX", vec![7, 999])], true);
+        let session = connect(port);
+        let operation = op(OpKind::PermanentDelete, "t1", "{}");
+        let mut locator = FakeLocator::with_thread(
+            "john",
+            "t1",
+            vec![
+                RemoteMessage {
+                    folder: "INBOX".into(),
+                    uid: 7,
+                },
+                // Arrived on the same thread *after* the user asked for the
+                // permanent delete, while the operation was still queued.
+                RemoteMessage {
+                    folder: "INBOX".into(),
+                    uid: 999,
+                },
+            ],
+        );
+        locator.operation_messages.insert(
+            (
+                "john".to_string(),
+                "t1".to_string(),
+                operation.id.as_str().to_string(),
+            ),
+            vec![RemoteMessage {
+                folder: "INBOX".into(),
+                uid: 7,
+            }],
+        );
+        let mut provider = ImapMailProvider::new(session, locator);
+        provider.apply(&operation).unwrap();
+
+        let st = state.lock().unwrap();
+        let uids: Vec<u32> = st.mailboxes["INBOX"].iter().map(|m| m.uid).collect();
+        assert!(
+            !uids.contains(&7),
+            "the message the user actually deleted must be gone, has {uids:?}"
+        );
+        assert!(
+            uids.contains(&999),
+            "a message that joined the thread after the command was queued must \
+             survive an irreversible EXPUNGE, has {uids:?}"
+        );
     }
 
     // --- Flags ---
@@ -956,6 +1052,74 @@ mod tests {
         );
     }
 
+    /// T-158: a folder whose *parent* is non-ASCII. `LIST` reported that
+    /// parent already in modified UTF-7, so the only thing this rename may
+    /// encode is the new leaf. Encoding the joined path instead escaped the
+    /// prefix's `&` a second time and asked the server to rename a mailbox
+    /// that does not exist -- which the fake here answers exactly as a real
+    /// server would, with NONEXISTENT.
+    #[test]
+    fn rename_folder_under_a_non_ascii_parent_encodes_only_the_leaf() {
+        // «Проекты/Ideas», as the server's own LIST spells it.
+        let (port, state) = spawn_fake_server(
+            vec![("INBOX", vec![1]), ("&BB8EQAQ+BDUEOgRCBEs-/Ideas", vec![9])],
+            true,
+        );
+        let session = connect(port);
+        let mut provider = ImapMailProvider::new(session, FakeLocator::default());
+        provider
+            .apply(&op(
+                OpKind::RenameFolder,
+                "john:ideas",
+                r#"{"from":"&BB8EQAQ+BDUEOgRCBEs-/Ideas","parent_remote_id":"&BB8EQAQ+BDUEOgRCBEs-","delimiter":"/","label":"Отчёты","at":1000}"#,
+            ))
+            .unwrap();
+
+        let st = state.lock().unwrap();
+        assert!(!st.mailboxes.contains_key("&BB8EQAQ+BDUEOgRCBEs-/Ideas"));
+        assert_eq!(
+            st.mailboxes["&BB8EQAQ+BDUEOgRCBEs-/&BB4EQgRHBFEEQgRL-"].len(),
+            1,
+            "one layer of encoding on the leaf, the parent byte for byte, \
+             and the mail travels with the name"
+        );
+        assert!(
+            !st.mailboxes.keys().any(|name| name.contains("&-BB8")),
+            "an escaped ampersand means the parent was encoded twice: {:?}",
+            st.mailboxes.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The same payload shape over a plain ASCII hierarchy must produce the
+    /// bytes it always did -- this is where a regression would be silent,
+    /// since every hierarchy the owner has today is ASCII.
+    #[test]
+    fn rename_folder_in_an_ascii_hierarchy_is_unchanged_by_the_new_payload() {
+        let (port, state) =
+            spawn_fake_server(vec![("INBOX", vec![1]), ("Team/Ideas", vec![9])], true);
+        let session = connect(port);
+        let mut provider = ImapMailProvider::new(session, FakeLocator::default());
+        provider
+            .apply(&op(
+                OpKind::RenameFolder,
+                "john:ideas",
+                r#"{"from":"Team/Ideas","parent_remote_id":"Team","delimiter":"/","label":"Plans","at":1000}"#,
+            ))
+            .unwrap();
+
+        let st = state.lock().unwrap();
+        assert!(!st.mailboxes.contains_key("Team/Ideas"));
+        assert!(st.mailboxes.contains_key("Team/Plans"));
+        assert!(
+            !st.mailboxes.contains_key("Plans"),
+            "the folder must not be promoted out of its hierarchy"
+        );
+    }
+
+    /// An operation queued before T-158 carries a finished `to` and no
+    /// parts. It is still in the queue after the upgrade (D29: offline work
+    /// survives restarts), so it must still apply -- by the old route,
+    /// whole-string encoding included.
     #[test]
     fn rename_folder_keeps_a_nested_path_the_applier_never_builds_itself() {
         let (port, state) =

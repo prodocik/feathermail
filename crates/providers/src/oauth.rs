@@ -440,6 +440,18 @@ impl<O: TokenRefresh, S: SecretStore> Reauthenticate<ImapMailProvider<Core>> for
         // reconnect below, the keyring is left holding the newer token
         // (still good for the next attempt) rather than the one that just
         // got rejected.
+        //
+        // A provider that rotates refresh tokens (Microsoft) hands back a
+        // new one on every exchange and lets the old one expire with the
+        // original grant; dropping it here would force a browser sign-in
+        // on a continuously used account. A response without one (Google)
+        // must leave the stored token alone -- overwriting it with an
+        // empty string would turn a working account into AUTH_REQUIRED.
+        if let Some(rotated) = tokens.refresh_token.as_deref().filter(|s| !s.is_empty()) {
+            self.secrets
+                .put(&refresh_key, rotated)
+                .map_err(|_| ApplyError::Auth)?;
+        }
         let access_key = SecretKey::oauth_access(self.account_id.as_str());
         self.secrets
             .put(&access_key, &tokens.access_token)
@@ -495,7 +507,16 @@ impl AuthSession {
                     if !addr.ip().is_loopback() {
                         continue;
                     }
-                    return read_code(stream, &self.state, self.provider_name);
+                    // Only a request carrying *our* `state` decides this
+                    // wait. A browser preconnect, a port scanner, or
+                    // another process' `?error=` would otherwise end the
+                    // sign-in on the first connection that is not the
+                    // redirect we are waiting for.
+                    match read_code(stream, &self.state, self.provider_name) {
+                        LoopbackOutcome::Code(code) => return Ok(code),
+                        LoopbackOutcome::Failed(err) => return Err(err),
+                        LoopbackOutcome::Stray => continue,
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
@@ -687,14 +708,30 @@ fn error_or_status(error: &str, status: u16) -> String {
     }
 }
 
-fn read_code(
-    mut stream: TcpStream,
-    expected_state: &str,
-    provider_name: &str,
-) -> Result<String, OauthError> {
-    stream
+/// What one accepted loopback connection means for the sign-in.
+enum LoopbackOutcome {
+    /// The redirect we were waiting for; `state` matched.
+    Code(String),
+    /// `state` matched and the request terminally ended the sign-in
+    /// (the user cancelled, or the provider reported an error).
+    Failed(OauthError),
+    /// Not our redirect at all -- a preconnect, a port scan, or someone
+    /// else's request. Keep waiting for the real one.
+    Stray,
+}
+
+/// Reads one loopback request and decides whether it is our redirect.
+///
+/// `state` is checked *before* `error=`: a stray `?error=access_denied`
+/// from a local process carries no matching `state`, and must not be able
+/// to cancel a sign-in it has nothing to do with.
+fn read_code(mut stream: TcpStream, expected_state: &str, provider_name: &str) -> LoopbackOutcome {
+    if stream
         .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| OauthError::network(e.to_string()))?;
+        .is_err()
+    {
+        return LoopbackOutcome::Stray;
+    }
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     while buf.len() < 8192 {
@@ -706,7 +743,7 @@ fn read_code(
                     break;
                 }
             }
-            Err(e) => return Err(OauthError::network(e.to_string())),
+            Err(_) => return LoopbackOutcome::Stray,
         }
     }
     let req = String::from_utf8_lossy(&buf);
@@ -718,27 +755,26 @@ fn read_code(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<!doctype html><title>Feather Mail</title>You can close this window."
     );
+    let state = params.get("state").cloned().unwrap_or_default();
+    if state != expected_state {
+        return LoopbackOutcome::Stray;
+    }
     if let Some(err) = params.get("error") {
         if err == "access_denied" {
-            return Err(OauthError::invalid(format!(
+            return LoopbackOutcome::Failed(OauthError::invalid(format!(
                 "{provider_name} sign-in was cancelled."
             )));
         }
-        return Err(OauthError::invalid(format!(
+        return LoopbackOutcome::Failed(OauthError::invalid(format!(
             "{provider_name} sign-in didn't finish."
         )));
     }
-    let state = params.get("state").cloned().unwrap_or_default();
-    if state != expected_state {
-        return Err(OauthError::invalid(format!(
-            "{provider_name} sign-in didn't match this request."
-        )));
+    match params.get("code").cloned().filter(|c| !c.is_empty()) {
+        Some(code) => LoopbackOutcome::Code(code),
+        None => LoopbackOutcome::Failed(OauthError::invalid(format!(
+            "{provider_name} sign-in didn't finish."
+        ))),
     }
-    params
-        .get("code")
-        .cloned()
-        .filter(|c| !c.is_empty())
-        .ok_or_else(|| OauthError::invalid(format!("{provider_name} sign-in didn't finish.")))
 }
 
 fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
@@ -763,14 +799,23 @@ fn url_decode(s: &str) -> String {
                 out.push(b' ');
                 i += 1;
             }
+            // Decode by byte, never by `str` slice: `s` comes from a
+            // lossy conversion of whatever a local process wrote to the
+            // loopback socket, so `i + 3` can land inside a multi-byte
+            // character and slicing there would panic.
             b'%' if i + 2 < bytes.len() => {
-                let hex = &s[i + 1..i + 3];
-                if let Ok(b) = u8::from_str_radix(hex, 16) {
-                    out.push(b);
-                    i += 3;
-                } else {
-                    out.push(bytes[i]);
-                    i += 1;
+                match std::str::from_utf8(&bytes[i + 1..i + 3])
+                    .ok()
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                {
+                    Some(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
                 }
             }
             b => {
@@ -1140,6 +1185,90 @@ mod tests {
     }
 
     #[test]
+    fn url_decode_survives_percent_before_a_multibyte_char() {
+        // `read_code` runs the request through `String::from_utf8_lossy`,
+        // so an invalid byte right after `%` becomes U+FFFD (3 bytes).
+        let lossy = String::from_utf8_lossy(b"code=%\xff\xfe").into_owned();
+        let decoded = url_decode(&lossy);
+        assert!(
+            decoded.starts_with("code=%"),
+            "a stray `%` must stay literal, got {decoded:?}"
+        );
+        assert_eq!(url_decode("a=%E2%82%ACx"), "a=\u{20ac}x");
+        // A `%` right before a multi-byte character, and truncated tails.
+        assert_eq!(url_decode("%\u{20ac}"), "%\u{20ac}");
+        assert_eq!(url_decode("%"), "%");
+        assert_eq!(url_decode("%A"), "%A");
+        assert_eq!(url_decode("%z9"), "%z9");
+        assert_eq!(url_decode("%\u{e9}9"), "%\u{e9}9");
+    }
+
+    #[test]
+    fn stray_connection_does_not_end_the_wait() {
+        let oauth = GoogleOauth::new(cfg(), MapHttp::new(200, "{}"));
+        let session = oauth.begin_loopback().unwrap();
+        let url = session.redirect_uri.clone();
+        let state = session.state.clone();
+        let addr = url.trim_start_matches("http://").to_string();
+        thread::spawn(move || {
+            // A browser preconnect: opens the socket, sends nothing.
+            thread::sleep(Duration::from_millis(40));
+            let stray = std::net::TcpStream::connect(&addr).unwrap();
+            drop(stray);
+            thread::sleep(Duration::from_millis(60));
+            let _ = ureq::get(&format!("{url}/?code=the-code&state={state}"))
+                .timeout(Duration::from_secs(2))
+                .call();
+        });
+        let code = session.wait_code(Duration::from_secs(3)).unwrap();
+        assert_eq!(code, "the-code");
+    }
+
+    #[test]
+    fn foreign_error_without_our_state_does_not_cancel_the_wait() {
+        let oauth = GoogleOauth::new(cfg(), MapHttp::new(200, "{}"));
+        let session = oauth.begin_loopback().unwrap();
+        let url = session.redirect_uri.clone();
+        let state = session.state.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            let _ = ureq::get(&format!("{url}/?error=access_denied"))
+                .timeout(Duration::from_secs(2))
+                .call();
+            thread::sleep(Duration::from_millis(60));
+            let _ = ureq::get(&format!("{url}/?code=the-code&state={state}"))
+                .timeout(Duration::from_secs(2))
+                .call();
+        });
+        let code = session.wait_code(Duration::from_secs(3)).unwrap();
+        assert_eq!(code, "the-code");
+    }
+
+    #[test]
+    fn a_real_cancellation_ends_the_wait_without_waiting_for_the_deadline() {
+        let oauth = GoogleOauth::new(cfg(), MapHttp::new(200, "{}"));
+        let session = oauth.begin_loopback().unwrap();
+        let url = session.redirect_uri.clone();
+        let state = session.state.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            let _ = ureq::get(&format!("{url}/?error=access_denied&state={state}"))
+                .timeout(Duration::from_secs(2))
+                .call();
+        });
+        let started = Instant::now();
+        let err = session.wait_code(Duration::from_secs(30)).unwrap_err();
+        assert!(
+            matches!(&err, OauthError::Invalid { message, .. } if message.contains("cancelled")),
+            "a cancellation carrying our state is terminal, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wizard must not hang until the deadline after a real cancellation"
+        );
+    }
+
+    #[test]
     fn sasl_xoauth2_matches_gmail_spec() {
         let mut raw = sasl_xoauth2("user@gmail.com", "ya29.v");
         let decoded = STANDARD.decode(&raw).unwrap();
@@ -1211,6 +1340,52 @@ mod tests {
             stored_access.expose(),
             "fresh-access-token",
             "the new access token must be persisted to the keyring, not just used once"
+        );
+        let stored_refresh = reauth
+            .secrets
+            .get(&SecretKey::oauth_refresh(account_id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_refresh.expose(),
+            "rt-good",
+            "a response without a refresh token (Google) must leave the stored one alone"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn rotated_refresh_token_is_persisted() {
+        let db_path = tempfile_path();
+        let imap_port = crate::xoauth2::fake_server::spawn_imap("fresh-access-token");
+        let account_id = seed_account(&db_path, imap_port);
+
+        let secrets = feathermail_security::MemorySecretStore::new();
+        secrets
+            .put(&SecretKey::oauth_refresh(account_id.as_str()), "rt1")
+            .unwrap();
+
+        // Microsoft rotates the refresh token on every refresh; the old
+        // one keeps only the original grant's lifetime.
+        let http = MapHttp::new(
+            200,
+            r#"{"access_token":"fresh-access-token","refresh_token":"rt2","expires_in":3600}"#,
+        );
+        let oauth = GoogleOauth::new(cfg(), http);
+        let mut reauth = OauthReauth::new(account_id.clone(), db_path.clone(), oauth, secrets);
+
+        let _provider = reauth.reauthenticate().expect("reauth should succeed");
+
+        let stored_refresh = reauth
+            .secrets
+            .get(&SecretKey::oauth_refresh(account_id.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_refresh.expose(),
+            "rt2",
+            "a rotated refresh token must replace the stored one"
         );
 
         let _ = std::fs::remove_file(&db_path);

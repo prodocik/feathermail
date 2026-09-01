@@ -12,21 +12,21 @@ The packages were built and smoke-tested on Ubuntu 25.10. Ubuntu 24.04+, Debian 
 
 ## Debian, Ubuntu and Linux Mint
 
-Download `feathermail_0.1.1_amd64.deb` from [GitHub Releases](https://github.com/prodocik/feathermail/releases/latest), then install it with dependency resolution:
+Download `feathermail_0.2.0_amd64.deb` from [GitHub Releases](https://github.com/prodocik/feathermail/releases/latest), then install it with dependency resolution:
 
 ```bash
-sudo apt install ./feathermail_0.1.1_amd64.deb
+sudo apt install ./feathermail_0.2.0_amd64.deb
 ```
 
 Launch **Feather Mail** from the app grid or run `feathermail`.
 
 ## AppImage
 
-Download `Feather-Mail-0.1.1-x86_64.AppImage` from [GitHub Releases](https://github.com/prodocik/feathermail/releases/latest):
+Download `Feather-Mail-0.2.0-x86_64.AppImage` from [GitHub Releases](https://github.com/prodocik/feathermail/releases/latest):
 
 ```bash
-chmod +x Feather-Mail-0.1.1-x86_64.AppImage
-./Feather-Mail-0.1.1-x86_64.AppImage
+chmod +x Feather-Mail-0.2.0-x86_64.AppImage
+./Feather-Mail-0.2.0-x86_64.AppImage
 ```
 
 The AppImage deliberately does not bundle WebKitGTK: WebKit spawns version-matched helper processes from the host. Install your distribution's WebKitGTK 6.0 runtime if the library is missing.

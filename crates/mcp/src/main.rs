@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use feathermail_core::Core;
-use feathermail_mcp::{call_tool, tool_definitions, Access, PermissionLevel, PROTOCOL_VERSION};
+use feathermail_mcp::{
+    call_tool, call_tool_unaudited, record_call_audit, tool_definitions, Access, PermissionLevel,
+    PROTOCOL_VERSION,
+};
 use serde_json::{json, Value};
 
 fn main() {
@@ -157,6 +160,12 @@ fn call_with_confirmation_until(
     args: &Value,
     deadline: Instant,
 ) -> Result<Value, feathermail_mcp::McpError> {
+    // The first call goes through the audited `call_tool`, so the request's
+    // arrival is always recorded exactly once. Every poll afterwards uses
+    // `call_tool_unaudited`, and the poll loop's own outcome -- confirmed,
+    // denied, or timed out -- gets exactly one more audit row of its own
+    // (below), so one MCP call never leaves more than two rows regardless of
+    // how long it waits for a GTK confirmation.
     let first = call_tool(core, access, name, args);
     let Err(first_error) = first else {
         return first;
@@ -168,10 +177,13 @@ fn call_with_confirmation_until(
         if Instant::now() >= deadline {
             return Err(first_error);
         }
-        std::thread::sleep(Duration::from_millis(200));
-        match call_tool(core, access, name, args) {
+        std::thread::sleep(Duration::from_secs(1));
+        match call_tool_unaudited(core, access, name, args) {
             Err(error) if error.pending_confirmation() == Some(request_id) => continue,
-            result => return result,
+            result => {
+                record_call_audit(core, access, name, args, &result);
+                return result;
+            }
         }
     }
 }
@@ -487,6 +499,49 @@ mod tests {
             let error = handle(&mut core, &access, method, &params).unwrap_err();
             assert_eq!(error.2["code"], "PERMISSION_DENIED");
         }
+    }
+
+    #[test]
+    fn one_waiting_call_leaves_one_audit_row() {
+        let mut core = Core::memory().unwrap();
+        core.set_mcp_enabled(1, true).unwrap();
+        assert!(core
+            .set_mcp_client_permission_level("stdio", PermissionLevel::Full)
+            .unwrap());
+        let pending = core
+            .authorize_mcp_action(
+                "stdio",
+                PermissionLevel::Full,
+                "delete_message",
+                PermissionLevel::Full,
+                true,
+                None,
+                Some("thread1"),
+                "delete_message:acc1:thread1",
+            )
+            .unwrap();
+        assert!(matches!(
+            pending,
+            feathermail_core::McpAuthorization::NeedsConfirmation(_)
+        ));
+        let audit_before = core.list_mcp_audit(200).unwrap().len();
+        let error = call_with_confirmation_until(
+            &mut core,
+            &Access {
+                ceiling: PermissionLevel::Full,
+                ..Access::default()
+            },
+            "delete_message",
+            &json!({"account_id":"acc1","thread_id":"thread1"}),
+            Instant::now() + Duration::from_millis(1200),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "PERMISSION_DENIED");
+        let written = core.list_mcp_audit(200).unwrap().len() - audit_before;
+        assert!(
+            written <= 2,
+            "one waiting MCP call must not multiply audit rows: wrote {written}"
+        );
     }
 
     #[test]

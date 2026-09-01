@@ -60,7 +60,9 @@
 //! against the previously stored value, so a `None` from a flags-only
 //! fetch never blanks out a subject/sender/date a full fetch already wrote.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use feathermail_db::Database;
 use feathermail_html::decode_encoded_words;
@@ -85,6 +87,21 @@ pub struct CoreSyncStore<'a> {
     db: &'a Database,
     account_id: String,
     folder_id: String,
+    /// Where `messages.body_path` is rooted, so the three deletion paths
+    /// below can take a cached body off disk with the row that named it.
+    /// `None` means "this store was built without one" -- deletion then
+    /// leaves the file alone rather than guessing a directory. See
+    /// [`CoreSyncStore::with_bodies_dir`] and [`Core::sync_store`].
+    bodies_dir: Option<PathBuf>,
+    /// Bodies whose `messages` row a de-duplication inside the current
+    /// `upsert_headers` batch has already deleted. They cannot be unlinked
+    /// where that happens -- it is in the middle of the batch transaction,
+    /// which may still roll back -- so they wait here until it commits.
+    /// Interior mutability because the de-duplication sits under
+    /// `&self` methods; `upsert_headers` empties this both before a batch
+    /// (a rolled-back batch must leave its files alone) and after its
+    /// commit.
+    doomed_bodies: RefCell<Vec<PathBuf>>,
 }
 
 struct ExistingMessage {
@@ -118,7 +135,75 @@ impl<'a> CoreSyncStore<'a> {
             db,
             account_id: account_id.into(),
             folder_id: folder_id.into(),
+            bodies_dir: None,
+            doomed_bodies: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Roots `messages.body_path` for this store, so a message this sync
+    /// deletes takes its cached body off disk with it.
+    ///
+    /// Deliberately a builder rather than a fourth argument to
+    /// [`CoreSyncStore::new`]: the deletion paths are the only thing that
+    /// needs the directory, and this crate's own body cache functions take
+    /// `bodies_dir: &Path` explicitly for the same reason (see
+    /// [`crate::body`]'s module docs) -- a `Core` does not carry a profile
+    /// path around. [`Core::sync_store`] supplies the real one.
+    #[must_use]
+    pub fn with_bodies_dir(mut self, bodies_dir: impl Into<PathBuf>) -> Self {
+        self.bodies_dir = Some(bodies_dir.into());
+        self
+    }
+
+    /// Paths of the cached bodies belonging to `message_ids`, read *before*
+    /// the rows are deleted. Returns nothing when this store has no
+    /// `bodies_dir`, so the callers below stay one shape either way.
+    fn cached_body_paths(&self, message_ids: &[String]) -> Result<Vec<PathBuf>, SyncError> {
+        let Some(dir) = self.bodies_dir.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; message_ids.len()].join(",");
+        let conn = self.db.conn();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT body_path FROM messages \
+                 WHERE id IN ({placeholders}) AND body_path IS NOT NULL"
+            ))
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(message_ids.iter()), |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(store_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(store_err)?;
+        Ok(rows.into_iter().map(|rel| dir.join(rel)).collect())
+    }
+
+    /// Every cached body in this store's folder, read before
+    /// [`CoreSyncStore::reset_folder`] throws the rows away.
+    fn cached_body_paths_for_folder(&self) -> Result<Vec<PathBuf>, SyncError> {
+        let Some(dir) = self.bodies_dir.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let conn = self.db.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT body_path FROM messages \
+                 WHERE account_id = ?1 AND folder_id = ?2 AND body_path IS NOT NULL",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![self.account_id, self.folder_id], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(store_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(store_err)?;
+        Ok(rows.into_iter().map(|rel| dir.join(rel)).collect())
     }
 
     fn message_row_id(&self, uid: u32) -> String {
@@ -324,6 +409,11 @@ impl<'a> CoreSyncStore<'a> {
             if referenced {
                 continue;
             }
+            // Read the cached body's path while the row still names it;
+            // the file itself is unlinked by `upsert_headers` once this
+            // batch's transaction has committed.
+            let doomed = self.cached_body_paths(std::slice::from_ref(&message_id))?;
+            self.doomed_bodies.borrow_mut().extend(doomed);
             conn.execute(
                 "DELETE FROM messages_fts WHERE rowid IN \
                  (SELECT fts_rowid FROM fts_message_rows WHERE message_id = ?1)",
@@ -332,6 +422,19 @@ impl<'a> CoreSyncStore<'a> {
             .map_err(store_err)?;
             conn.execute("DELETE FROM messages WHERE id = ?1", params![message_id])
                 .map_err(store_err)?;
+            // Same two-level protection as `remove_vanished` and
+            // `reset_folder`: `drafts.thread_id` is `ON DELETE SET NULL`
+            // since schema v28, and this restates it where the thread is
+            // actually dropped so a profile that missed the migration
+            // cannot turn a reply draft into a permanently failing sync.
+            // The `NOT EXISTS` guard is the delete's own, so a thread that
+            // still holds messages keeps its drafts attached.
+            conn.execute(
+                "UPDATE drafts SET thread_id = NULL WHERE thread_id = ?1
+                 AND NOT EXISTS (SELECT 1 FROM messages WHERE thread_id = ?1)",
+                params![thread_id],
+            )
+            .map_err(store_err)?;
             conn.execute(
                 "DELETE FROM threads WHERE id = ?1
                  AND NOT EXISTS (SELECT 1 FROM messages WHERE thread_id = ?1)",
@@ -880,7 +983,8 @@ impl SyncStore for CoreSyncStore<'_> {
             .db
             .conn()
             .query_row(
-                "SELECT uidvalidity, uidnext, highest_modseq, last_sync_at, backfill_floor, backfill_target
+                "SELECT uidvalidity, uidnext, highest_modseq, last_sync_at, backfill_floor,
+                        backfill_target, resync_cursor, resync_completed_at
                  FROM sync_state WHERE account_id = ?1 AND folder_id = ?2",
                 params![self.account_id, self.folder_id],
                 |r| {
@@ -891,6 +995,15 @@ impl SyncStore for CoreSyncStore<'_> {
                         last_synced_at: r.get(3)?,
                         backfill_floor: r.get::<_, Option<i64>>(4)?.map(|v| v as u32),
                         backfill_target: r.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                        // T-157: the rolling reconciliation walk is a
+                        // background sweep measured in hours, so it only
+                        // works if it survives the restarts a desktop
+                        // client sees between two of its passes -- a
+                        // cursor kept in memory would restart the circle
+                        // from the top every launch and never reach the
+                        // bottom of the mailbox.
+                        resync_cursor: r.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+                        resync_completed_at: r.get(7)?,
                     })
                 },
             )
@@ -904,15 +1017,18 @@ impl SyncStore for CoreSyncStore<'_> {
             .conn()
             .execute(
                 "INSERT INTO sync_state
-                    (account_id, folder_id, uidvalidity, uidnext, highest_modseq, last_sync_at, backfill_floor, backfill_target)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    (account_id, folder_id, uidvalidity, uidnext, highest_modseq, last_sync_at,
+                     backfill_floor, backfill_target, resync_cursor, resync_completed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(account_id, folder_id) DO UPDATE SET
                     uidvalidity = excluded.uidvalidity,
                     uidnext = excluded.uidnext,
                     highest_modseq = excluded.highest_modseq,
                     last_sync_at = excluded.last_sync_at,
                     backfill_floor = excluded.backfill_floor,
-                    backfill_target = excluded.backfill_target",
+                    backfill_target = excluded.backfill_target,
+                    resync_cursor = excluded.resync_cursor,
+                    resync_completed_at = excluded.resync_completed_at",
                 params![
                     self.account_id,
                     self.folder_id,
@@ -922,6 +1038,8 @@ impl SyncStore for CoreSyncStore<'_> {
                     state.last_synced_at,
                     state.backfill_floor.map(i64::from),
                     state.backfill_target.map(i64::from),
+                    state.resync_cursor.map(i64::from),
+                    state.resync_completed_at,
                 ],
             )
             .map_err(store_err)?;
@@ -945,6 +1063,10 @@ impl SyncStore for CoreSyncStore<'_> {
         // visible" the same statement. Measured cost of the grouping on a
         // 200-header batch: 19.5ms autocommit vs 16.2ms in one transaction.
         let conn = self.db.conn();
+        // A previous batch that failed after de-duplicating a row rolled
+        // that deletion back, so anything still queued here belongs to rows
+        // that are alive again and must keep their bodies.
+        self.doomed_bodies.borrow_mut().clear();
         let tx = conn.unchecked_transaction().map_err(store_err)?;
         let mut seed = Vec::with_capacity(headers.len());
         for h in headers {
@@ -952,6 +1074,8 @@ impl SyncStore for CoreSyncStore<'_> {
         }
         self.assign_and_rollup(Some(&seed))?;
         tx.commit().map_err(store_err)?;
+        let doomed = std::mem::take(&mut *self.doomed_bodies.borrow_mut());
+        remove_cached_bodies(&doomed);
         Ok(())
     }
 
@@ -1081,6 +1205,10 @@ impl SyncStore for CoreSyncStore<'_> {
             }
         }
 
+        // Read while the rows still exist; the files go after the commit
+        // (see `remove_cached_bodies`).
+        let doomed_bodies = self.cached_body_paths(&msg_ids)?;
+
         let msg_placeholders = vec!["?"; msg_ids.len()].join(",");
         // Delete the FTS rows for these messages first: `messages_fts` is a
         // plain FTS5 virtual table with no FK to `messages` (and no
@@ -1109,6 +1237,26 @@ impl SyncStore for CoreSyncStore<'_> {
         // now-empty rows, then rewrite rollup on what remains.
         let thread_placeholders = vec!["?"; thread_ids.len()].join(",");
         if !thread_ids.is_empty() {
+            // Belt and braces with `drafts.thread_id`'s `ON DELETE SET
+            // NULL` (schema v28): a reply draft must not be able to wedge
+            // this folder's sync, and on a profile where that migration
+            // somehow did not land the FK would still be `NO ACTION` and
+            // the `DELETE` below would fail forever. Saying it here as well
+            // also states the semantics where they are decided -- the
+            // thread is gone, so the draft's pointer to it stopped being
+            // true; the draft itself is the owner's own text and stays
+            // (D29). Guarded by the same `NOT EXISTS` as the delete, so a
+            // thread that keeps other messages keeps its drafts too. The
+            // sibling merge path already does exactly this via
+            // `retarget_refs`.
+            conn.execute(
+                &format!(
+                    "UPDATE drafts SET thread_id = NULL WHERE thread_id IN ({thread_placeholders}) \
+                     AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.thread_id = drafts.thread_id)"
+                ),
+                rusqlite::params_from_iter(thread_ids.iter()),
+            )
+            .map_err(store_err)?;
             conn.execute(
                 &format!(
                     "DELETE FROM threads WHERE id IN ({thread_placeholders}) \
@@ -1121,6 +1269,7 @@ impl SyncStore for CoreSyncStore<'_> {
         }
 
         tx.commit().map_err(store_err)?;
+        remove_cached_bodies(&doomed_bodies);
         Ok(())
     }
 
@@ -1128,6 +1277,9 @@ impl SyncStore for CoreSyncStore<'_> {
         // Reached when UIDVALIDITY changed, i.e. the whole folder is being
         // thrown away and re-pulled. Half a wipe is the worst outcome here.
         let conn = self.db.conn();
+        // Read before the rows go; unlinked after the commit (see
+        // `remove_cached_bodies`).
+        let doomed_bodies = self.cached_body_paths_for_folder()?;
         let tx = conn.unchecked_transaction().map_err(store_err)?;
         conn.execute(
             "DELETE FROM messages_fts WHERE rowid IN \
@@ -1141,13 +1293,40 @@ impl SyncStore for CoreSyncStore<'_> {
             params![self.account_id, self.folder_id],
         )
         .map_err(store_err)?;
+        // Same two-level protection as `remove_vanished`: the schema's `ON
+        // DELETE SET NULL` (v28) would do this, and saying it here keeps a
+        // reply draft from making a whole folder unsyncable on a profile
+        // where that migration did not land. Every thread of this folder is
+        // going, so every draft pointing into it is detached -- and kept.
+        conn.execute(
+            "UPDATE drafts SET thread_id = NULL WHERE thread_id IN \
+             (SELECT id FROM threads WHERE account_id = ?1 AND folder_id = ?2)",
+            params![self.account_id, self.folder_id],
+        )
+        .map_err(store_err)?;
         conn.execute(
             "DELETE FROM threads WHERE account_id = ?1 AND folder_id = ?2",
             params![self.account_id, self.folder_id],
         )
         .map_err(store_err)?;
         tx.commit().map_err(store_err)?;
+        remove_cached_bodies(&doomed_bodies);
         Ok(())
+    }
+}
+
+/// Best-effort removal of the cached bodies whose `messages` rows this pass
+/// has just deleted.
+///
+/// Called *after* the transaction commits, never inside it: the file system
+/// does not roll back, so deleting first would let a rolled-back transaction
+/// leave a live row pointing at a body that is no longer there -- a message
+/// that opens to nothing and never re-fetches, which is worse than the
+/// failure mode this direction has (a crash between commit and unlink leaves
+/// an orphan file, exactly what `Core::remove_account` already accepts).
+fn remove_cached_bodies(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -1193,10 +1372,15 @@ const MONTHS: [&str; 12] = [
 ];
 
 fn month_index(s: &str) -> Option<u32> {
-    if s.len() < 3 {
-        return None;
-    }
-    let key = s[..3].to_ascii_lowercase();
+    // `str::get` -- not `s[..3]`. The token comes straight off the wire
+    // (`Date:` is whatever the sender wrote, `String::from_utf8_lossy`-d by
+    // the provider), so a three-*byte* prefix is not necessarily a three-
+    // *character* one: "Янв" is six bytes and byte 3 lands inside 'н',
+    // where slicing panics and takes the whole sync thread with it. `get`
+    // answers `None` both for a short token and for a byte offset that is
+    // not a char boundary, which is the same "not a month" this returns for
+    // any other garbage.
+    let key = s.get(..3)?.to_ascii_lowercase();
     MONTHS.iter().position(|m| *m == key).map(|i| i as u32 + 1)
 }
 
@@ -1419,8 +1603,16 @@ impl Core {
     /// construct one. `folder` is the same `folders.id` string
     /// [`Core::folder_sync_inputs`] hands back in each `FolderInput::id` --
     /// not the IMAP mailbox name, see [`CoreSyncStore`]'s own doc comment.
+    /// The bodies directory handed over is the profile default
+    /// ([`crate::body::default_bodies_dir`]), the same one
+    /// [`Core::remove_account`] assumes for exactly the same reason: the
+    /// cached file has to go when the row naming it does, and `service` --
+    /// the only production caller -- has no profile path of its own to pass
+    /// down. Tests that keep their bodies in a tempdir build the store
+    /// directly and say so with [`CoreSyncStore::with_bodies_dir`].
     pub fn sync_store(&self, account: &AccountId, folder: &str) -> CoreSyncStore<'_> {
         CoreSyncStore::new(&self.db, account.as_str(), folder)
+            .with_bodies_dir(crate::body::default_bodies_dir())
     }
 
     /// T-078 (b) prep: assembles [`feathermail_sync::schedule::next_sync`]'s
@@ -1968,6 +2160,45 @@ mod tests {
         );
     }
 
+    /// T-157: the rolling reconciliation walk is measured in hours and a
+    /// desktop client is restarted far more often than that, so the cursor
+    /// has to come back out of `sync_state` after the process is gone --
+    /// otherwise every launch reopens the circle at the top of the mailbox
+    /// and the bottom is never checked at all. This is the durable half of
+    /// the guarantee `feathermail_sync`'s
+    /// `the_walk_resumes_from_the_saved_cursor_after_a_restart` states over
+    /// an in-memory store.
+    #[test]
+    fn the_reconciliation_cursor_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mail.db");
+        {
+            let db = Database::open(&path).unwrap();
+            seed_account_and_folder(&db);
+            let mut store = CoreSyncStore::new(&db, "john", "inbox");
+            store
+                .save_state(
+                    "INBOX",
+                    &FolderSyncState {
+                        uidvalidity: Some(7),
+                        uidnext: Some(5000),
+                        resync_cursor: Some(4200),
+                        resync_completed_at: Some(1_700_000_000),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        let mut store = CoreSyncStore::new(&db, "john", "inbox");
+        let state = store.load_state("INBOX").unwrap();
+        assert_eq!(
+            (state.resync_cursor, state.resync_completed_at),
+            (Some(4200), Some(1_700_000_000))
+        );
+    }
+
     #[test]
     fn load_state_defaults_when_no_row_yet() {
         let db = Database::memory().unwrap();
@@ -1989,6 +2220,8 @@ mod tests {
             last_synced_at: Some(999),
             backfill_floor: Some(20),
             backfill_target: Some(50),
+            resync_cursor: Some(12),
+            resync_completed_at: Some(900),
         };
         store.save_state("INBOX", &state).unwrap();
         let loaded = store.load_state("INBOX").unwrap();
@@ -3811,5 +4044,306 @@ mod tests {
             "distinct gm_thrid must refuse JWZ merge through the store"
         );
         assert_eq!(thread_count(&db), 2);
+    }
+
+    /// A non-ASCII month token must be rejected, not sliced at byte 3.
+    #[test]
+    fn month_index_rejects_a_non_ascii_token() {
+        assert_eq!(month_index("Янв"), None);
+    }
+
+    /// Both date parsers share `month_index`, so both survive a month name
+    /// whose third byte is inside a character: no date rather than a panic.
+    #[test]
+    fn a_non_ascii_month_yields_no_date_instead_of_a_panic() {
+        assert_eq!(parse_rfc2822_date("Tue, 15 Янв 1994 08:12:31 -0500"), None);
+        assert_eq!(parse_internaldate("01-Янв-2024 00:00:00 +0000"), None);
+    }
+
+    /// End to end: a hostile `Date:` header must not blow up a sync batch.
+    /// The sender writes that header, nothing between the wire and here
+    /// validates it, and the sync worker runs with no `catch_unwind` above
+    /// it -- a panic here stops mail for every account until restart.
+    #[test]
+    fn upsert_headers_survives_a_non_ascii_date_header() {
+        let db = Database::memory().unwrap();
+        seed_account_and_folder(&db);
+        let mut store = CoreSyncStore::new(&db, "john", "inbox");
+        let h = header(
+            1,
+            "Hi",
+            "jane@example.com",
+            "Tue, 15 Янв 1994 08:12:31 -0500",
+        );
+        assert!(store
+            .upsert_headers("INBOX", std::slice::from_ref(&h))
+            .is_ok());
+    }
+
+    /// A reply draft pointing at a thread must not block that thread's
+    /// removal when its last message vanished on the server.
+    #[test]
+    fn a_reply_draft_does_not_wedge_remove_vanished() {
+        let db = Database::memory().unwrap();
+        seed_account_and_folder(&db);
+        let mut store = CoreSyncStore::new(&db, "john", "inbox");
+        let h = header(7, "Hello", "jane@example.com", "01 Jan 2024 10:00:00 +0000");
+        store
+            .upsert_headers("INBOX", std::slice::from_ref(&h))
+            .unwrap();
+        let thread_id: String = db
+            .conn()
+            .query_row(
+                "SELECT thread_id FROM messages WHERE provider_uid = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO drafts (id, account_id, thread_id, from_addr, updated_at)
+                 VALUES ('draft:john:1', 'john', ?1, 'john@example.com', 0)",
+                params![thread_id],
+            )
+            .unwrap();
+
+        store
+            .remove_vanished("INBOX", &[7])
+            .expect("a draft reply must not wedge the sync of its folder");
+
+        let threads_left: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(threads_left, 0);
+        let draft_thread: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT thread_id FROM drafts WHERE id = 'draft:john:1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(draft_thread, None, "the draft itself must survive");
+    }
+
+    /// The same for a UIDVALIDITY reset, which throws away every thread of
+    /// the folder: the drafts are detached, not deleted, and the folder can
+    /// be re-pulled.
+    #[test]
+    fn a_reply_draft_does_not_wedge_reset_folder() {
+        let db = Database::memory().unwrap();
+        seed_account_and_folder(&db);
+        let mut store = CoreSyncStore::new(&db, "john", "inbox");
+        let h = header(7, "Hello", "jane@example.com", "01 Jan 2024 10:00:00 +0000");
+        store
+            .upsert_headers("INBOX", std::slice::from_ref(&h))
+            .unwrap();
+        let thread_id: String = db
+            .conn()
+            .query_row(
+                "SELECT thread_id FROM messages WHERE provider_uid = 7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO drafts (id, account_id, thread_id, from_addr, updated_at)
+                 VALUES ('draft:john:1', 'john', ?1, 'john@example.com', 0)",
+                params![thread_id],
+            )
+            .unwrap();
+
+        store
+            .reset_folder("INBOX")
+            .expect("UIDVALIDITY reset must not be blocked by a draft");
+    }
+
+    /// A vanished message's cached body file must not outlive its row: the
+    /// row that named the file is gone, so nothing -- neither the cache
+    /// budget nor "Clear cache", both of which walk `messages` -- could
+    /// ever find it again.
+    #[test]
+    fn remove_vanished_deletes_the_cached_body_from_disk() {
+        let mut core = Core::memory().unwrap();
+        seed_account_and_folder(&core.db);
+        {
+            let mut store = CoreSyncStore::new(&core.db, "john", "inbox");
+            let h = header(7, "Hello", "jane@example.com", "01 Jan 2024 10:00:00 +0000");
+            store
+                .upsert_headers("INBOX", std::slice::from_ref(&h))
+                .unwrap();
+        }
+        let msg_id: String = core
+            .db
+            .conn()
+            .query_row("SELECT id FROM messages WHERE provider_uid = 7", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        core.store_body(
+            &crate::model::MessageId(msg_id.clone()),
+            dir.path(),
+            b"From: a@b\r\n\r\nsecret body",
+        )
+        .unwrap();
+        let rel: String = core
+            .db
+            .conn()
+            .query_row(
+                "SELECT body_path FROM messages WHERE id = ?1",
+                params![msg_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(dir.path().join(&rel).exists(), "precondition: body cached");
+
+        CoreSyncStore::new(&core.db, "john", "inbox")
+            .with_bodies_dir(dir.path())
+            .remove_vanished("INBOX", &[7])
+            .unwrap();
+
+        assert!(
+            !dir.path().join(&rel).exists(),
+            "the deleted message's body must not stay on disk"
+        );
+    }
+
+    /// A UIDVALIDITY reset throws away every row of the folder, so it has
+    /// to take every cached body with it -- otherwise a whole Inbox worth
+    /// of mail stays readable on disk while the cache budget, which only
+    /// sums `messages`, no longer knows the files exist.
+    #[test]
+    fn reset_folder_deletes_the_cached_bodies_from_disk() {
+        let mut core = Core::memory().unwrap();
+        seed_account_and_folder(&core.db);
+        {
+            let mut store = CoreSyncStore::new(&core.db, "john", "inbox");
+            let h = header(7, "Hello", "jane@example.com", "01 Jan 2024 10:00:00 +0000");
+            store
+                .upsert_headers("INBOX", std::slice::from_ref(&h))
+                .unwrap();
+        }
+        let msg_id: String = core
+            .db
+            .conn()
+            .query_row("SELECT id FROM messages WHERE provider_uid = 7", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        core.store_body(
+            &crate::model::MessageId(msg_id.clone()),
+            dir.path(),
+            b"From: a@b\r\n\r\nsecret body",
+        )
+        .unwrap();
+        let rel: String = core
+            .db
+            .conn()
+            .query_row(
+                "SELECT body_path FROM messages WHERE id = ?1",
+                params![msg_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(dir.path().join(&rel).exists(), "precondition: body cached");
+
+        CoreSyncStore::new(&core.db, "john", "inbox")
+            .with_bodies_dir(dir.path())
+            .reset_folder("INBOX")
+            .unwrap();
+
+        assert!(
+            !dir.path().join(&rel).exists(),
+            "a folder reset must not leave its bodies on disk"
+        );
+    }
+
+    /// The third deletion path: folding away the stale destination copy of
+    /// a message this client moved itself. Its thread goes with it, so a
+    /// draft pointing there is detached rather than blocking the batch, and
+    /// its cached body is unlinked once the batch has committed.
+    #[test]
+    fn de_duplicating_a_moved_message_frees_its_body_and_keeps_the_draft() {
+        let mut core = seed_real_move_core();
+        core.db
+            .conn()
+            .execute(
+                "INSERT INTO threads (id, account_id, folder_id, subject, snippet, date, unread)
+                 VALUES ('stale-thread', 'john', 'archive', 'Hello', 'Hello', 1704103200, 0)",
+                [],
+            )
+            .unwrap();
+        core.db
+            .conn()
+            .execute(
+                "INSERT INTO messages (
+                    id, account_id, thread_id, folder_id, provider_uid, message_id_header,
+                    date, sender_name, sender_email, subject, snippet, unread, size_bytes
+                 ) VALUES ('stale-message', 'john', 'stale-thread', 'archive', 99, '<m1@x>',
+                           1704103200, 'Sender', 'sender@example.com', 'Hello', 'Hello', 0, 100)",
+                [],
+            )
+            .unwrap();
+        core.db
+            .conn()
+            .execute(
+                "INSERT INTO drafts (id, account_id, thread_id, from_addr, updated_at)
+                 VALUES ('draft:john:1', 'john', 'stale-thread', 'john@example.com', 0)",
+                [],
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        core.store_body(
+            &crate::model::MessageId("stale-message".into()),
+            dir.path(),
+            b"From: a@b\r\n\r\nstale copy",
+        )
+        .unwrap();
+        let rel: String = core
+            .db
+            .conn()
+            .query_row(
+                "SELECT body_path FROM messages WHERE id = 'stale-message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(dir.path().join(&rel).exists(), "precondition: body cached");
+
+        core.dispatch(crate::command::Command::Archive {
+            account_id: crate::model::AccountId("john".into()),
+            thread_ids: vec![crate::model::ThreadId("t1".into())],
+        })
+        .unwrap();
+        core.db
+            .conn()
+            .execute("UPDATE operations SET status = 'acked'", [])
+            .unwrap();
+        CoreSyncStore::new(&core.db, "john", "inbox")
+            .remove_vanished("INBOX", &[7])
+            .unwrap();
+        CoreSyncStore::new(&core.db, "john", "archive")
+            .with_bodies_dir(dir.path())
+            .upsert_headers("Archive", &[moved_header(42)])
+            .expect("a draft on the stale copy's thread must not fail the batch");
+
+        assert!(
+            !dir.path().join(&rel).exists(),
+            "the folded-away copy's body must not stay on disk"
+        );
+        let draft_thread: Option<String> = core
+            .db
+            .conn()
+            .query_row(
+                "SELECT thread_id FROM drafts WHERE id = 'draft:john:1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(draft_thread, None, "the draft itself must survive");
     }
 }

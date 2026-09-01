@@ -143,19 +143,36 @@ impl RemoteLocator for Core {
         // subsequent command before the worker claims this operation. The
         // status guard also keeps this helper from replaying an already ACKed
         // operation if a caller invokes it outside the queue.
-        let operation: Option<(String, String)> = conn
+        let operation: Option<(String, String, String)> = conn
             .query_row(
-                "SELECT op, status FROM operations
+                "SELECT op, status, payload FROM operations
                  WHERE id = ?1 AND account_id = ?2 AND target_id = ?3",
                 params![operation_id, account_id.as_str(), thread_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(sql_err_apply)?;
-        if operation.as_ref().is_some_and(|(kind, status)| {
-            kind == OpKind::Move.as_str() && matches!(status.as_str(), "pending" | "running")
-        }) {
+        let live = operation
+            .as_ref()
+            .filter(|(_, status, _)| matches!(status.as_str(), "pending" | "running"));
+        if live.is_some_and(|(kind, _, _)| kind == OpKind::Move.as_str()) {
             return self.thread_messages(account_id, thread_id);
+        }
+        // `PermanentDelete` is the one operation whose targets must never be
+        // re-resolved live: `UID EXPUNGE` cannot be undone, so a reply that
+        // joined the thread while the operation sat in the queue (offline, or
+        // in network backoff) would be destroyed by a command issued before it
+        // arrived. It cannot use `operation_moves` either -- the queue reads a
+        // row there as an active MOVE and would rehome the message -- so
+        // `store::permanent_delete_payload` freezes the coordinates in the
+        // operation's own payload at dispatch, and this reads them back.
+        // An operation queued before that payload existed resolves to nothing
+        // and fails closed as `NotFound`, which is the right way round for an
+        // irreversible delete.
+        if let Some((_, _, payload)) =
+            live.filter(|(kind, _, _)| kind == OpKind::PermanentDelete.as_str())
+        {
+            return Ok(permanent_delete_targets(payload));
         }
 
         // Core-created Archive/Trash overlays deliberately have no durable
@@ -245,6 +262,55 @@ impl RemoteLocator for Core {
         }
         self.remote_folder(account_id, folder_key)
     }
+}
+
+/// Reads back the `{"targets":[{"folder":"…","uid":N},…]}` snapshot
+/// `store::permanent_delete_payload` writes at dispatch. Mirror image of
+/// that writer (only `\` and `"` are ever escaped), in the same
+/// dependency-free spirit as `store::json_string_field`.
+///
+/// Anything malformed stops the scan and keeps what parsed so far only up to
+/// that point: a truncated payload must not be rounded up into "delete the
+/// whole thread".
+fn permanent_delete_targets(payload: &str) -> Vec<RemoteMessage> {
+    const FOLDER: &str = "\"folder\":\"";
+    const UID: &str = "\"uid\":";
+    let mut out = Vec::new();
+    let Some((_, mut rest)) = payload.split_once("\"targets\":[") else {
+        return out;
+    };
+    while let Some(at) = rest.find(FOLDER) {
+        let value_at = at + FOLDER.len();
+        let mut chars = rest[value_at..].char_indices();
+        let mut folder = String::new();
+        let end = loop {
+            let Some((i, c)) = chars.next() else {
+                return out;
+            };
+            match c {
+                '\\' => match chars.next() {
+                    Some((_, escaped)) => folder.push(escaped),
+                    None => return out,
+                },
+                '"' => break value_at + i + 1,
+                _ => folder.push(c),
+            }
+        };
+        rest = &rest[end..];
+        let Some(uid_at) = rest.find(UID) else {
+            return out;
+        };
+        let digits: String = rest[uid_at + UID.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        rest = &rest[uid_at + UID.len() + digits.len()..];
+        match digits.parse::<u32>() {
+            Ok(uid) if !folder.is_empty() => out.push(RemoteMessage { folder, uid }),
+            _ => return out,
+        }
+    }
+    out
 }
 
 /// Maps a well-known [`RemoteLocator::remote_folder`] key to the
@@ -653,5 +719,124 @@ mod tests {
             .thread_messages(&AccountId("acc1".into()), "does-not-exist")
             .unwrap();
         assert!(messages.is_empty());
+    }
+
+    // --- PermanentDelete resolves the snapshot taken at dispatch ---
+
+    fn queue_permanent_delete(core: &mut Core, thread: &str) -> String {
+        core.dispatch_with_receipt(crate::command::Command::PermanentDelete {
+            account_id: AccountId("acc1".into()),
+            thread_ids: vec![crate::model::ThreadId(thread.into())],
+        })
+        .unwrap()
+        .operations
+        .into_iter()
+        .next()
+        .expect("PermanentDelete queues a provider operation")
+        .operation_id
+        .as_str()
+        .to_string()
+    }
+
+    /// `UID EXPUNGE` cannot be undone, so the targets are whatever the thread
+    /// held when the user pressed the button -- not whatever it holds when
+    /// the worker finally gets to the operation. A reply that lands while the
+    /// operation waits (offline, or in backoff) must survive.
+    #[test]
+    fn permanent_delete_targets_are_frozen_when_the_command_is_queued() {
+        let mut core = Core::memory().unwrap();
+        seed_folder(
+            &core,
+            "acc1",
+            "acc1:inbox",
+            FolderKind::Inbox,
+            Some("INBOX"),
+        );
+        seed_message(&core, "acc1", "t1", "m1", "acc1:inbox", Some(7));
+        let operation_id = queue_permanent_delete(&mut core, "t1");
+
+        // Sync brings a reply on the same thread after the command was queued.
+        seed_message(&core, "acc1", "t1", "m2", "acc1:inbox", Some(999));
+
+        let account = AccountId("acc1".into());
+        assert_eq!(
+            core.thread_messages_for_operation(&account, "t1", &operation_id)
+                .unwrap(),
+            vec![RemoteMessage {
+                folder: "INBOX".into(),
+                uid: 7,
+            }],
+            "the snapshot must not grow after dispatch"
+        );
+        assert_eq!(
+            core.thread_messages(&account, "t1").unwrap().len(),
+            2,
+            "the live view is unchanged: only PermanentDelete freezes"
+        );
+    }
+
+    /// A mailbox name with a quote or a backslash has to survive the payload
+    /// round trip, or the EXPUNGE would be aimed at a different mailbox.
+    #[test]
+    fn a_snapshot_survives_a_mailbox_name_that_needs_escaping() {
+        let mut core = Core::memory().unwrap();
+        seed_folder(
+            &core,
+            "acc1",
+            "acc1:odd",
+            FolderKind::Inbox,
+            Some(r#"Q1 "plan"\draft"#),
+        );
+        seed_message(&core, "acc1", "t1", "m1", "acc1:odd", Some(7));
+        let operation_id = queue_permanent_delete(&mut core, "t1");
+        assert_eq!(
+            core.thread_messages_for_operation(&AccountId("acc1".into()), "t1", &operation_id)
+                .unwrap(),
+            vec![RemoteMessage {
+                folder: r#"Q1 "plan"\draft"#.into(),
+                uid: 7,
+            }]
+        );
+    }
+
+    /// An operation queued before Core started writing the snapshot resolves
+    /// to nothing, so `ImapMailProvider` answers `NotFound` instead of
+    /// expunging a thread nobody described.
+    #[test]
+    fn a_permanent_delete_with_no_snapshot_resolves_to_nothing() {
+        let mut core = Core::memory().unwrap();
+        seed_folder(
+            &core,
+            "acc1",
+            "acc1:inbox",
+            FolderKind::Inbox,
+            Some("INBOX"),
+        );
+        seed_message(&core, "acc1", "t1", "m1", "acc1:inbox", Some(7));
+        let operation_id = queue_permanent_delete(&mut core, "t1");
+        core.db
+            .conn()
+            .execute(
+                "UPDATE operations SET payload = '{}' WHERE id = ?1",
+                params![operation_id],
+            )
+            .unwrap();
+        assert!(core
+            .thread_messages_for_operation(&AccountId("acc1".into()), "t1", &operation_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_truncated_snapshot_never_widens_into_the_whole_thread() {
+        assert!(permanent_delete_targets("{}").is_empty());
+        assert!(permanent_delete_targets(r#"{"targets":[]}"#).is_empty());
+        assert_eq!(
+            permanent_delete_targets(r#"{"targets":[{"folder":"INBOX","uid":7},{"folder":"Sen"#),
+            vec![RemoteMessage {
+                folder: "INBOX".into(),
+                uid: 7,
+            }]
+        );
     }
 }

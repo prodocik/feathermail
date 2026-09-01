@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use feathermail_core::{format_clock, Importance, ListRow, Thread, FIXTURE_NOW};
+use feathermail_core::{format_clock, Importance, ListRow, Thread};
 use feathermail_html::decode_encoded_words;
 use gtk::prelude::*;
 use relm4::gtk;
@@ -20,6 +20,24 @@ pub struct MailRow {
     /// warm-up's last message -- wore a preloader that would never resolve.
     /// A preloader that cannot finish is not a preloader; it is furniture.
     pub preview_pending: bool,
+    /// Unix seconds the row's timestamp is measured against, taken once
+    /// per painted page. The same clock `stamp_headers` stamps the date
+    /// header with, so the two halves of one row cannot answer "when did
+    /// this arrive" from different clocks -- and never a fixture constant,
+    /// which pushed every real letter into `format_clock`'s "Today" branch.
+    pub now: i64,
+    /// T-161: the folder chip this row shows, or `None` for no chip.
+    ///
+    /// Decided by the shell (`App::row_chip_label`) and handed down as a
+    /// value, exactly the way `now` is. It used to be derived here from
+    /// `Thread.labels`, which `Core::map_thread` fills with an empty
+    /// vector for every row it maps out of SQLite -- so the chip DESIGN.md
+    /// promises was dead code that never painted once. What the reader
+    /// actually needs it for is a list that mixes folders: Starred,
+    /// Snoozed, the merged view. In an ordinary folder every row would say
+    /// the same thing as the column heading, so the shell sends `None` and
+    /// nothing is drawn.
+    pub chip: Option<String>,
     pub sender: Sender<Msg>,
 }
 
@@ -458,7 +476,13 @@ impl RelmListItem for MailRow {
                 // fired for a widget that was reused underneath it. The strip
                 // is put away one line above for the same reason.
                 widgets.star.set_visible(true);
-                bind_thread(widgets, t, self.preview_pending);
+                bind_thread(
+                    widgets,
+                    t,
+                    self.chip.as_deref(),
+                    self.preview_pending,
+                    self.now,
+                );
             }
         }
     }
@@ -497,11 +521,11 @@ thread_local! {
 /// cannot drift apart. Only mapped rows are considered: an unmapped entry is
 /// a widget sitting in GTK's recycling pool, which will be bound from the
 /// model before it is shown again. Returns whether a card was repainted.
-pub fn repaint_live_row(t: &Thread, preview_pending: bool) -> bool {
+pub fn repaint_live_row(t: &Thread, chip: Option<&str>, preview_pending: bool, now: i64) -> bool {
     LIVE_ROWS.with(|rows| {
         for w in rows.borrow().iter() {
             if w.thread.is_mapped() && w.id.borrow().as_str() == t.id.as_str() {
-                bind_thread(w, t, preview_pending);
+                bind_thread(w, t, chip, preview_pending, now);
                 return true;
             }
         }
@@ -509,7 +533,13 @@ pub fn repaint_live_row(t: &Thread, preview_pending: bool) -> bool {
     })
 }
 
-fn bind_thread(w: &MailRowWidgets, t: &Thread, preview_pending: bool) {
+fn bind_thread(
+    w: &MailRowWidgets,
+    t: &Thread,
+    chip: Option<&str>,
+    preview_pending: bool,
+    now: i64,
+) {
     w.id.replace(t.id.as_str().to_string());
     let sender = display_sender(t);
     if t.message_count > 1 {
@@ -518,7 +548,7 @@ fn bind_thread(w: &MailRowWidgets, t: &Thread, preview_pending: bool) {
     } else {
         w.sender_label.set_label(&sender);
     }
-    w.time.set_label(&format_clock(t.date, FIXTURE_NOW));
+    w.time.set_label(&format_clock(t.date, now));
     w.subject.set_label(&display_subject(&t.subject));
     // T-097(7), T-099: text, or a preloader, or an empty slot -- exactly one
     // of the three, all 34px tall, so nothing on the card moves when the
@@ -537,7 +567,9 @@ fn bind_thread(w: &MailRowWidgets, t: &Thread, preview_pending: bool) {
             display_subject(&t.subject)
         ))]);
     w.attach.set_visible(t.has_attachment);
-    if let Some(label) = display_label(t) {
+    // T-161: the chip is the shell's answer, not this row's. See
+    // `MailRow::chip`.
+    if let Some(label) = chip {
         w.label_chip.set_visible(true);
         w.label_chip.set_label(label);
     } else {
@@ -610,15 +642,6 @@ pub(crate) fn display_subject(subject: &str) -> String {
     } else {
         cleaned
     }
-}
-
-fn display_label(t: &Thread) -> Option<&str> {
-    t.labels.iter().map(String::as_str).find(|l| {
-        !matches!(
-            *l,
-            "Inbox" | "Sent" | "Drafts" | "Trash" | "Spam" | "Archive" | "Snoozed"
-        )
-    })
 }
 
 /// T-032: one ghost button with a left-aligned label, shared by the
@@ -724,6 +747,13 @@ mod tests {
     fn joined(parts: &[&str]) -> String {
         parts.concat()
     }
+
+    /// The one row-painting door, spelled out once: three contracts below
+    /// anchor on it and rustfmt owns where its parameter list breaks.
+    const BIND_THREAD_SIGNATURE: &str = concat!(
+        "fn bind_thread(\n    w: &MailRowWidgets,\n    t: &Thread,\n",
+        "    chip: Option<&str>,\n    preview_pending: bool,\n    now: i64,\n) {"
+    );
 
     /// T-054 (D39): the hover watch belongs to the overlay that holds both
     /// the row and the strip. On `thread` alone, the pointer reaching a
@@ -1025,10 +1055,7 @@ mod tests {
             "the selection model's own state is what must paint the card"
         );
         let src = include_str!("rows.rs");
-        let bind = extract_brace_body(
-            src,
-            "fn bind_thread(w: &MailRowWidgets, t: &Thread, preview_pending: bool) {",
-        );
+        let bind = extract_brace_body(src, BIND_THREAD_SIGNATURE);
         assert!(
             !bind.contains(&joined(&["add_css_class(\"select", "ed\")"])),
             "nothing in a row may write the selection back onto the widget"
@@ -1042,10 +1069,7 @@ mod tests {
     #[test]
     fn the_row_skeleton_means_loading_and_animates() {
         let src = include_str!("rows.rs");
-        let bind = extract_brace_body(
-            src,
-            "fn bind_thread(w: &MailRowWidgets, t: &Thread, preview_pending: bool) {",
-        );
+        let bind = extract_brace_body(src, BIND_THREAD_SIGNATURE);
         assert!(
             bind.contains("let loading = preview.is_empty() && preview_pending;"),
             "an empty preview alone is not a loading preview"
@@ -1123,6 +1147,33 @@ mod tests {
                 && setup.contains("Msg::ToggleStar(id)"),
             "the strip must carry the star it covers, through the same \
              ToggleStar door the row star uses"
+        );
+    }
+
+    /// T-161: the chip is painted from the value the shell handed down,
+    /// and this file has no other source for one. It used to be derived
+    /// here from `Thread.labels`, which `Core::map_thread` fills with an
+    /// empty vector for every row it maps -- so `display_label` returned
+    /// `None` on every real letter and the chip DESIGN.md promises never
+    /// appeared. Mutation: read `t.labels` here again -> this test is red.
+    #[test]
+    fn the_row_chip_comes_from_the_shell_not_from_thread_labels() {
+        let src = include_str!("rows.rs");
+        let bind = extract_brace_body(src, BIND_THREAD_SIGNATURE);
+        assert!(
+            bind.contains("if let Some(label) = chip {")
+                && bind.contains("w.label_chip.set_label(label);"),
+            "the chip is the argument, not something this file works out"
+        );
+        let live = src.split(&joined(&["mod ", "tests"])).next().unwrap();
+        assert!(
+            !live.contains(&joined(&["t.la", "bels"])),
+            "`Thread.labels` is empty on every row Core maps, so a chip \
+             built from it can only ever be invisible"
+        );
+        assert!(
+            live.contains("pub chip: Option<String>,"),
+            "the row carries the shell's answer the same way it carries `now`"
         );
     }
 
@@ -1213,16 +1264,41 @@ mod tests {
         );
         let live = extract_brace_body(
             src,
-            "pub fn repaint_live_row(t: &Thread, preview_pending: bool) -> bool {",
+            "pub fn repaint_live_row(t: &Thread, chip: Option<&str>, preview_pending: bool, now: i64) -> bool {",
         );
         assert!(
-            live.contains("bind_thread(w, t, preview_pending);"),
+            live.contains("bind_thread(w, t, chip, preview_pending, now);"),
             "the in-place repaint must not grow its own copy of bind_thread"
         );
         assert!(
             live.contains("w.thread.is_mapped()"),
             "an unmapped entry is a widget in GTK's recycling pool: it is \
              bound from the model before it is ever shown again"
+        );
+    }
+
+    /// A row's timestamp and the date header directly above it must come
+    /// from one clock. Against the fixture constant every letter newer than
+    /// 2024-05-20 fell into `format_clock`'s "Today" branch and printed a
+    /// time of day, so a row under an "Older" header read "3:42 PM". The
+    /// needle is built by concatenation so this test's own source cannot
+    /// satisfy it.
+    #[test]
+    fn a_list_rows_time_is_measured_against_the_wall_clock() {
+        let src = include_str!("rows.rs");
+        let live = src.split(&joined(&["mod ", "tests"])).next().unwrap();
+        assert!(
+            !live.contains(&joined(&["FIXTURE", "_NOW"])),
+            "a rendered row's timestamp must be measured against the same \
+             wall clock `stamp_headers` uses, not the fixture constant"
+        );
+        // And the clock reaches the label as a value, so `rows` never has
+        // to know where the shell reads it.
+        let bind = extract_brace_body(src, BIND_THREAD_SIGNATURE);
+        assert!(
+            bind.contains("format_clock(t.date, now)"),
+            "the row's timestamp is measured against the page's own reading \
+             of the clock"
         );
     }
 }

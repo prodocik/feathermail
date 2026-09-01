@@ -1290,4 +1290,30 @@ Content-Transfer-Encoding: {encoding_canary}
         assert_eq!(msg.body, BodyContent::Empty);
         assert_eq!(msg.attachments.len(), 1);
     }
+
+    #[test]
+    fn multipart_with_transport_padding_shows_the_body() {
+        // RFC 2046 §5.1.1 transport-padding after the boundary used to make
+        // the whole multipart unsplittable, so the reader saw an empty
+        // message plus one bogus "attachment" holding the entire body.
+        // Padded and unpadded must now parse identically -- including the
+        // second body-shaped leaf that multipart/mixed deliberately lists
+        // as an attachment (see `find_body_leaf`).
+        let padded = b"Content-Type: multipart/mixed; boundary=X\r\n\r\n--X \r\nContent-Type: text/plain\r\n\r\nfirst\r\n--X \t\r\nContent-Type: text/html\r\n\r\n<p>second</p>\r\n--X-- \r\n";
+        let bare = b"Content-Type: multipart/mixed; boundary=X\r\n\r\n--X\r\nContent-Type: text/plain\r\n\r\nfirst\r\n--X\r\nContent-Type: text/html\r\n\r\n<p>second</p>\r\n--X--\r\n";
+        let msg = parse_message(padded, true);
+        let reference = parse_message(bare, true);
+        assert_eq!(plain(&msg), "first");
+        assert_eq!(plain(&msg), plain(&reference));
+        assert_eq!(msg.attachments.len(), reference.attachments.len());
+        assert_eq!(msg.attachments[0].content_type, "text/html");
+    }
+
+    #[test]
+    fn rfc2231_attachment_filename_reaches_attachment_info() {
+        let raw = b"Content-Type: multipart/mixed; boundary=X\r\n\r\n--X\r\nContent-Type: text/plain\r\n\r\nbody\r\n--X\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename*=UTF-8''%D0%94%D0%BE%D0%B3%D0%BE%D0%B2%D0%BE%D1%80.pdf\r\n\r\n%PDF\r\n--X--\r\n";
+        let msg = parse_message(raw, true);
+        assert_eq!(msg.attachments.len(), 1, "{:?}", msg.attachments);
+        assert_eq!(msg.attachments[0].name.as_deref(), Some("Договор.pdf"));
+    }
 }

@@ -26,6 +26,39 @@ impl NotificationPayload {
             thread_id,
         }
     }
+
+    /// T-159: one notification standing for a whole tick's worth of new
+    /// mail, rather than one per letter.
+    ///
+    /// A sync tick that lands more unread mail than the shell is willing
+    /// to post individually used to lose the overflow for good: the limit
+    /// cut the oldest, the watermark moved past everything it announced,
+    /// and nothing ever brought the cut letters back as candidates. A
+    /// summary covers all of them at once, so the watermark may clear the
+    /// lot honestly.
+    ///
+    /// It has no thread: it is about the mailbox, not about one letter,
+    /// and the click opens that mailbox's Inbox. That is also why the id
+    /// has its own prefix -- a summary and a per-letter notification for
+    /// the same mailbox are different notifications, and neither may
+    /// replace the other. `take_for_account` still finds it (marking the
+    /// mailbox read makes it untrue), `take_for_threads` deliberately does
+    /// not: reading one of the letters it counts does not make the count
+    /// wrong about the others.
+    pub fn summary(
+        account_id: impl Into<String>,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Self {
+        let account_id = account_id.into();
+        Self {
+            id: format!("new-mail-summary:{account_id}"),
+            title: title.into(),
+            subject: body.into(),
+            account_id,
+            thread_id: String::new(),
+        }
+    }
 }
 
 /// The notifications this process has handed to the desktop shell and is
@@ -198,6 +231,48 @@ mod tests {
             .is_empty());
         assert!(registry.take_for_account("someone-else").is_empty());
         assert_eq!(registry.take_all(), vec![kept.id]);
+    }
+
+    /// T-159: the summary is the shell's to withdraw like any other, and
+    /// it must not collide with -- or be collided with by -- the
+    /// per-letter notifications for the same mailbox.
+    #[test]
+    fn a_burst_summary_is_withdrawn_with_its_account_and_never_replaces_a_letter() {
+        let mut registry = PostedNotifications::default();
+        let letter = posted("work", "t1");
+        let summary = NotificationPayload::summary("work", "Work", "25 new messages");
+        assert_ne!(summary.id, letter.id, "two notifications, two ids");
+        registry.record(&letter);
+        registry.record(&summary);
+        assert!(
+            registry
+                .take_for_threads(&["t1".to_string()])
+                .contains(&letter.id),
+            "reading the letter withdraws the letter"
+        );
+        assert_eq!(
+            registry.take_all(),
+            vec![summary.id.clone()],
+            "and leaves the summary, which is about the other letters too"
+        );
+
+        let mut registry = PostedNotifications::default();
+        registry.record(&summary);
+        registry.record(&posted("home", "t1"));
+        assert_eq!(
+            registry.take_for_account("work"),
+            vec![summary.id],
+            "marking that mailbox read is what makes the summary untrue"
+        );
+    }
+
+    /// D14: a summary counts letters, it does not quote them.
+    #[test]
+    fn a_burst_summary_carries_no_sender_and_no_subject() {
+        let summary = NotificationPayload::summary("a", "Work", "25 new messages");
+        assert_eq!(summary.title, "Work");
+        assert_eq!(summary.subject, "25 new messages");
+        assert!(summary.thread_id.is_empty(), "a summary is about a mailbox");
     }
 
     #[test]

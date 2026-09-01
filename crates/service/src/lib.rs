@@ -38,12 +38,14 @@
 //! synchronously from a GTK callback: the shell talks to the worker by
 //! sending it a command and receiving events back.
 
+pub mod autoconfig;
 pub mod bodylog;
 pub mod connector;
 pub mod provider_factory;
 pub mod provision;
 pub mod worker;
 
+pub use autoconfig::{spawn_autoconfig, AutoconfigOutcome, LOOKUP_TIMEOUT};
 pub use connector::ConnectorKind;
 pub use provider_factory::{ImapProviderFactory, MailSession, ProviderFactory};
 pub use provision::{spawn_provision, OauthProvider, ProvisionRequest};

@@ -37,7 +37,7 @@ pub fn assign_groups(hints: &[ThreadHint]) -> Vec<String> {
     if n == 0 {
         return Vec::new();
     }
-    let mut uf = UnionFind::new(n);
+    let mut uf = UnionFind::new_with(hints);
 
     // Already one thread in the store: keep them together regardless of
     // headers (a previous pass, or Gmail thrid written on 1:1 rows).
@@ -72,7 +72,7 @@ pub fn assign_groups(hints: &[ThreadHint]) -> Vec<String> {
     for (i, h) in hints.iter().enumerate() {
         for id in related_ids(h) {
             if let Some(&j) = by_mid.get(&id) {
-                try_union(&mut uf, hints, i, j);
+                try_union(&mut uf, i, j);
             } else {
                 by_mid.insert(id, i);
             }
@@ -94,28 +94,27 @@ pub fn assign_groups(hints: &[ThreadHint]) -> Vec<String> {
     (0..n).map(|i| survivor[&uf.find(i)].clone()).collect()
 }
 
-fn try_union(uf: &mut UnionFind, hints: &[ThreadHint], a: usize, b: usize) {
-    if a == b {
+fn try_union(uf: &mut UnionFind, a: usize, b: usize) {
+    if uf.find(a) == uf.find(b) {
         return;
     }
-    let ta = component_gm_thrid(uf, hints, a);
-    let tb = component_gm_thrid(uf, hints, b);
+    let ta = component_gm_thrid(uf, a);
+    let tb = component_gm_thrid(uf, b);
     match (ta, tb) {
         (Some(x), Some(y)) if x != y => {}
         _ => uf.union(a, b),
     }
 }
 
-fn component_gm_thrid(uf: &mut UnionFind, hints: &[ThreadHint], i: usize) -> Option<String> {
+/// The component's `gm_thrid`, if any member carries one -- O(alpha),
+/// since each component's value now lives in the union-find itself
+/// (`UnionFind::thrid`, kept in sync by `union`) instead of being
+/// recomputed by scanning every hint on every call. Clones the (short)
+/// string rather than borrowing it, so two calls in a row (see
+/// `try_union`) don't fight over `uf`'s mutable borrow.
+fn component_gm_thrid(uf: &mut UnionFind, i: usize) -> Option<String> {
     let root = uf.find(i);
-    for (k, h) in hints.iter().enumerate() {
-        if uf.find(k) == root {
-            if let Some(t) = nonempty(h.gm_thrid.as_deref()) {
-                return Some(t.to_string());
-            }
-        }
-    }
-    None
+    uf.thrid[root].clone()
 }
 
 fn related_ids(h: &ThreadHint) -> Vec<String> {
@@ -144,12 +143,22 @@ fn nonempty(s: Option<&str>) -> Option<&str> {
 
 struct UnionFind {
     parent: Vec<usize>,
+    /// Each component root's `gm_thrid`, if any member carries one. Kept
+    /// in sync by `union` so `component_gm_thrid` is a `find` plus a
+    /// lookup instead of a scan over every hint (see core-domain-03: that
+    /// scan made `assign_groups` quadratic in folder size).
+    thrid: Vec<Option<String>>,
 }
 
 impl UnionFind {
-    fn new(n: usize) -> Self {
+    fn new_with(hints: &[ThreadHint]) -> Self {
+        let thrid = hints
+            .iter()
+            .map(|h| nonempty(h.gm_thrid.as_deref()).map(str::to_string))
+            .collect();
         Self {
-            parent: (0..n).collect(),
+            parent: (0..hints.len()).collect(),
+            thrid,
         }
     }
 
@@ -167,10 +176,10 @@ impl UnionFind {
         if pa == pb {
             return;
         }
-        if pa < pb {
-            self.parent[pb] = pa;
-        } else {
-            self.parent[pa] = pb;
+        let (new_root, old_root) = if pa < pb { (pa, pb) } else { (pb, pa) };
+        self.parent[old_root] = new_root;
+        if self.thrid[new_root].is_none() {
+            self.thrid[new_root] = self.thrid[old_root].take();
         }
     }
 }
@@ -178,6 +187,51 @@ impl UnionFind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `assign_and_rollup` loads the *whole folder* and calls this on every
+    /// 200-header batch, inside the sync write transaction. So the cost of
+    /// one call has to grow with the folder, not with the folder squared.
+    /// `component_gm_thrid` used to walk all `n` hints (calling `find` on
+    /// each) for every JWZ id match, which made this O(n^2); it now reads
+    /// the component's `gm_thrid` straight out of the union-find.
+    ///
+    /// Shape below: one root plus `n-1` replies to it -- an ordinary
+    /// mailing-list thread. Budget is deliberately loose (a linear
+    /// implementation measures ~11ms here in a debug build).
+    #[test]
+    fn assign_groups_is_not_quadratic_in_folder_size() {
+        const N: usize = 20_000;
+        let hints: Vec<ThreadHint> = (0..N)
+            .map(|i| ThreadHint {
+                row_id: format!("thr:{i:06}"),
+                message_id: Some(format!("<m{i}@x>")),
+                in_reply_to: (i > 0).then(|| "<m0@x>".to_string()),
+                references: if i == 0 {
+                    Vec::new()
+                } else {
+                    vec!["<m0@x>".to_string()]
+                },
+                gm_thrid: None,
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        let groups = assign_groups(&hints);
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            groups
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            1,
+            "the whole reply chain is one conversation"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "assign_groups on {N} folder-local hints took {elapsed:?}; it is quadratic"
+        );
+    }
 
     fn hint(
         row_id: &str,
@@ -294,6 +348,33 @@ mod tests {
     #[test]
     fn empty_input_is_empty_output() {
         assert!(assign_groups(&[]).is_empty());
+    }
+
+    /// `by_row` merges same-`row_id` hints unconditionally, before either
+    /// hint's `gm_thrid` is considered -- with the union-find now carrying
+    /// one `thrid` per component (`UnionFind::thrid`, set once when a
+    /// component gets its first non-empty value and never overwritten,
+    /// mirroring the old scan's `for k in 0..n` "first match wins" order),
+    /// that merged component's `thrid` must still correctly refuse a later
+    /// JWZ link (`try_union`, via In-Reply-To) to a hint carrying a
+    /// *different* `gm_thrid` -- exactly the case `distinct_gm_thrid_does_not_merge_even_when_jwz_would`
+    /// covers for two single-hint components, now checked through a
+    /// multi-hint one.
+    #[test]
+    fn a_row_id_merged_components_thrid_still_blocks_a_conflicting_jwz_link() {
+        let hints = vec![
+            hint("thr:x", Some("<a@x>"), None, &[], Some("111")),
+            hint("thr:x", Some("<b@x>"), None, &[], None),
+            hint("thr:y", Some("<c@x>"), Some("<b@x>"), &[], Some("222")),
+        ];
+        let assigned = groups(&hints);
+        assert_eq!(assigned[0], assigned[1], "same row_id always merges");
+        assert_eq!(
+            unique_count(&assigned),
+            2,
+            "hint 2's gm_thrid (222) conflicts with the row_id-merged component's thrid (111), \
+             so the In-Reply-To link to hint 1 must not merge it in"
+        );
     }
 
     #[test]

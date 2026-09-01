@@ -1337,7 +1337,7 @@ fn run(
                         &core,
                         &mut account_cursor,
                         &mut account_count,
-                        &connect_backoff,
+                        &mut connect_backoff,
                         now,
                     )
                 });
@@ -1365,7 +1365,19 @@ fn run(
                     .into_iter()
                     .flatten()
                     .min()
-                    .unwrap_or(MAX_IDLE_POLL_SECS);
+                    .unwrap_or(MAX_IDLE_POLL_SECS)
+                    // Floor of one second. Nothing here is supposed to
+                    // produce a zero, but this arm is the one place where a
+                    // zero would not merely waste a pass: `clock.wait(.., 0)`
+                    // degrades to `recv_timeout(0)`, so the loop would come
+                    // straight back, re-run `wake_due_snoozes` and three
+                    // more queries, and ask for zero again -- a tight loop
+                    // against the profile database for as long as the
+                    // process lives (D30: "никакого tight loop"). The
+                    // shortest real deadline anything can ask for is the
+                    // D32 two-second backoff, so a one-second floor cannot
+                    // delay a legitimate wake-up.
+                    .max(1);
                     if wait_for_shutdown(&rx, &clock, wait, &pending_fetches) {
                         return;
                     }
@@ -2548,14 +2560,25 @@ fn watch_inbox_for_push(
 /// when a sweep of per-account `Idle`s has actually covered all of them.
 /// Returns `None` when there are no accounts at all yet (fresh profile,
 /// Welcome screen still showing).
+///
+/// Takes `backoff` by `&mut` for one reason: this is the only place in the
+/// loop that reads the profile's current account list, so it is also the
+/// only place that can tell a backoff entry apart from an entry for an
+/// account that no longer exists. An account removed while it was serving a
+/// backoff (Settings -> Remove does not restart the worker) would otherwise
+/// leave its entry behind forever, and `soonest_retry` would keep answering
+/// "due now" for a mailbox nobody can connect to any more.
 fn pick_account(
     core: &Core,
     cursor: &mut usize,
     count: &mut usize,
-    backoff: &HashMap<String, (u32, i64)>,
+    backoff: &mut HashMap<String, (u32, i64)>,
     now: i64,
 ) -> Option<AccountId> {
     let accounts = core.list_accounts().ok()?;
+    // Prune before the empty check, not after: "the last account was just
+    // removed" is exactly the case that leaves an orphan behind.
+    backoff.retain(|id, _| accounts.iter().any(|a| a.id.as_str() == id));
     if accounts.is_empty() {
         return None;
     }
@@ -8375,6 +8398,151 @@ mod tests {
         assert_eq!(
             cooldown_until, 0,
             "a successful call must clear the cooldown"
+        );
+    }
+
+    /// A `ProviderFactory` whose `connect` never succeeds, so the worker
+    /// always lands in `connect_backoff` and never holds a session.
+    struct UnreachableFactory;
+
+    impl ProviderFactory for UnreachableFactory {
+        fn connect(&mut self, _account: &AccountId) -> Result<Box<dyn MailSession>, ConnectError> {
+            Err(ConnectError::network("host is not answering"))
+        }
+    }
+
+    /// Like [`FakeClock`], but records every `timeout_secs` the loop asks to
+    /// wait for. A zero-length wait in the "nothing to connect to" arm is a
+    /// tight loop in production (`SystemClock::wait` degrades to
+    /// `recv_timeout(0)`), so the recorded values are the assertion.
+    struct RecordingWaitClock {
+        now: Arc<Mutex<i64>>,
+        waits: Arc<Mutex<Vec<i64>>>,
+    }
+
+    impl WorkerClock for RecordingWaitClock {
+        fn now(&self) -> i64 {
+            *self.now.lock().unwrap()
+        }
+
+        fn wait(&self, rx: &Receiver<WorkerCommand>, timeout_secs: i64) -> Option<WorkerCommand> {
+            self.waits.lock().unwrap().push(timeout_secs);
+            if let Ok(cmd) = rx.recv_timeout(Duration::from_millis(1)) {
+                return Some(cmd);
+            }
+            *self.now.lock().unwrap() += timeout_secs.max(0);
+            None
+        }
+    }
+
+    /// `pick_account` is the loop's only reader of the live account list, so
+    /// it is also what has to drop backoff entries for accounts that are no
+    /// longer in the profile -- including when the list has become empty and
+    /// the early return would otherwise skip the pruning entirely.
+    #[test]
+    fn picking_an_account_drops_backoff_entries_for_accounts_that_are_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mail.db");
+        {
+            Core::open(&path).unwrap();
+        }
+        seed_account_with_own_rows(&path, "acc1");
+        let core = Core::open(&path).unwrap();
+
+        let mut backoff: HashMap<String, (u32, i64)> = HashMap::new();
+        backoff.insert("acc1".to_string(), (1, 0));
+        backoff.insert("removed".to_string(), (3, 0));
+        let mut cursor = 0usize;
+        let mut count = 0usize;
+
+        let picked = pick_account(&core, &mut cursor, &mut count, &mut backoff, 100);
+        assert_eq!(picked.as_ref().map(|a| a.as_str()), Some("acc1"));
+        assert_eq!(
+            backoff.keys().collect::<Vec<_>>(),
+            vec!["acc1"],
+            "an entry for an account the profile no longer has must not survive"
+        );
+
+        // And once the last account goes too, the map empties instead of
+        // keeping a permanently-due deadline nobody can act on.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("DELETE FROM accounts WHERE id = 'acc1'", [])
+            .unwrap();
+        assert!(pick_account(&core, &mut cursor, &mut count, &mut backoff, 100).is_none());
+        assert!(backoff.is_empty());
+        assert_eq!(soonest_retry(&backoff, 100), None);
+    }
+
+    /// Removing the only account (Settings -> Remove, which does *not*
+    /// restart the worker) must leave the loop idling, not spinning. The
+    /// removed account's `connect_backoff` entry outlives it unless
+    /// something prunes it, and once its `next_attempt_at` passes,
+    /// `soonest_retry` answers `0` while `pick_account` answers `None` --
+    /// a zero-length wait asked for again and again, i.e. a tight loop
+    /// against the profile database for the life of the process.
+    #[test]
+    fn removing_the_last_account_does_not_leave_the_worker_spinning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mail.db");
+        {
+            Core::open(&path).unwrap();
+        }
+        seed_account_with_own_rows(&path, "acc1");
+
+        let now = Arc::new(Mutex::new(1_000_000i64));
+        let waits: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+        let clock = RecordingWaitClock {
+            now: Arc::clone(&now),
+            waits: Arc::clone(&waits),
+        };
+        let events: Arc<Mutex<Vec<SyncEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_for_worker = Arc::clone(&events);
+        let handle = start_with_clock(
+            path.clone(),
+            UnreachableFactory,
+            move |e| {
+                events_for_worker.lock().unwrap().push(e);
+            },
+            clock,
+            FixedPower(false),
+        );
+
+        // The account is unreachable, so the worker records a D32 backoff
+        // entry for it.
+        wait_until(
+            || {
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::ConnectFailed { .. }))
+            },
+            Duration::from_secs(5),
+        );
+
+        // The user removes it. The worker keeps running against the same
+        // profile -- `Msg::RemoveAccountConfirm` never restarts it.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.busy_timeout(Duration::from_secs(5)).unwrap();
+            conn.execute("DELETE FROM accounts WHERE id = 'acc1'", [])
+                .unwrap();
+        }
+
+        let before = waits.lock().unwrap().len();
+        wait_until(
+            || waits.lock().unwrap().len() >= before + 200,
+            Duration::from_secs(10),
+        );
+        handle.shutdown();
+
+        let recorded = waits.lock().unwrap().clone();
+        let tail: Vec<i64> = recorded[recorded.len().saturating_sub(100)..].to_vec();
+        assert!(
+            tail.iter().all(|secs| *secs > 0),
+            "with no account left to connect to the worker must sleep, not ask for a \
+             zero-length wait over and over: {tail:?}"
         );
     }
 }

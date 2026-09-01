@@ -42,11 +42,101 @@
 //! - An empty query (or one that is only whitespace) means "show
 //!   everything", not "match nothing" — `to_search_plan` returns
 //!   `fts_match: None` for it, since `MATCH ''` is an FTS5 syntax error.
+//!
+//! # Index/query normalization (T-155)
+//!
+//! [`fts_text`] is the one normalization the index and the query must
+//! agree on before FTS5's `unicode61` tokenizer sees either of them: it
+//! folds Cyrillic `ё` to `е` and puts a space at every boundary touching a
+//! CJK character. It lives here, next to the parser, precisely so there is
+//! a single definition for both sides — see its doc comment.
 
 /// Workspace probe so `cargo test -p feathermail-search` has a test even
 /// before the parser existed. Kept for continuity with earlier scaffolding.
 pub fn crate_name() -> &'static str {
     env!("CARGO_PKG_NAME")
+}
+
+/// Normalize text so that the FTS5 `unicode61` tokenizer produces the
+/// tokens a human expects (T-155).
+///
+/// **This is one half of a pair.** The exact same function must be applied
+/// to the text that goes *into* `messages_fts` and to the text of every
+/// term/phrase that comes *out* of [`Query::to_search_plan`]. Applying it
+/// on one side only silently breaks search rather than erroring: the index
+/// holds one spelling and the query asks for another, and FTS5 answers
+/// "no rows". Core calls it in its indexer (`crates/core/src/search.rs`,
+/// `index_one`); this crate calls it in `escape_fts_literal`. There is no
+/// third caller, and a new writer of `messages_fts` must use it too.
+///
+/// It fixes exactly two things `unicode61` gets wrong for this mailbox:
+///
+/// 1. **Cyrillic `ё`.** `unicode61` folds case (so `СЧЁТ` is findable as
+///    `счёт`) but `ё` and `е` stay two different letters, so a user typing
+///    `счет` never finds `СЧЁТ`. Russian writing treats the two as
+///    interchangeable, so both sides fold `ё`/`Ё` to `е`/`Е`.
+/// 2. **CJK runs.** `unicode61` splits on non-alphanumeric characters, and
+///    every Han ideograph and kana sign is "alphanumeric" to it, so a whole
+///    Japanese sentence written without spaces is *one* token. D54 searches
+///    for a literal phrase (no `*`), so `東京` inside
+///    `今日の会議は東京で行われました` could never be found. A space is
+///    inserted at every boundary that touches a CJK character, which makes
+///    each such character a token of its own; the query `東京` then becomes
+///    the two-token phrase `"東 京"` and matches consecutive tokens.
+///
+/// Nothing else is touched: Latin, Cyrillic, Hangul, Arabic and the rest
+/// come back byte-for-byte unchanged, and the function is idempotent (a
+/// boundary that already has whitespace does not get another space).
+///
+/// The result is *index-only* text. It is not what the user typed and must
+/// never be shown back to a human — the UI's snippets come from
+/// `messages.snippet`, never from an FTS column, and nothing in the
+/// codebase reads a column of `messages_fts` back out.
+#[must_use]
+pub fn fts_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev: Option<char> = None;
+    for ch in raw.chars() {
+        let ch = match ch {
+            'ё' => 'е',
+            'Ё' => 'Е',
+            other => other,
+        };
+        // A boundary needs a space when at least one of its two sides is a
+        // CJK character. Between two of them that is what turns a run into
+        // one-token-per-character; on the edge of a run it is what keeps a
+        // mixed word like `東京Tokyo` from indexing as `東 京Tokyo` while
+        // the query for `Tokyo` alone asks for the bare token `tokyo`.
+        // Whitespace on either side means the boundary is already split,
+        // which is also what makes this idempotent.
+        if let Some(prev) = prev {
+            if (is_cjk(prev) || is_cjk(ch)) && !prev.is_whitespace() && !ch.is_whitespace() {
+                out.push(' ');
+            }
+        }
+        out.push(ch);
+        prev = Some(ch);
+    }
+    out
+}
+
+/// Han ideographs and kana — the scripts that write words without spaces
+/// and that `unicode61` therefore glues into a single token.
+///
+/// Hangul is deliberately **not** here: Korean is written with spaces
+/// between words, so `unicode61` already tokenizes it the way a reader
+/// expects, and splitting every syllable block would only make phrases
+/// longer for no gain. Neither is CJK punctuation (U+3000–U+303F), which
+/// `unicode61` already treats as a separator.
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        u32::from(ch),
+        0x3040..=0x30FF        // Hiragana + Katakana
+            | 0x3400..=0x4DBF  // CJK Unified Ideographs Extension A
+            | 0x4E00..=0x9FFF  // CJK Unified Ideographs
+            | 0xF900..=0xFAFF  // CJK Compatibility Ideographs
+            | 0x2_0000..=0x2_FA1F // SIP: Extensions B-F + Compatibility Supplement
+    )
 }
 
 /// A parsed search query: an ordered list of filters, all combined with AND.
@@ -349,10 +439,20 @@ fn operator_or_term(raw: &str, value: &str, build: impl FnOnce(&str) -> Filter) 
 /// is what stops user input like `OR`, `NEAR(a b)`, `*`, or a literal `"`
 /// from being interpreted as FTS5 syntax instead of being searched for
 /// literally.
+///
+/// The text is first put through [`fts_text`], the same normalization the
+/// indexer applies before writing `messages_fts` (T-155) — the two must
+/// agree or nothing matches. Normalizing *inside* the quotes is what makes
+/// a CJK word searchable: `東京` becomes the phrase `"東 京"`, two tokens
+/// that must appear next to each other, which is exactly what the user
+/// asked for and still not a wildcard (D54 stays a literal search). The
+/// quoting and quote-doubling are unchanged and still applied to the
+/// normalized text, so no input can escape the literal.
 fn escape_fts_literal(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len() + 2);
+    let normalized = fts_text(raw);
+    let mut out = String::with_capacity(normalized.len() + 2);
     out.push('"');
-    for ch in raw.chars() {
+    for ch in normalized.chars() {
         if ch == '"' {
             out.push('"');
         }
@@ -422,7 +522,7 @@ fn days_in_month(year: u16, month: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{crate_name, Addressee, Date, Filter, IsFlag, Predicate, Query};
+    use super::{crate_name, fts_text, Addressee, Date, Filter, IsFlag, Predicate, Query};
 
     #[test]
     fn crate_compiles() {
@@ -778,6 +878,102 @@ mod tests {
         assert_eq!(
             query.filters,
             vec![Filter::Term("has:calendar".to_string())]
+        );
+    }
+
+    // -- T-155: index/query normalization ------------------------------------
+
+    #[test]
+    fn normalization_folds_cyrillic_yo_to_ye_in_both_cases() {
+        assert_eq!(fts_text("Оплатите СЧЁТ"), "Оплатите СЧЕТ");
+        assert_eq!(fts_text("ёжик"), "ежик");
+        assert_eq!(fts_text("Ёлка"), "Елка");
+    }
+
+    #[test]
+    fn normalization_splits_a_cjk_run_into_one_token_per_character() {
+        assert_eq!(
+            fts_text("今日の会議は東京で行われました"),
+            "今 日 の 会 議 は 東 京 で 行 わ れ ま し た"
+        );
+    }
+
+    #[test]
+    fn normalization_turns_a_cjk_query_word_into_a_two_token_phrase() {
+        // This is the whole point: the query and the indexed body are put
+        // through the same function, so `東 京` in the query lines up with
+        // `... 東 京 で ...` in the index.
+        let plan = Query::parse("東京").to_search_plan();
+        assert_eq!(plan.fts_match.as_deref(), Some("\"東 京\""));
+    }
+
+    #[test]
+    fn normalization_leaves_latin_text_byte_for_byte_alone() {
+        let latin = "Quarterly report from john@example.com (Q3, 2026) -- 100% done";
+        assert_eq!(fts_text(latin), latin);
+    }
+
+    #[test]
+    fn normalization_leaves_cyrillic_without_yo_and_hangul_alone() {
+        assert_eq!(fts_text("Оплатите счет"), "Оплатите счет");
+        // Korean is written with spaces already; splitting syllable blocks
+        // would be churn, so Hangul is not in the CJK set.
+        assert_eq!(fts_text("안녕하세요 여러분"), "안녕하세요 여러분");
+    }
+
+    #[test]
+    fn normalization_separates_cjk_from_the_latin_glued_to_it() {
+        // Without the boundary space the index would hold the token
+        // `京tokyo`, and a search for either half alone would miss it.
+        assert_eq!(fts_text("東京Tokyo"), "東 京 Tokyo");
+        assert_eq!(fts_text("Tokyo東京"), "Tokyo 東 京");
+    }
+
+    #[test]
+    fn normalization_does_not_add_a_second_space_where_one_exists() {
+        assert_eq!(
+            fts_text("Meeting in 東京 tomorrow"),
+            "Meeting in 東 京 tomorrow"
+        );
+    }
+
+    #[test]
+    fn normalization_is_idempotent() {
+        for raw in [
+            "今日の会議は東京で行われました",
+            "Оплатите СЧЁТ пожалуйста",
+            "東京Tokyo ёлка",
+            "plain latin text",
+            "",
+        ] {
+            let once = fts_text(raw);
+            assert_eq!(fts_text(&once), once, "not idempotent for {raw:?}");
+        }
+    }
+
+    #[test]
+    fn normalization_applies_inside_a_phrase_without_losing_the_escaping() {
+        let plan = Query::parse("\"счёт 東京\"").to_search_plan();
+        assert_eq!(plan.fts_match.as_deref(), Some("\"счет 東 京\""));
+    }
+
+    #[test]
+    fn normalization_applies_to_from_and_subject_values() {
+        let plan = Query::parse("from:Королёв subject:東京").to_search_plan();
+        assert_eq!(
+            plan.fts_match.as_deref(),
+            Some("sender:\"Королев\" subject:\"東 京\"")
+        );
+    }
+
+    #[test]
+    fn normalization_never_lets_a_quote_break_out_of_the_literal() {
+        let query = Query {
+            filters: vec![Filter::Term("счёт \" 東京".to_string())],
+        };
+        assert_eq!(
+            query.to_search_plan().fts_match.as_deref(),
+            Some("\"счет \"\" 東 京\"")
         );
     }
 }

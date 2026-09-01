@@ -8,8 +8,8 @@ colors:
   paper-wash: "#F1F5FD"
   paper-selected: "#E5ECFD"
   ink: "#0B0C0E"
-  ink-secondary: "#6B7280"
-  ink-tertiary: "#9AA0AB"
+  ink-secondary: "#5B6270"
+  ink-tertiary: "#697080"
   hairline: "#EEF0F3"
   stroke-soft: "#E6E8EE"
   accent: "#1A64FC"
@@ -144,14 +144,14 @@ components:
     backgroundColor: "{colors.paper-pane}"
     textColor: "{colors.ink}"
     rounded: "{rounded.md}"
-    padding: "14px 20px"
-    height: "128px"
+    padding: "10px 10px 10px 16px"
+    height: "96px"
   message-row-selected:
     backgroundColor: "{colors.paper-wash}"
     textColor: "{colors.ink}"
     rounded: "{rounded.md}"
-    padding: "14px 20px"
-    height: "128px"
+    padding: "10px 10px 10px 16px"
+    height: "96px"
   chip-folder:
     backgroundColor: "{colors.paper-recess}"
     textColor: "{colors.ink-secondary}"
@@ -217,8 +217,8 @@ components:
 - **Selection Wash** (`paper-wash`, `#F1F5FD`): выбранная строка письма (~8% акцента).
 - **Nav Selected** (`paper-selected`, `#E5ECFD`): активный Inbox в сайдбаре (плотнее wash).
 - **Ink** (`ink`, `#0B0C0E`): заголовки и тело. На мокапе глифы письма почти `#000`; для GTK/a11y держим чуть мягче, не `#15171A` из ТЗ — тот серее, чем кадр.
-- **Ink Secondary** (`ink-secondary`, `#6B7280`): подписи, время, иконки тулбара, email в сайдбаре (~`#747677` на кадре; канон ТЗ совпал достаточно).
-- **Ink Tertiary** (`ink-tertiary`, `#9AA0AB`): preview-строка, плейсхолдер Reply, секция «Folders».
+- **Ink Secondary** (`ink-secondary`, `#5B6270`): подписи, время, иконки тулбара, email в сайдбаре (~`#747677` на кадре; канон ТЗ совпал достаточно). T-160: затемнён с `#6B7280` до WCAG AA 4.5:1 на всех фонах бумаги (paper-pane/sidebar/recess/wash/selected).
+- **Ink Tertiary** (`ink-tertiary`, `#697080`): preview-строка, плейсхолдер Reply, секция «Folders». T-160: затемнён с `#9AA0AB` до WCAG AA 4.5:1 на бумаге; единственное исключение — на `paper-selected` контраст 4.20:1, выше порога 3:1 для крупного текста/UI.
 - **Hairline** (`hairline`, `#EEF0F3`): вертикальные сплиттеры сайдбар/список/превью.
 - **Stroke Soft** (`stroke-soft`, `#E6E8EE`): обводка Reply-бара.
 
@@ -258,6 +258,8 @@ components:
 
 Непрочитанное в списке: sender и subject тем же кеглем, но **650**. Прочитанное: 400 / secondary на preview.
 
+Строка списка идёт на ступень ниже этой шкалы (решение T-097(1)): `.msg-sender`/`.msg-subject` — 14px (не Title 16px и не Body-sm 15px), `.msg-preview` — 13px (не Body-sm 15px), `.msg-time` — 12px (не Label 13px). Шкала Hierarchy описывает приложение в целом, список — сознательное исключение из неё, а не расхождение с ней.
+
 **The One Face Rule.** Никакого второго шрифта в оболочке. HTML-письмо внутри WebKit может нести свои лица — это контент, не хром.
 
 ## Layout
@@ -272,7 +274,8 @@ components:
 
 - Сайдбар не скроллит вместе с письмами. Account block сверху, секция **All Inbox** (системные ящики Inbox…Trash), затем **Folders** + `+`, settings/theme прибиты к низу. All Inbox — заголовок раздела текущего аккаунта, не сводный ящик всех аккаунтов.
 - Вертикальные сплиттеры — hairline, без drag-handle визуала (resize можно, ручку не рисовать).
-- Ритм **8px**. Внутренние поля колонок 20–32px. Nav item 40px, gap 4px. Колонка списка — `paper-recess` (в dark — чуть темнее панелей); строки — `paper-pane` ~128px (sender, subject, две строки preview + 14px vertical padding) + **12px gap**. Выбранная строка — 9% акцента на pane, чтобы карточка не слипалась со столом. Зазор читается как бумага стола, не как тень карточки.
+- Ритм **8px**. Внутренние поля колонок 20–32px. Nav item 40px, gap 4px. Колонка списка — `paper-recess` (в dark — чуть темнее панелей); строки — `paper-pane` 96px (76px контента: sender 19 + subject 19 + preview 34 + два зазора 2px, плюс 10px vertical padding) + **8px gap** (T-097(1,2)). Внутренние поля строки — 10px сверху/снизу/справа и 16px слева (T-099: звезда и hover-плашка отступают от угла карточки на 10px, текст слева не прижат к краю). Выбранная строка — 9% акцента на pane, чтобы карточка не слипалась со столом. Зазор читается как бумага стола, не как тень карточки.
+- Осознанные исключения из ритма 8px (T-097(4)/T-099): `.msg-row` padding `10px 10px 10px 16px`, `.quick-actions` `margin-top: 10px; margin-right: 22px` (12+10), `.pull-refresh-bubble` padding `7px`. Не «выравнивать» их обратно на сетку без отдельной задачи.
 - Группы дат («Today») — 13px label, воздух сверху от предыдущего блока, 8px снизу до первой строки. Не карточки-секции.
 - Превью: subject и мета в ~32px полях; тело 16px с шириной меры ~60–70ch, не на всю колонку в 4K.
 - Compact density (настройка): row 72px, nav 36px, gap 4px, те же радиусы. **Comfortable = дефолт, воздух как у Kanmail.** Compact ≈ прежний packed-мокап.
@@ -316,7 +319,7 @@ components:
 - Высота 48px, пилюля, заливка `paper-recess`, без обводки в покое.
 - Лупа 16px secondary слева, плейсхолдер «Search mail» 15px tertiary.
 - Справа отдельная **клавишная пилюля** `/` — ещё светлее, ~30×30, 13px label.
-- Focus: 2px accent ring с offset 2px (единственное место, где ring допустим — клавиатурный фокус, не selection).
+- Focus: ринга нет (T-097(5)). Клавиатурная обратная связь — accent-подчёркивание активного поля Compose (`.compose-grid entry.compose-field:focus-within`) и выделение строки списка из selection-модели.
 
 ### Sidebar navigation
 
@@ -375,7 +378,7 @@ components:
 
 - Под мета-строкой письма: `paper-recess`, hairline 1px, радиус 12px, padding 8×12px; без тени и без акцентной заливки.
 - Слева paperclip 16px `ink-secondary`; имя — Body-sm 15/500 `ink`, вторая строка `MIME · size` — Label 13/500 `ink-secondary`.
-- Справа `Open` и `Save as`: тихие text-actions 13px, высота не ниже 32px, `paper-pane` + `stroke-soft`, радиус 12px. Hover = `paper-wash`; disabled = tertiary. Keyboard focus остаётся 2px `accent` ring.
+- Справа `Open` и `Save as`: тихие text-actions 13px, высота не ниже 32px, `paper-pane` + `stroke-soft`, радиус 12px. Hover = `paper-wash`; disabled = tertiary.
 
 ### Thread stack (ветка из нескольких писем)
 
@@ -409,11 +412,11 @@ components:
 
 ### Reply bar
 
-- Прибит к низу превью и выровнен по левому краю. Обводка `stroke-soft` 1px, радиус 12px, компактная высота 40px, внутри стрелка reply + «Reply to {Name}» tertiary. Не полноценный composer.
+- Прибит к низу превью и выровнен по левому краю. Обводка `stroke-soft` 1px, радиус 12px, компактная высота 38px, внутри стрелка reply + «Reply to {Name}» tertiary. Не полноценный composer.
 
 ### Chips
 
-- Метка папки у subject: recess, 12px, пилюля, secondary text. Не accent.
+- Метка папки у subject: recess, 13px, пилюля, secondary text. Не accent.
 
 ### Toast (Undo, нет на кадре — наследовать)
 
@@ -444,11 +447,11 @@ components:
 - **Do** брать палитру и радиусы из frontmatter. Мокап — суд структуры и цвета; кегль и воздух — D70.
 - **Do** держать Compose единственной заливной синей поверхностью на экране (плюс мелкие точки/счётчики).
 - **Do** виртуализировать список: стиль строки не имеет права требовать полных DOM-карточек.
-- **Do** рисовать focus ring только для клавиатуры, 2px accent.
 - **Do** в GTK мапить токены в CSS variables один-в-один (`--paper-sidebar`, `--accent`, …).
 
 ### Don't:
 
+- **Don't** возвращать focus ring — он снят решением T-097(5); возврат роняет `nothing_wears_a_focus_ring_and_nothing_falls_back_to_the_host_theme` (crates/app/src/main.rs).
 - **Don't** ставить календарную иконку в тулбар — её нет в продукте MVP, даже если она на кадре. Тулбар: Archive, Delete, Unread, Snooze, Read, Overflow.
 - **Don't** тёплый off-white, terracotta, glassmorphism, градиенты, огромные тени, 24px иконки.
 - **Don't** Inter Display / serif / mono в Inbox.

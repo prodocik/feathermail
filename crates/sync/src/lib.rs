@@ -15,7 +15,12 @@
 //!   changed `CHANGEDSINCE` the last known `HIGHESTMODSEQ`;
 //! - a changed `UIDVALIDITY` invalidates the folder's local state and forces
 //!   a full metadata re-sync;
-//! - vanished UIDs are removed locally;
+//! - vanished UIDs are removed locally: every completed pass re-checks the
+//!   newest [`RECONCILE_WINDOW`] UIDs against the server plus one
+//!   [`UID_FETCH_BATCH`] of a rolling walk down the rest of the mailbox
+//!   ([`FolderSyncState::resync_cursor`]), and a server without CONDSTORE
+//!   additionally gets a whole-range flags reconciliation every
+//!   [`FULL_RECONCILE_INTERVAL_SECS`] (D29/D30);
 //! - progress is only ever persisted after a batch's headers are durably
 //!   written, so a network error mid-run cannot lose progress or leave a
 //!   gap, and a resumed run never re-downloads an already-saved batch;
@@ -31,6 +36,38 @@ use std::fmt;
 /// Batch size for `UID FETCH` during backfill and delta pulls. Kept small so
 /// the first folder open can paint before a big mailbox finishes backfilling.
 pub const UID_FETCH_BATCH: u32 = 200;
+
+/// How many of the newest UIDs every completed pass reconciles against the
+/// server (D29 "UID vanished -> локально удалить metadata+body").
+///
+/// Neither half of a normal pass can notice a message that disappeared: the
+/// backfill walks downwards once and never returns, `pull_new_mail` only
+/// ever walks UIDs *above* the cursor, and a CONDSTORE delta reports changed
+/// flags, not gone mail (this crate's session trait has no VANISHED/QRESYNC
+/// channel at all). So each pass re-checks the newest window — the end of
+/// the mailbox where mail is actually read, filed and deleted — at a cost of
+/// exactly one extra `UID FETCH`, never a `1:*` sweep.
+///
+/// Everything *below* the window is reached by the rolling walk instead
+/// ([`FolderSyncState::resync_cursor`], T-157): one more batch per pass, so
+/// the whole mailbox is still covered, just not all at once.
+pub const RECONCILE_WINDOW: u32 = UID_FETCH_BATCH;
+
+/// How rarely a folder gets a *whole-range* reconciliation instead of just
+/// the newest [`RECONCILE_WINDOW`] (D30: without CONDSTORE, "иначе —
+/// периодическая полная сверка флагов"). Measured from the last completed
+/// pass, and only ever taken on a server that reports no `HIGHESTMODSEQ`:
+/// where CONDSTORE exists the flags delta already covers the whole mailbox
+/// every pass, and re-fetching every envelope in a 200k mailbox to learn
+/// what CONDSTORE just told us for free is exactly the sweep this window
+/// scheme exists to avoid.
+///
+/// Also the cool-down between two circles of the rolling walk
+/// ([`FolderSyncState::resync_completed_at`]): a walk that reached UID 1
+/// starts over no sooner than this, so a folder is swept end to end at
+/// roughly the cadence D30 asks for whether or not the server has
+/// CONDSTORE.
+pub const FULL_RECONCILE_INTERVAL_SECS: i64 = 6 * 60 * 60;
 
 /// One message's metadata (headers only — bodies are T-024). Also used for
 /// flags-only updates (CONDSTORE `CHANGEDSINCE`, or a plain flags re-fetch),
@@ -108,6 +145,28 @@ pub struct FolderSyncState {
     /// only ever caught by [`pull_new_mail`], never by adopting a newer
     /// snapshot's `uidnext` directly.
     pub backfill_target: Option<u32>,
+    /// T-157: resume point of the rolling reconciliation walk — the highest
+    /// UID below the newest [`RECONCILE_WINDOW`] that has not been checked
+    /// against the server yet. `None` means no walk is in progress: either
+    /// none has ever started, or the last one reached UID 1 and stamped
+    /// [`Self::resync_completed_at`].
+    ///
+    /// The walk exists because nothing else in a pass can notice mail that
+    /// vanished *below* the newest window: the backfill walks down once and
+    /// never returns, `pull_new_mail` only ever goes up, and a CONDSTORE
+    /// delta reports changed flags, not gone mail. The whole-range sweep
+    /// [`reconcile_known_range`] takes without CONDSTORE is not available
+    /// there either — with CONDSTORE it would re-read every envelope in the
+    /// mailbox to learn what the delta already gave for free. So the walk
+    /// moves one [`UID_FETCH_BATCH`] per pass instead: one extra `UID
+    /// FETCH`, never a `1:*`, and the whole mailbox covered eventually.
+    pub resync_cursor: Option<u32>,
+    /// When the last rolling walk reached UID 1. The next circle starts no
+    /// sooner than [`FULL_RECONCILE_INTERVAL_SECS`] after it — the same
+    /// cadence D30 gives the whole-range sweep, and a separate clock from
+    /// [`Self::last_synced_at`], which moves on every successful pass and
+    /// so can never say when a circle closed.
+    pub resync_completed_at: Option<i64>,
 }
 
 /// Everything the sync engine needs from a live IMAP connection.
@@ -337,7 +396,8 @@ where
         state.backfill_floor = None;
     }
 
-    if state.backfill_floor.is_some() {
+    let backfill_ran = state.backfill_floor.is_some();
+    if backfill_ran {
         run_backfill(
             session,
             store,
@@ -404,16 +464,194 @@ where
         }
     }
 
-    state.last_synced_at = Some(now);
+    // Reconciliation against the server (D29 vanished mail, D30 periodic
+    // full flags check). Deliberately the last step of the pass: by the time
+    // it runs, everything this pass owed the folder has already been fetched
+    // and saved, so interrupting it costs nothing but the reconciliation
+    // itself.
+    //
+    // Skipped while a backfill is outstanding *or* ran in this very pass:
+    // `detect_vanished` over a range the store was never given rows for is
+    // precisely the mistake [`fetch_range`] warns about, and a range this
+    // pass just fetched has nothing to reconcile against anyway.
+    if !outcome.cancelled && !backfill_ran && state.backfill_floor.is_none() {
+        reconcile_known_range(
+            session,
+            store,
+            folder,
+            snapshot,
+            now,
+            &mut state,
+            is_cancelled,
+            &mut outcome,
+        )?;
+    }
+
+    // A cancelled pass kept its progress but did **not** finish syncing the
+    // folder, and `last_synced_at` is exactly `schedule::next_sync`'s "how
+    // long since the last *successful* sync" input. Stamping it here would
+    // park a half-done backfill for a whole scheduler interval every time a
+    // click in the reading pane yielded the socket (T-118). `save_state`
+    // stays unconditional -- it is also what persists `backfill_floor`,
+    // `uidnext` and `highest_modseq`.
+    if !outcome.cancelled {
+        state.last_synced_at = Some(now);
+    }
     store.save_state(folder, &state)?;
 
     Ok(outcome)
 }
 
+/// Re-check a range the store already has rows for: whatever the server
+/// still returns updates flags, whatever it no longer returns is gone (D29).
+///
+/// Three parts, in this order:
+/// 1. one [`RECONCILE_WINDOW`]-wide window at the top of the UID space,
+///    every pass — the end of the mailbox where mail is actually read,
+///    filed and deleted;
+/// 2. on a server without CONDSTORE, and no more often than
+///    [`FULL_RECONCILE_INTERVAL_SECS`], the whole synced range instead of
+///    that window (D30) — which also closes the walk below, since it has
+///    just checked everything the walk would;
+/// 3. otherwise one [`UID_FETCH_BATCH`] of the rolling walk below the
+///    window ([`FolderSyncState::resync_cursor`], T-157). That is the only
+///    thing that ever looks below the window on a CONDSTORE server, where
+///    part 2 is deliberately never taken.
+///
+/// Budget: one `UID FETCH` for the window plus at most one for the walk.
+/// Never a `1:*`, and never a second walk batch to "catch up" — a pass that
+/// falls behind simply covers the mailbox a little later.
+///
+/// Cancellation stops the walk but does **not** mark the pass cancelled:
+/// the substantive sync already completed above, and reporting the pass as
+/// unfinished would keep the folder permanently due — on a client that
+/// yields the socket often, a sweep that can never finish would then be
+/// restarted from the bottom on every single pass. For the same reason a
+/// cancellation leaves `resync_cursor` exactly where it was: the batch it
+/// stopped before is simply the next pass's batch.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_known_range<M, S>(
+    session: &mut M,
+    store: &mut S,
+    folder: &str,
+    snapshot: MailboxSnapshot,
+    now: i64,
+    state: &mut FolderSyncState,
+    is_cancelled: &dyn Fn() -> bool,
+    outcome: &mut SyncOutcome,
+) -> Result<(), SyncError>
+where
+    M: MailboxSession,
+    S: SyncStore,
+{
+    let top = snapshot.uidnext.saturating_sub(1);
+    if top == 0 {
+        return Ok(());
+    }
+    let full_due = snapshot.highest_modseq.is_none()
+        && state
+            .last_synced_at
+            .is_some_and(|last| now.saturating_sub(last) >= FULL_RECONCILE_INTERVAL_SECS);
+    let window_bottom = top.saturating_sub(RECONCILE_WINDOW - 1).max(1);
+    let bottom = if full_due { 1 } else { window_bottom };
+    if !reconcile_span(session, store, folder, bottom, top, is_cancelled, outcome)? {
+        return Ok(());
+    }
+    if full_due {
+        // The sweep just read every UID the rolling walk exists to reach,
+        // so the circle is closed by it rather than duplicated after it.
+        state.resync_cursor = None;
+        state.resync_completed_at = Some(now);
+        return Ok(());
+    }
+    let cursor = match state.resync_cursor {
+        // A mailbox that shrank (UIDs expunged from the top) can leave a
+        // stored cursor above the current top; clamp rather than re-read a
+        // range that no longer exists.
+        Some(cursor) => cursor.min(top),
+        None => {
+            let due = state
+                .resync_completed_at
+                .is_none_or(|done| now.saturating_sub(done) >= FULL_RECONCILE_INTERVAL_SECS);
+            if !due {
+                return Ok(());
+            }
+            if window_bottom <= 1 {
+                // The window already covers the whole mailbox: there is
+                // nothing below it to walk, and the circle is complete the
+                // moment it opens. Stamping it keeps a small folder from
+                // re-deciding this on every single pass.
+                state.resync_completed_at = Some(now);
+                return Ok(());
+            }
+            window_bottom - 1
+        }
+    };
+    if is_cancelled() {
+        return Ok(());
+    }
+    let batch_bottom = cursor.saturating_sub(UID_FETCH_BATCH - 1).max(1);
+    let checked = resync_flags_range(
+        session,
+        store,
+        folder,
+        UidRange::bounded(batch_bottom, cursor),
+    )?;
+    outcome.flags_updated += checked.updated;
+    outcome.vanished_removed += checked.vanished_removed;
+    if batch_bottom <= 1 {
+        state.resync_cursor = None;
+        state.resync_completed_at = Some(now);
+    } else {
+        state.resync_cursor = Some(batch_bottom - 1);
+    }
+    Ok(())
+}
+
+/// Walk `bottom..=top` in [`UID_FETCH_BATCH`]-sized chunks, re-checking
+/// each against the server. `false` means a cancellation cut the walk
+/// short (the caller must not then claim the span was covered).
+fn reconcile_span<M, S>(
+    session: &mut M,
+    store: &mut S,
+    folder: &str,
+    bottom: u32,
+    top: u32,
+    is_cancelled: &dyn Fn() -> bool,
+    outcome: &mut SyncOutcome,
+) -> Result<bool, SyncError>
+where
+    M: MailboxSession,
+    S: SyncStore,
+{
+    let mut bottom = bottom;
+    loop {
+        if is_cancelled() {
+            return Ok(false);
+        }
+        let chunk_top = bottom.saturating_add(UID_FETCH_BATCH - 1).min(top);
+        let checked =
+            resync_flags_range(session, store, folder, UidRange::bounded(bottom, chunk_top))?;
+        // Counted as a flags update, not as `headers_fetched`: nothing new
+        // was discovered here, the same headers were simply re-read.
+        outcome.flags_updated += checked.updated;
+        outcome.vanished_removed += checked.vanished_removed;
+        if chunk_top >= top {
+            return Ok(true);
+        }
+        bottom = chunk_top + 1;
+    }
+}
+
 /// Periodic full flags reconciliation for servers without CONDSTORE (D30).
-/// The caller (adaptive scheduler, T-023) decides cadence and which range to
-/// check; this also catches vanished mail in that range (a requested UID
-/// that the server no longer returns).
+/// The caller decides which range to check; this also catches vanished mail
+/// in that range (a requested UID that the server no longer returns).
+///
+/// [`sync_folder`] drives this itself at the end of every completed pass
+/// (see [`reconcile_known_range`] for the cadence and window it picks); it
+/// stays public because a caller with better knowledge — a range the user is
+/// actually looking at, a folder a conflict was just detected in — can ask
+/// for a tighter range directly.
 pub fn resync_flags_range<M, S>(
     session: &mut M,
     store: &mut S,
@@ -1372,5 +1610,319 @@ mod tests {
         let mut session = FakeSession::new(1);
         let err = fetch_body(&mut session, "INBOX", 999).unwrap_err();
         assert!(matches!(err, SyncError::Session(_)));
+    }
+
+    /// Mail deleted on the server (webmail, phone, another client) must stop
+    /// existing locally too -- the crate doc's "vanished UIDs are removed
+    /// locally" and D29. The only code that can notice a vanished UID is
+    /// `fetch_range(.., detect_vanished = true)`; the rest of a pass only
+    /// ever walks *new* UIDs and a CONDSTORE flags delta, neither of which
+    /// can report mail that is simply gone.
+    #[test]
+    fn mail_deleted_on_the_server_is_removed_locally_on_the_next_pass() {
+        let mut session = FakeSession::new(5);
+        let mut store = FakeStore::default();
+        let cancel = no_cancel();
+
+        sync_folder(&mut session, &mut store, "INBOX", 1, &cancel).unwrap();
+        assert!(
+            store.rows["INBOX"].contains_key(&3),
+            "precondition: uid 3 was synced by the first pass"
+        );
+
+        // The user deletes that message from another client. On the wire the
+        // UID is simply gone from every FETCH response afterwards.
+        session.messages.retain(|m| m.uid != 3);
+        session.highest_modseq += 1;
+
+        sync_folder(&mut session, &mut store, "INBOX", 2, &cancel).unwrap();
+
+        assert!(
+            !store.rows["INBOX"].contains_key(&3),
+            "a UID the server no longer has must be removed locally, not kept forever"
+        );
+    }
+
+    /// The reconciliation above must stay *bounded*, not a `1:*` sweep: on
+    /// a 100k mailbox one pass may cost the newest window plus one batch of
+    /// the rolling walk (T-157) and not one byte more, or every background
+    /// pass would re-download every envelope in the folder.
+    #[test]
+    fn reconciliation_of_a_huge_mailbox_costs_a_window_and_one_walk_batch() {
+        let mut session = FakeSession::new(0);
+        session.messages = vec![HeaderMeta {
+            uid: 99_999,
+            ..HeaderMeta::default()
+        }];
+        session.uidnext_override = Some(100_000);
+        let mut store = FakeStore::default();
+        // Stand in for a folder whose backfill finished long ago, so this
+        // pass has nothing to do but reconcile.
+        store.state.insert(
+            "INBOX".to_string(),
+            FolderSyncState {
+                uidvalidity: Some(1),
+                uidnext: Some(100_000),
+                highest_modseq: Some(0),
+                last_synced_at: Some(0),
+                backfill_floor: None,
+                backfill_target: None,
+                resync_cursor: None,
+                resync_completed_at: None,
+            },
+        );
+        store.upsert_headers("INBOX", &session.messages).unwrap();
+
+        let out = sync_folder(&mut session, &mut store, "INBOX", 1, &no_cancel()).unwrap();
+
+        assert!(!out.cancelled);
+        assert_eq!(
+            session.fetch_call_count, 2,
+            "one window plus one walk batch, not one fetch per {UID_FETCH_BATCH} \
+             uids in the whole mailbox"
+        );
+        assert!(
+            store.rows["INBOX"].contains_key(&99_999),
+            "the one message the server still has must survive the window"
+        );
+        // Ten more passes stay at the same price: the walk takes one batch
+        // each, never a catch-up sweep for the passes it has not reached.
+        for now in 2..=11 {
+            sync_folder(&mut session, &mut store, "INBOX", now, &no_cancel()).unwrap();
+        }
+        assert_eq!(session.fetch_call_count, 22);
+    }
+
+    /// D30: a server that reports no `HIGHESTMODSEQ` never sends a flags
+    /// delta, so the whole synced range has to be re-read from time to time
+    /// -- but only from time to time, never on every pass.
+    #[test]
+    fn a_server_without_condstore_gets_a_whole_range_pass_only_now_and_then() {
+        let mut session = FakeSession::new(500);
+        session.condstore = false;
+        let mut store = FakeStore::default();
+        let cancel = no_cancel();
+
+        sync_folder(&mut session, &mut store, "INBOX", 0, &cancel).unwrap();
+        assert_eq!(store.rows["INBOX"].len(), 500);
+
+        // A message far below the newest window disappears on the server.
+        session.messages.retain(|m| m.uid != 3);
+
+        sync_folder(&mut session, &mut store, "INBOX", 1, &cancel).unwrap();
+        assert!(
+            store.rows["INBOX"].contains_key(&3),
+            "a pass one second later must stay a cheap window, not sweep the folder"
+        );
+
+        let out = sync_folder(
+            &mut session,
+            &mut store,
+            "INBOX",
+            1 + FULL_RECONCILE_INTERVAL_SECS,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(out.vanished_removed, 1);
+        assert!(
+            !store.rows["INBOX"].contains_key(&3),
+            "the periodic whole-range pass must catch mail the window cannot reach"
+        );
+    }
+
+    /// The counterpart: with CONDSTORE the flags delta already covers the
+    /// whole mailbox on every pass, so the expensive whole-range sweep must
+    /// never be taken -- however long it has been since the last pass. What
+    /// the pass may spend below the newest window is one rolling-walk batch
+    /// (T-157) and nothing more.
+    #[test]
+    fn a_condstore_server_never_takes_the_whole_range_pass() {
+        let mut session = FakeSession::new(500);
+        let mut store = FakeStore::default();
+        let cancel = no_cancel();
+
+        sync_folder(&mut session, &mut store, "INBOX", 0, &cancel).unwrap();
+        let after_backfill = session.fetch_call_count;
+
+        sync_folder(
+            &mut session,
+            &mut store,
+            "INBOX",
+            10 * FULL_RECONCILE_INTERVAL_SECS,
+            &cancel,
+        )
+        .unwrap();
+
+        assert_eq!(
+            session.fetch_call_count - after_backfill,
+            2,
+            "CONDSTORE covers flags for free; the pass may re-read the newest \
+             window and take one walk batch, not sweep 500 uids"
+        );
+    }
+
+    /// T-157: the hole the newest window leaves. On a CONDSTORE server the
+    /// whole-range sweep is never taken (the test above), the flags delta
+    /// reports changed flags rather than gone mail, and the window only
+    /// covers the top of the mailbox -- so before the rolling walk existed,
+    /// a message deleted from another client deep in the mailbox stayed
+    /// local *forever*. It must now disappear on its own, within one circle
+    /// of the walk and without any pass sweeping the folder.
+    #[test]
+    fn mail_deleted_deep_in_a_condstore_mailbox_vanishes_once_the_walk_reaches_it() {
+        let mut session = FakeSession::new(500);
+        let mut store = FakeStore::default();
+        let cancel = no_cancel();
+
+        sync_folder(&mut session, &mut store, "INBOX", 0, &cancel).unwrap();
+        assert!(store.rows["INBOX"].contains_key(&3));
+        assert!(
+            session.snapshot().highest_modseq.is_some(),
+            "precondition: this is the CONDSTORE path"
+        );
+
+        // Deleted from webmail. Uid 3 is 200+ uids below the newest window.
+        session.messages.retain(|m| m.uid != 3);
+        session.highest_modseq += 1;
+
+        sync_folder(&mut session, &mut store, "INBOX", 1, &cancel).unwrap();
+        assert!(
+            store.rows["INBOX"].contains_key(&3),
+            "the newest window cannot reach uid 3; this pass only opens the walk"
+        );
+        assert_eq!(
+            store.state["INBOX"].resync_cursor,
+            Some(100),
+            "the walk checked 101..300 and parked just below it"
+        );
+
+        let out = sync_folder(&mut session, &mut store, "INBOX", 2, &cancel).unwrap();
+        assert_eq!(out.vanished_removed, 1);
+        assert!(
+            !store.rows["INBOX"].contains_key(&3),
+            "a walk that reached the bottom must have noticed the deletion"
+        );
+        assert_eq!(
+            (
+                store.state["INBOX"].resync_cursor,
+                store.state["INBOX"].resync_completed_at
+            ),
+            (None, Some(2)),
+            "a completed circle clears the cursor and stamps when it closed"
+        );
+    }
+
+    /// A closed circle does not immediately start another one: the walk is
+    /// a background sweep, not a busy loop, so it waits the same
+    /// `FULL_RECONCILE_INTERVAL_SECS` D30 gives the whole-range pass. Until
+    /// then a pass costs the newest window and nothing else.
+    #[test]
+    fn a_finished_walk_waits_out_the_interval_before_starting_the_next_circle() {
+        let mut session = FakeSession::new(500);
+        let mut store = FakeStore::default();
+        let cancel = no_cancel();
+
+        sync_folder(&mut session, &mut store, "INBOX", 0, &cancel).unwrap();
+        sync_folder(&mut session, &mut store, "INBOX", 1, &cancel).unwrap();
+        sync_folder(&mut session, &mut store, "INBOX", 2, &cancel).unwrap();
+        assert_eq!(store.state["INBOX"].resync_completed_at, Some(2));
+
+        let after_circle = session.fetch_call_count;
+        sync_folder(&mut session, &mut store, "INBOX", 3, &cancel).unwrap();
+        assert_eq!(
+            session.fetch_call_count - after_circle,
+            1,
+            "a pass inside the cool-down may only re-read the newest window"
+        );
+        assert_eq!(store.state["INBOX"].resync_cursor, None);
+
+        let before_next = session.fetch_call_count;
+        sync_folder(
+            &mut session,
+            &mut store,
+            "INBOX",
+            2 + FULL_RECONCILE_INTERVAL_SECS,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            session.fetch_call_count - before_next,
+            2,
+            "once the interval is up the next circle opens, one batch at a time"
+        );
+        assert_eq!(store.state["INBOX"].resync_cursor, Some(100));
+    }
+
+    /// The cursor is state, not a run-local variable: a restart between two
+    /// passes must resume the walk where it stopped instead of starting the
+    /// circle over from the top (which, on a client restarted often, would
+    /// mean the bottom of the mailbox is never checked at all). Here the
+    /// engine is handed a store that only knows what was durably saved --
+    /// the same thing `CoreSyncStore` reads back out of `sync_state`.
+    #[test]
+    fn the_walk_resumes_from_the_saved_cursor_after_a_restart() {
+        let mut session = FakeSession::new(500);
+        let mut store = FakeStore::default();
+        let cancel = no_cancel();
+
+        sync_folder(&mut session, &mut store, "INBOX", 0, &cancel).unwrap();
+        sync_folder(&mut session, &mut store, "INBOX", 1, &cancel).unwrap();
+        let saved = store.state["INBOX"].clone();
+        assert_eq!(saved.resync_cursor, Some(100));
+
+        // Restart: a brand new store that has been given nothing but the
+        // saved state and the rows the previous run wrote.
+        let mut restarted = FakeStore {
+            rows: store.rows.clone(),
+            ..FakeStore::default()
+        };
+        restarted.state.insert("INBOX".to_string(), saved);
+        session.messages.retain(|m| m.uid != 3);
+        session.fetched_uids_log.clear();
+
+        sync_folder(&mut session, &mut restarted, "INBOX", 2, &cancel).unwrap();
+
+        assert!(
+            !restarted.rows["INBOX"].contains_key(&3),
+            "the resumed walk must pick up at uid 100, not at the window again"
+        );
+        assert!(
+            !session.fetched_uids_log.contains(&150),
+            "and it must not re-read the batch the pass before the restart did"
+        );
+    }
+
+    /// A pass cancelled between batches (T-118: a click yields the socket)
+    /// saved its progress but did **not** finish syncing the folder, so it
+    /// must not stamp `last_synced_at` -- that column is exactly
+    /// `next_sync`'s "enough time has passed since the last *successful*
+    /// sync" input, and moving it forward parks a half-done backfill for a
+    /// whole scheduler interval.
+    #[test]
+    fn cancelled_pass_does_not_stamp_last_synced_at() {
+        let mut session = FakeSession::new(1000);
+        let mut store = FakeStore::default();
+        let calls = Cell::new(0u32);
+        // First poll (before the first backfill batch) says "keep going";
+        // every later one yields, exactly like a FetchBody arriving mid-pass.
+        let cancel = || {
+            let n = calls.get();
+            calls.set(n + 1);
+            n >= 1
+        };
+
+        let out = sync_folder(&mut session, &mut store, "INBOX", 777, &cancel).unwrap();
+
+        assert!(out.cancelled, "precondition: the pass really was cancelled");
+        let state = store.load_state("INBOX").unwrap();
+        assert!(
+            state.backfill_floor.is_some_and(|f| f > 1),
+            "precondition: the backfill is still outstanding, floor = {:?}",
+            state.backfill_floor
+        );
+        assert_eq!(
+            state.last_synced_at, None,
+            "a cancelled pass is not a completed sync and must not move last_synced_at"
+        );
     }
 }

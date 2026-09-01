@@ -627,4 +627,262 @@ mod tests {
     fn binary_crate_compiles() {
         assert!(!env!("CARGO_PKG_VERSION").is_empty());
     }
+
+    /// Every `@name` colour reference in style.css must be `@define-color`d
+    /// in both theme files.
+    ///
+    /// GTK's colour resolver does not error on an unknown symbolic name the
+    /// way it does on a malformed declaration: `CssProvider::load_from_data`
+    /// parses `@paper-selected` (a hyphen, never `@define-color`d --
+    /// `@paper_selected` with an underscore is what the tokens files define)
+    /// without complaint, and the fill silently drops to whatever GTK's own
+    /// compute-time fallback is. Nothing appears in the log, so this class of
+    /// bug is invisible to both CI and a developer's eye; the settings-page
+    /// avatar and the Synced/Syncing pill lost their `paper_selected` wash
+    /// this way.
+    ///
+    /// Mutation: change any `@define-color` name in tokens_light.css or
+    /// tokens_dark.css so a reference used in style.css no longer has a
+    /// matching definition (or reintroduce a hyphenated typo like
+    /// `@paper-selected`) -> this test is red.
+    #[test]
+    fn every_color_reference_in_style_css_is_defined_in_both_themes() {
+        let css = include_str!("style.css");
+        let light = include_str!("tokens_light.css");
+        let dark = include_str!("tokens_dark.css");
+
+        // Strip /* ... */ comments so a token name mentioned only in prose
+        // cannot masquerade as a real reference.
+        let mut stripped = String::with_capacity(css.len());
+        let mut rest = css;
+        loop {
+            match rest.find("/*") {
+                Some(start) => {
+                    stripped.push_str(&rest[..start]);
+                    match rest[start..].find("*/") {
+                        Some(end) => rest = &rest[start + end + 2..],
+                        None => break,
+                    }
+                }
+                None => {
+                    stripped.push_str(rest);
+                    break;
+                }
+            }
+        }
+
+        // Collect `@identifier` references by hand, the same character
+        // class CSS allows in an identifier -- no regex dependency in this
+        // crate. `@keyframes` is the only at-rule this file uses and is not
+        // a colour, so it is excluded by name.
+        let mut names: Vec<String> = Vec::new();
+        let mut chars = stripped.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '@' {
+                continue;
+            }
+            let mut name = String::new();
+            while let Some(&next) = chars.peek() {
+                if next.is_ascii_alphanumeric() || next == '_' || next == '-' {
+                    name.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !name.is_empty() && name != "keyframes" && name != "media" {
+                names.push(name);
+            }
+        }
+
+        assert!(
+            !names.is_empty(),
+            "the scan must find real colour references, or it proves nothing"
+        );
+        for name in names {
+            let needle = format!("@define-color {name} ");
+            assert!(
+                light.contains(&needle) && dark.contains(&needle),
+                "style.css references `@{name}`, which is not `@define-color`d \
+                 in both theme files -- GTK resolves an unknown symbolic \
+                 colour silently at compute time, not at parse time, so this \
+                 never shows up as an error"
+            );
+        }
+    }
+
+    /// T-054/DESIGN.md: `.msg-time` carries the Ink Secondary role
+    /// ("подписи, время, иконки тулбара, email в сайдбаре"), not Ink
+    /// Tertiary. Ink Tertiary on the pane/selected-row backgrounds this text
+    /// sits on measures under WCAG AA (roughly 2.3-2.6:1 in the light theme
+    /// for this 12px text); Ink Secondary clears it (4.83:1 on paper_pane).
+    #[test]
+    fn message_row_time_uses_the_secondary_ink_token() {
+        let css = include_str!("style.css");
+        let rule = css
+            .split_once(".msg-time {")
+            .expect(".msg-time needs a rule")
+            .1;
+        let body = &rule[..rule.find('}').unwrap()];
+        assert!(
+            body.contains("color: @ink_secondary;"),
+            "DESIGN.md assigns list-row time to Ink Secondary; painting it \
+             with Ink Tertiary drops below the AA contrast threshold on the \
+             pane and selected-row backgrounds"
+        );
+    }
+
+    /// T-097(1,2)/T-099 shrank the message row from 128px to 96px. DESIGN.md
+    /// is the file AGENTS.md tells the next agent to treat as the UI source
+    /// of truth, so it has to describe the row that ships, not the one T-097
+    /// replaced -- otherwise a future edit "restores" the 128px card DESIGN.md
+    /// still claims and rolls the layout back.
+    #[test]
+    fn design_doc_describes_the_current_row_height_not_the_pre_t097_one() {
+        let css = include_str!("style.css");
+        let design = include_str!("../../../DESIGN.md");
+        assert!(
+            css.contains("min-height: 76px"),
+            "this test's premise (the T-097 96px card) has moved; update the \
+             assertions below to match style.css before touching DESIGN.md"
+        );
+        assert!(
+            !design.contains("128px"),
+            "DESIGN.md must not describe the pre-T-097 128px row -- style.css \
+             has shipped the 96px card since T-097(1,2)"
+        );
+        assert!(
+            design.contains("96px"),
+            "DESIGN.md must describe the row height that style.css actually paints"
+        );
+    }
+
+    /// T-160: `ink_secondary`/`ink_tertiary` must clear WCAG AA (4.5:1)
+    /// against every paper/row background they actually sit on, in both
+    /// themes. One documented exception: `ink_tertiary` on the two
+    /// "selected" blues (`paper_selected`, `row_selected`) only reaches
+    /// ~4.1:1, still above the 3:1 floor WCAG allows for large/UI text.
+    ///
+    /// The formula (WCAG 2.x relative luminance -> contrast ratio) is
+    /// implemented right here rather than trusted from memory, so a future
+    /// `@define-color` edit that drifts a digit off the audited value is
+    /// caught by arithmetic, not by re-reading the audit.
+    ///
+    /// Mutation: revert `ink_secondary`/`ink_tertiary` in tokens_light.css
+    /// to `#6b7280`/`#9aa0ab` (T-160's pre-fix values) -> red, every light
+    /// background drops under 4.5:1 (tertiary as low as 2.22:1).
+    #[test]
+    fn ink_secondary_and_tertiary_clear_wcag_aa_on_paper() {
+        fn channel_linear(byte: u8) -> f64 {
+            let c = byte as f64 / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn relative_luminance(hex: &str) -> f64 {
+            let hex = hex.trim_start_matches('#');
+            let r = u8::from_str_radix(&hex[0..2], 16).expect("red channel");
+            let g = u8::from_str_radix(&hex[2..4], 16).expect("green channel");
+            let b = u8::from_str_radix(&hex[4..6], 16).expect("blue channel");
+            0.2126 * channel_linear(r) + 0.7152 * channel_linear(g) + 0.0722 * channel_linear(b)
+        }
+        fn contrast_ratio(a: &str, b: &str) -> f64 {
+            let (la, lb) = (relative_luminance(a), relative_luminance(b));
+            let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+            (hi + 0.05) / (lo + 0.05)
+        }
+        fn token(css: &str, name: &str) -> String {
+            let needle = format!("@define-color {name} ");
+            let rest = css
+                .split_once(needle.as_str())
+                .unwrap_or_else(|| panic!("{name} must be @define-color'd"))
+                .1;
+            rest[..rest.find(';').expect("declaration must end in ;")]
+                .trim()
+                .to_string()
+        }
+
+        let light = include_str!("tokens_light.css");
+        let dark = include_str!("tokens_dark.css");
+
+        let light_secondary = token(light, "ink_secondary");
+        let light_tertiary = token(light, "ink_tertiary");
+        let dark_secondary = token(dark, "ink_secondary");
+        let dark_tertiary = token(dark, "ink_tertiary");
+
+        let light_papers = [
+            ("paper_pane", token(light, "paper_pane")),
+            ("paper_sidebar", token(light, "paper_sidebar")),
+            ("paper_recess", token(light, "paper_recess")),
+            ("paper_wash", token(light, "paper_wash")),
+            ("paper_selected", token(light, "paper_selected")),
+            ("row_selected", token(light, "row_selected")),
+            ("row_hover", token(light, "row_hover")),
+        ];
+        let dark_papers = [
+            ("paper_sidebar", token(dark, "paper_sidebar")),
+            ("paper_pane", token(dark, "paper_pane")),
+            ("paper_recess", token(dark, "paper_recess")),
+            ("paper_wash", token(dark, "paper_wash")),
+            ("paper_selected", token(dark, "paper_selected")),
+        ];
+
+        // `ink_tertiary` on the two selection blues is the one place the
+        // owner accepted a lower floor -- everywhere else, both roles, both
+        // themes, the AA floor applies.
+        let tertiary_exception = ["paper_selected", "row_selected"];
+
+        for (theme, secondary, tertiary, papers) in [
+            (
+                "light",
+                &light_secondary,
+                &light_tertiary,
+                &light_papers[..],
+            ),
+            ("dark", &dark_secondary, &dark_tertiary, &dark_papers[..]),
+        ] {
+            for (name, bg) in papers {
+                let ratio = contrast_ratio(secondary, bg);
+                assert!(
+                    ratio >= 4.5,
+                    "{theme} ink_secondary ({secondary}) vs {name} ({bg}) is \
+                     {ratio:.2}:1, below WCAG AA 4.5:1"
+                );
+                let ratio = contrast_ratio(tertiary, bg);
+                let floor = if tertiary_exception.contains(name) {
+                    4.0
+                } else {
+                    4.5
+                };
+                assert!(
+                    ratio >= floor,
+                    "{theme} ink_tertiary ({tertiary}) vs {name} ({bg}) is \
+                     {ratio:.2}:1, below the required {floor}:1"
+                );
+            }
+        }
+
+        // One hex, one place: DESIGN.md's yaml token block must name the
+        // same colour tokens_light.css defines, or the doc silently drifts
+        // from what ships.
+        let design = include_str!("../../../DESIGN.md");
+        for (role, css_hex) in [
+            ("ink-secondary", &light_secondary),
+            ("ink-tertiary", &light_tertiary),
+        ] {
+            let needle = format!("  {role}: \"");
+            let rest = design
+                .split_once(needle.as_str())
+                .unwrap_or_else(|| panic!("DESIGN.md's yaml block must declare {role}"))
+                .1;
+            let doc_hex = &rest[..rest.find('"').expect("closing quote")];
+            assert_eq!(
+                doc_hex.to_ascii_lowercase(),
+                css_hex.to_ascii_lowercase(),
+                "DESIGN.md's {role} must name the same hex tokens_light.css defines"
+            );
+        }
+    }
 }

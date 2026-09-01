@@ -8,8 +8,10 @@
   start a fresh Read + Draft profile. A `confirm` field cannot bypass high-risk
   approval and is `INVALID_ARGUMENT` on those actions.
 - `INVALID_ARGUMENT`: inspect the `tools/list` input schema. Missing or empty
-  required strings, an unknown tool, malformed cursor, or an impossible local
-  folder/destination are rejected before a mutation is queued.
+  required strings, an unknown tool, malformed cursor, an out-of-range `limit`
+  (must be an integer in 1…200 when present; it is rejected, not clamped), or
+  an impossible local folder/destination are rejected before a mutation is
+  queued.
 - `ACCOUNT_NOT_FOUND` or `MESSAGE_NOT_FOUND`: refresh local metadata and use
   an id from an allowed account. A draft or attachment lookup uses the same
   local target boundary as a message lookup and does not reveal a foreign id.

@@ -90,7 +90,7 @@ fn decode_modified_utf7(input: &str) -> String {
             return decoded;
         };
         let token = &encoded[..end];
-        let wire = &rest[..start + end + 2];
+        let wire = &rest[start..start + end + 2];
         if token.is_empty() {
             // "&-" is the literal ampersand escape in modified UTF-7.
             decoded.push('&');
@@ -104,6 +104,19 @@ fn decode_modified_utf7(input: &str) -> String {
     decoded.push_str(rest);
     decoded
 }
+
+/// Encode a human mailbox label into modified UTF-7 (RFC 3501 §5.1.3) for
+/// `CREATE`/`RENAME`.
+///
+/// The implementation lives in `feathermail-core`
+/// ([`feathermail_core::store::encode_modified_utf7`]) and is re-exported
+/// here for this crate's own callers. T-158 moved it: `Core` has to know
+/// the exact bytes a `RENAME` puts on the wire, because
+/// `queue::settle_folder_rename` writes them into `folders.remote_id` when
+/// the server acks, and a second implementation on this side would only
+/// have to agree with that one forever. `providers` depends on `core`
+/// (D9), so there is one function, on the side that owns folder identity.
+pub(crate) use feathermail_core::store::encode_modified_utf7;
 
 fn decode_modified_utf7_token(token: &str) -> Option<String> {
     let mut base64 = token.replace(',', "/");
@@ -195,6 +208,55 @@ mod tests {
     fn modified_utf7_literal_ampersand_and_malformed_token_stay_readable() {
         assert_eq!(decode_modified_utf7("R&-D &- Notes"), "R&D & Notes");
         assert_eq!(decode_modified_utf7("&not-base64-"), "&not-base64-");
+        // The same malformed run, but no longer at index 0: the prefix
+        // before `&` must not be emitted twice.
+        assert_eq!(
+            decode_modified_utf7("Team/&not-base64-"),
+            "Team/&not-base64-"
+        );
+    }
+
+    #[test]
+    fn malformed_run_after_a_prefix_is_not_duplicated() {
+        assert_eq!(
+            decode_modified_utf7("Sales & Marketing - 2024"),
+            "Sales & Marketing - 2024"
+        );
+        assert_eq!(decode_modified_utf7("Q&A - notes"), "Q&A - notes");
+        assert_eq!(decode_modified_utf7("Team/&A-/Sub"), "Team/&A-/Sub");
+    }
+
+    #[test]
+    fn modified_utf7_encodes_non_ascii_and_escapes_the_ampersand() {
+        assert_eq!(encode_modified_utf7("Notes"), "Notes");
+        assert_eq!(encode_modified_utf7("Проекты"), "&BB8EQAQ+BDUEOgRCBEs-");
+        assert_eq!(
+            encode_modified_utf7("Исходящие"),
+            "&BBgEQQRFBD4ENARPBEkEOAQ1-"
+        );
+        assert_eq!(encode_modified_utf7("R&D"), "R&-D");
+        assert_eq!(encode_modified_utf7(""), "");
+    }
+
+    #[test]
+    fn modified_utf7_round_trips_labels_a_user_can_type() {
+        for label in [
+            "Notes",
+            "Team/Ideas",
+            "Проекты",
+            "Счета 2024",
+            "Work&Fun",
+            "R&D & Notes",
+            "\u{1f680} launch",    // surrogate pair
+            "Идеи \u{1f600} !",    // mixed run + surrogate pair
+            "a&b\u{4f60}\u{597d}", // ampersand next to an encoded run
+        ] {
+            assert_eq!(
+                decode_modified_utf7(&encode_modified_utf7(label)),
+                label,
+                "round trip failed for {label:?}"
+            );
+        }
     }
 
     #[test]

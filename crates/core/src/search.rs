@@ -761,17 +761,32 @@ fn index_one(
         params![message_id],
     )
     .map_err(sql_err)?;
+    // T-155: every *indexed* column goes through the one normalization the
+    // query side applies too (`feathermail_search::fts_text`) -- it folds
+    // Cyrillic `ё` to `е` and puts a space at every boundary touching a CJK
+    // character, so that `unicode61` stops gluing a whole Japanese sentence
+    // into one token. The two sides must not drift: normalizing here and not
+    // in `escape_fts_literal` (or the other way round) does not error, it
+    // just returns nothing. `message_id` is deliberately left raw -- it is
+    // the UNINDEXED join key back to `messages`, not searchable text, and
+    // normalizing it would break `fts_message_rows` lookups.
+    //
+    // D14 is unaffected: `body` is still the same message text, still bound
+    // as a parameter into this one column, never logged and never read back
+    // out (nothing in the codebase SELECTs a column of `messages_fts`, and
+    // the UI's snippets come from `messages.snippet`), so the user never
+    // sees the normalized spelling.
     tx.execute(
         "INSERT INTO messages_fts \
          (sender, recipients, subject, body, attachment_names, labels, message_id) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
-            sender,
-            recipients,
-            subject,
-            body,
-            attachment_names,
-            labels,
+            feathermail_search::fts_text(sender),
+            feathermail_search::fts_text(&recipients),
+            feathermail_search::fts_text(&subject),
+            feathermail_search::fts_text(&body),
+            feathermail_search::fts_text(&attachment_names),
+            feathermail_search::fts_text(&labels),
             message_id
         ],
     )
@@ -2268,6 +2283,167 @@ mod tests {
         assert!(
             !lower.contains("scan m ") && !lower.contains("scan t "),
             "plan was:\n{explain}"
+        );
+    }
+
+    // --- T-155: unicode61 normalization, end to end ---
+
+    /// The defect T-155 was filed for: `unicode61` glues a whole Japanese
+    /// sentence into one token, and D54 searches for a literal phrase (no
+    /// `*`), so the word inside it was unreachable -- silently, with an
+    /// empty result and no error. Indexer and query now share
+    /// `feathermail_search::fts_text`, which makes every CJK character its
+    /// own token on both sides.
+    #[test]
+    fn a_word_inside_a_cjk_body_is_found_by_that_word() {
+        let mut core = Core::memory().unwrap();
+        seed_account(&core, "acc1", "me@example.com");
+        seed_message(
+            &core,
+            "acc1",
+            "m1",
+            "件名",
+            "Alice",
+            "alice@example.com",
+            "",
+            100,
+            false,
+            false,
+            false,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        core.store_body(
+            &crate::model::MessageId("m1".into()),
+            dir.path(),
+            "Content-Type: text/plain; charset=utf-8\r\n\r\n今日の会議は東京で行われました"
+                .as_bytes(),
+        )
+        .unwrap();
+        core.index_pending_batch(dir.path(), 10).unwrap();
+
+        let account = AccountId("acc1".into());
+        let found = core.search(&account, &plan("東京"), None, 0).unwrap();
+        assert_eq!(
+            found.threads.len(),
+            1,
+            "a word inside a spaceless CJK sentence must be findable"
+        );
+        assert_eq!(found.threads[0].id.as_str(), "acc1:t:m1");
+
+        // The whole sentence still matches -- splitting into per-character
+        // tokens turns it into a long phrase, not into nothing.
+        let whole = core
+            .search(&account, &plan("今日の会議は東京で行われました"), None, 0)
+            .unwrap();
+        assert_eq!(whole.threads.len(), 1);
+
+        // And it is still a *literal* search, not a wildcard: a CJK word
+        // that is not in the message must not match it.
+        let miss = core.search(&account, &plan("大阪"), None, 0).unwrap();
+        assert!(
+            miss.threads.is_empty(),
+            "T-155 must not turn D54 into a fuzzy match"
+        );
+    }
+
+    /// The second half of T-155: `unicode61` folds case for Cyrillic but
+    /// keeps `ё` and `е` apart, so `счет` never found `СЧЁТ`. Both sides
+    /// now fold `ё` to `е`, so either spelling finds the message -- in the
+    /// body, in the subject, and in the sender.
+    #[test]
+    fn a_cyrillic_yo_message_is_found_whether_the_user_types_yo_or_ye() {
+        let mut core = Core::memory().unwrap();
+        seed_account(&core, "acc1", "me@example.com");
+        seed_message(
+            &core,
+            "acc1",
+            "m1",
+            "Оплатите СЧЁТ",
+            "Королёв",
+            "korolev@example.com",
+            "",
+            100,
+            false,
+            false,
+            false,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        core.store_body(
+            &crate::model::MessageId("m1".into()),
+            dir.path(),
+            "Content-Type: text/plain; charset=utf-8\r\n\r\nПришлём ещё один счёт".as_bytes(),
+        )
+        .unwrap();
+        core.index_pending_batch(dir.path(), 10).unwrap();
+
+        let account = AccountId("acc1".into());
+        for query in [
+            "счет",
+            "счёт",
+            "subject:счет",
+            "subject:счёт",
+            "from:Королев",
+            "from:Королёв",
+            "пришлем",
+        ] {
+            let found = core.search(&account, &plan(query), None, 0).unwrap();
+            assert_eq!(found.threads.len(), 1, "query {query:?} found nothing");
+            assert_eq!(found.threads[0].id.as_str(), "acc1:t:m1");
+        }
+
+        // Still literal: `е` folds to `е`, it does not fold everything.
+        let miss = core.search(&account, &plan("счета"), None, 0).unwrap();
+        assert!(miss.threads.is_empty());
+    }
+
+    /// Guard for the other 99% of the mailbox: normalizing on both sides
+    /// must be a no-op for ordinary Latin mail, including the `from:` and
+    /// `subject:` operators and a quoted phrase.
+    #[test]
+    fn latin_search_and_field_operators_do_not_regress_under_normalization() {
+        let mut core = Core::memory().unwrap();
+        seed_account(&core, "acc1", "me@example.com");
+        seed_message(
+            &core,
+            "acc1",
+            "m1",
+            "Quarterly report",
+            "Alice",
+            "alice@example.com",
+            "",
+            100,
+            false,
+            false,
+            false,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        core.store_body(
+            &crate::model::MessageId("m1".into()),
+            dir.path(),
+            b"Content-Type: text/plain\r\n\r\nplease review the attached numbers",
+        )
+        .unwrap();
+        core.index_pending_batch(dir.path(), 10).unwrap();
+
+        let account = AccountId("acc1".into());
+        for query in [
+            "quarterly",
+            "numbers",
+            "\"quarterly report\"",
+            "from:alice@example.com",
+            "from:Alice",
+            "subject:report",
+            "quarterly numbers",
+        ] {
+            let found = core.search(&account, &plan(query), None, 0).unwrap();
+            assert_eq!(found.threads.len(), 1, "query {query:?} found nothing");
+        }
+        let miss = core
+            .search(&account, &plan("from:bob@example.com"), None, 0)
+            .unwrap();
+        assert!(
+            miss.threads.is_empty(),
+            "from: must still scope to the sender"
         );
     }
 

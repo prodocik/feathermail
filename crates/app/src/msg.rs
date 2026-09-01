@@ -8,8 +8,41 @@ use feathermail_core::{
     ThreadPage, UndoTicket,
 };
 
+use feathermail_service::AutoconfigOutcome;
+
 use crate::html_view::PreparedBody;
 use crate::nav::{PrefKey, SettingsPage};
+
+/// T-156: the address one autoconfig lookup was started for, carried back
+/// with its answer so a reply for a mailbox the user has since retyped can
+/// be recognised and dropped.
+///
+/// It is a newtype rather than a `String` because [`Msg`] derives `Debug`,
+/// and D14 keeps mail addresses out of every printed line -- the same
+/// reason `ProvisionRequest` redacts its password and `AutoconfigOutcome`
+/// redacts the form it found. Comparison is what the wizard needs, so that
+/// is what the type offers; the text itself never leaves it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WizardEmail(String);
+
+impl WizardEmail {
+    pub fn new(email: impl Into<String>) -> Self {
+        Self(email.into())
+    }
+
+    /// Whether the field still holds the address this lookup was for.
+    /// Trimmed and case-insensitive, because neither difference makes it a
+    /// different mailbox and both are easy to introduce by editing.
+    pub fn matches(&self, current: &str) -> bool {
+        self.0.trim().eq_ignore_ascii_case(current.trim())
+    }
+}
+
+impl std::fmt::Debug for WizardEmail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateCheck {
@@ -156,7 +189,12 @@ pub enum Msg {
         gen: u64,
     },
     SaveDraft,
+    /// `session` is the compose session that asked for the save. A window
+    /// closed and reopened while the write was in flight is a different
+    /// session, and this answer belongs to the previous one -- the same
+    /// generation guard `BodyLookup`/`SearchResults` already carry.
     DraftSaved {
+        session: u64,
         gen: u64,
         result: Result<Draft, String>,
     },
@@ -165,13 +203,22 @@ pub enum Msg {
     /// already prepared before this background SQLite query started.
     ResponseDraftReady {
         kind: ResponseKind,
+        /// The mailbox the letter being answered lives in -- the owner of
+        /// the draft Core just created. Every compose door has to act on
+        /// this account, not on whichever one the account menu shows.
+        account_id: AccountId,
         source_message_id: MessageId,
         result: Result<Draft, String>,
     },
     DiscardDraft,
     PickAttachment,
     AttachmentPicked(PathBuf),
-    AttachmentAdded(Result<(DraftId, Vec<DraftAttachment>), String>),
+    /// `session`: see [`Msg::DraftSaved`]. This arm rebinds
+    /// `compose_draft_id`, so a late answer must not reach a newer window.
+    AttachmentAdded {
+        session: u64,
+        result: Result<(DraftId, Vec<DraftAttachment>), String>,
+    },
     /// T-046: include or remove one already cached incoming attachment from
     /// the current Forward draft through Core's draft-attachment command.
     ForwardAttachmentToggled {
@@ -199,7 +246,11 @@ pub enum Msg {
         ok: bool,
     },
     Send,
+    /// `session`: see [`Msg::DraftSaved`]. This arm rebinds
+    /// `compose_draft_id` and hides the compose window, so a late answer
+    /// must not close a window the reader has only just opened.
     SendQueued {
+        session: u64,
         result: Result<(DraftId, OperationId), String>,
     },
     SearchChanged(String),
@@ -318,6 +369,23 @@ pub enum Msg {
         result: Result<String, String>,
     },
     WizardSecurityChanged,
+    /// T-156: focus left the wizard's address field. Not `changed`: every
+    /// one of these may cost an HTTPS request plus two DNS queries, so the
+    /// lookup is started once the address is finished rather than once per
+    /// keystroke. The arm decides whether it is worth asking at all
+    /// (`autoconfig_trigger`); this message only says the moment arrived.
+    WizardEmailEntered,
+    /// T-156: the one-shot autoconfig thread
+    /// (`feathermail_service::spawn_autoconfig`) started by
+    /// `Msg::WizardEmailEntered` has answered. `email` is the address the
+    /// lookup was started for -- there is no way to cancel the thread, so a
+    /// reply is only applied while the field still holds that address, the
+    /// same guard `Msg::Provisioned` gets from `gen`. D14: neither half of
+    /// this message prints the address.
+    AutoconfigResolved {
+        email: WizardEmail,
+        outcome: AutoconfigOutcome,
+    },
     WizardBack,
     OpenInboxFromWizard,
     EditAccount(String),
@@ -458,6 +526,14 @@ pub enum Msg {
     NavLoaded {
         gen: u64,
         folders: Vec<FolderSummary>,
+        /// T-161: the folders a row chip may name, which is not the same
+        /// list the sidebar shows. In the merged view the sidebar is the
+        /// four unified folders and a row's own folder belongs to one
+        /// mailbox, so the chip has to look the label up somewhere that
+        /// knows every account's folders. In a single mailbox the two
+        /// lists are the same and this carries a copy of it, built on the
+        /// same background thread rather than cloned on the GTK one.
+        chip_folders: Vec<FolderSummary>,
     },
     /// T-080: completion of the background `Core::lookup_body` disk read
     /// kicked off by `App::request_body`/`App::lookup_body_async` -- the
@@ -568,6 +644,124 @@ pub enum Msg {
     SnoozeWritten {
         ids: Vec<String>,
         label: &'static str,
+        tickets: Vec<UndoTicket>,
+        error: Option<String>,
+    },
+    /// A Star/Unstar the mailbox writer has finished. `starred` is the
+    /// *pre*-toggle flag the click read, so it says which command was sent
+    /// -- and a starred-only list may drop the row only here, once Core has
+    /// actually taken the star off. Deciding that on the click hid a thread
+    /// the database had refused to unstar, and only a folder switch brought
+    /// it back.
+    StarWritten {
+        ids: Vec<String>,
+        starred: bool,
+        error: Option<String>,
+    },
+    /// A Trash the mailbox writer has finished. The rows left the list on
+    /// the click; this is Core agreeing -- with the durable Undo tickets --
+    /// or refusing, in which case the list is re-read.
+    DeleteWritten {
+        label: &'static str,
+        tickets: Vec<UndoTicket>,
+        error: Option<String>,
+    },
+    /// A permanent delete the mailbox writer has finished. Deliberately
+    /// ticketless: T-034 keeps permanent deletion outside Undo, so the
+    /// receipt's tickets are dropped on the writer thread rather than
+    /// carried here where a toast could offer them.
+    PermanentDeleteWritten {
+        label: &'static str,
+        error: Option<String>,
+    },
+    /// An Unsnooze the mailbox writer has finished. `woken` counts the
+    /// threads that actually had a deadline; threads that were not snoozed
+    /// are skipped, not failed.
+    UnsnoozeWritten {
+        woken: usize,
+        failed: bool,
+    },
+    /// The Undo the mailbox writer has finished. The tickets were consumed
+    /// on the GTK thread the moment the button was pressed, so a second
+    /// press cannot undo the same operation twice while this is in flight.
+    UndoWritten {
+        failed: bool,
+    },
+    /// A draft the mailbox writer has deleted -- from Discard, or from the
+    /// discard that was parked on an in-flight save. The window is already
+    /// closed; only a refusal has anything left to say.
+    DraftDiscarded {
+        error: Option<String>,
+    },
+    /// An attachment the mailbox writer has removed from the open draft.
+    /// `session` guards the same race `AttachmentAdded` does: by the time
+    /// this lands the reader may be writing the next letter.
+    AttachmentRemoved {
+        session: u64,
+        id: String,
+        error: Option<String>,
+    },
+    /// T-049 (д): the recent-query list, read off the GTK thread on the
+    /// same reader handle `refill_nav` uses.
+    SearchHistoryLoaded(Vec<String>),
+    /// T-163: `Core::create_folder_with_color` finished on the mailbox
+    /// writer thread.
+    ///
+    /// `gen` is [`App::reader_place`] as it stood when the button was
+    /// pressed -- which mailbox, which folder, which settings editor. The
+    /// answer moves the reader into the new folder only while that is
+    /// still true; a reader who has navigated away in the meantime, or who
+    /// is halfway through typing the next folder's name, keeps what they
+    /// have. `result` is the new folder's id, or Core's own error text
+    /// shown verbatim (D14: no protocol detail, no credentials).
+    FolderCreated {
+        gen: u64,
+        result: Result<String, String>,
+    },
+    /// T-163: `Core::rename_folder` finished on the mailbox writer. `Ok`
+    /// carries whether the RENAME was queued for the server (a folder the
+    /// server has never heard of is renamed locally and queues nothing).
+    FolderRenamed {
+        gen: u64,
+        result: Result<bool, String>,
+    },
+    /// T-163: `Core::delete_folder` finished on the mailbox writer. Same
+    /// `Ok(queued)` as [`Msg::FolderRenamed`].
+    ///
+    /// Deliberately without a `gen`, unlike its two siblings: everything
+    /// this answer does -- drop the section cache, wake the worker,
+    /// recount the sidebar -- is true wherever the reader has got to,
+    /// because the folder is gone for all of them. The one thing that
+    /// would need a stamp, moving a reader off the folder they were
+    /// standing in, is not done here at all: it lands in `Msg::NavLoaded`,
+    /// under that message's own generation guard, once `list_folders` has
+    /// actually stopped returning it.
+    FolderDeleted {
+        result: Result<bool, String>,
+    },
+    /// T-163: `Core::update_account` finished on the mailbox writer. The
+    /// account id travels with the answer so the settings editor is closed
+    /// only if it is still the editor for that account.
+    AccountNameSaved {
+        gen: u64,
+        id: String,
+        error: Option<String>,
+    },
+    /// T-163: `Core::remove_account` finished on the mailbox writer --
+    /// together with the `SecretStore::connect()` D-Bus round trip that
+    /// used to happen on the GTK thread in front of it. `Ok` carries the
+    /// report's `keyring_error`: local removal committed either way, so
+    /// the account is gone from the UI and this is only a heads-up that a
+    /// stray keyring entry may remain.
+    AccountRemoved {
+        gen: u64,
+        account_id: AccountId,
+        result: Result<Option<String>, String>,
+    },
+    /// T-163: a Move the mailbox writer has finished. Same shape as
+    /// [`Msg::DeleteWritten`]: the rows are re-read from Core either way,
+    /// and a successful receipt supplies the Undo tickets.
+    MoveWritten {
         tickets: Vec<UndoTicket>,
         error: Option<String>,
     },

@@ -152,7 +152,16 @@ CREATE TABLE IF NOT EXISTS message_labels (
 CREATE TABLE IF NOT EXISTS drafts (
     id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    thread_id TEXT REFERENCES threads(id),
+    -- v28: `ON DELETE SET NULL`, not the default NO ACTION and not CASCADE.
+    -- A draft is local data the owner typed and D29 says we never lose it,
+    -- so it cannot ride the thread out; but the thread it answers does get
+    -- deleted underneath it by ordinary sync (a UIDVALIDITY reset, the last
+    -- message of the thread vanishing on the server, a de-duplicated copy),
+    -- and NO ACTION turned every one of those into `FOREIGN KEY constraint
+    -- failed` -- rolling back the whole sync transaction and wedging the
+    -- folder forever. The link simply stopped being true; the draft stays,
+    -- with `in_reply_to` still carrying what it is a reply to.
+    thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL,
     in_reply_to TEXT,
     from_addr TEXT NOT NULL,
     to_addr TEXT NOT NULL DEFAULT '',
@@ -212,6 +221,24 @@ CREATE TABLE IF NOT EXISTS sync_state (
     -- Both must survive a restart (D32), hence columns, not in-memory state.
     last_attempt_at INTEGER,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    -- T-157 (schema v29): the rolling full-mailbox UID reconciliation
+    -- cursor. Every completed pass re-checks the newest
+    -- `feathermail_sync::RECONCILE_WINDOW` UIDs, which is where mail is
+    -- actually read and deleted -- but on a CONDSTORE server nothing else
+    -- ever looked below that window, so a message deleted deep in the
+    -- mailbox stayed local forever (a CONDSTORE delta reports changed
+    -- flags, not gone mail). `resync_cursor` is the highest UID the walk
+    -- has not checked yet; it starts just below the newest window and
+    -- moves down one `UID_FETCH_BATCH` per pass, so the whole mailbox is
+    -- covered eventually at a cost of exactly one extra `UID FETCH` per
+    -- pass and never a `1:*` sweep. NULL means no walk is in progress:
+    -- either none has ever started, or the last one reached UID 1 and
+    -- stamped `resync_completed_at`. The next circle then waits
+    -- `feathermail_sync::FULL_RECONCILE_INTERVAL_SECS` from that stamp --
+    -- a separate clock from `last_sync_at` above, which moves on every
+    -- successful pass and so can never say when a circle closed.
+    resync_cursor INTEGER,
+    resync_completed_at INTEGER,
     PRIMARY KEY (account_id, folder_id)
 );
 
@@ -226,6 +253,20 @@ CREATE TABLE IF NOT EXISTS operations (
     retry_count INTEGER NOT NULL DEFAULT 0,
     next_attempt_at INTEGER,
     status TEXT NOT NULL DEFAULT 'pending',
+    -- T-162 (schema v29): the queue's own monotonic sequence number, handed
+    -- out by `feathermail_core::store::enqueue` on every INSERT *and* on
+    -- every revive. `created_at` is whole seconds, so two commands issued
+    -- back to back usually tie and the tie-break decides the real order;
+    -- `claim_next` used `rowid` for that, which SQLite hands out in INSERT
+    -- order and never changes afterwards. A revived row (D29's idempotency
+    -- key lands a repeated command on its own `failed`/`acked` row, which
+    -- `enqueue` turns back into `pending` with an UPDATE) therefore kept
+    -- the rowid of the first time it was issued and was claimed ahead of
+    -- everything enqueued since -- a Star from ten minutes ago applied
+    -- after a Move issued a second ago. `seq` is `MAX(seq) + 1` at the
+    -- moment the operation last became claimable, which is exactly the
+    -- order the user issued the commands in.
+    seq INTEGER,
     -- T-034: causal predecessor for a reverse operation created by Undo.
     -- Status is intentionally data-driven (pending/running/acked/failed/
     -- blocked/cancelled/local); old profiles are upgraded additively in
@@ -345,7 +386,14 @@ CREATE TABLE IF NOT EXISTS mcp_audit (
 CREATE TABLE IF NOT EXISTS outbox (
     id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    draft_id TEXT REFERENCES drafts(id),
+    -- v28: `ON DELETE SET NULL`, same reasoning as `drafts.thread_id` and
+    -- for the same class of bug. T-041/T-045 make an outbox row a frozen,
+    -- self-contained snapshot: once it exists it never reads the draft
+    -- again, so the pointer back is a provenance breadcrumb, not a
+    -- dependency. Under NO ACTION that breadcrumb made `Core::delete_draft`
+    -- impossible for any draft that had ever been sent -- the discard came
+    -- back as "Couldn't save that change." and the row stayed forever.
+    draft_id TEXT REFERENCES drafts(id) ON DELETE SET NULL,
     from_addr TEXT NOT NULL DEFAULT '',
     to_addr TEXT NOT NULL,
     cc TEXT NOT NULL DEFAULT '',
@@ -531,6 +579,15 @@ CREATE INDEX IF NOT EXISTS fts_pending_queued_at ON fts_pending (queued_at);
 -- contains. `Database::migrate`'s `current < 23` block re-queues every
 -- message with a cached body for the same reason the v9 block did, and with
 -- the same no-op effect on a fresh install.
+
+-- T-155 (schema v29): the same again, once more data-only. The text
+-- normalisation `messages_fts` is fed with changed, so every row indexed by
+-- the old one answers a different set of queries than a row indexed today.
+-- `Database::migrate`'s `current < 29` block re-queues *every* message, not
+-- just those with a cached body as in v9/v23: normalisation applies to the
+-- subject and the addresses too, which are indexed for a message whose body
+-- was never downloaded. On a fresh install `messages` is empty and the
+-- block is a no-op, so this file stays what a v28 install already had.
 
 -- T-060s (schema v20): the one durable door a *headless* process has for
 -- "sync this account now". The stdio MCP server runs in its own process
