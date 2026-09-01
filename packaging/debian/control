@@ -1,0 +1,15 @@
+Package: feathermail
+Version: @VERSION@
+Section: mail
+Priority: optional
+Architecture: amd64
+Maintainer: prodocik <prodocik@gmail.com>
+Installed-Size: @INSTALLED_SIZE@
+Depends: libgtk-4-1 (>= 4.10), libwebkitgtk-6.0-4, libsecret-1-0
+Homepage: https://github.com/prodocik/feathermail
+Description: Linux-native local-first email client
+ Feather Mail is a GTK4 email client with IMAP, SMTP and local SQLite cache.
+ .
+ The shell needs GTK 4.10 or newer and the WebKitGTK 6.0 (GTK4) API, so it
+ does not install on releases that only ship GTK 4.6/4.8 or the WebKit
+ 2.0/4.1 API series.

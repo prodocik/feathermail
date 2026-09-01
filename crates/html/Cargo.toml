@@ -1,0 +1,19 @@
+[package]
+name = "feathermail-html"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "HTML sanitize policy for WebKitGTK bodies"
+
+[dependencies]
+ammonia = "4.1.4"
+base64 = "0.22"
+cssparser = { version = "0.37.0", default-features = false }
+html5ever = "0.39.0"
+url = "2.5.8"
+
+[lints]
+workspace = true

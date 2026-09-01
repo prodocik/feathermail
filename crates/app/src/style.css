@@ -1,0 +1,1683 @@
+/* Cool Paper Inbox shell. Layout is GTK widgets; this file is paint only. */
+
+window.fm-shell {
+  background-color: @paper_pane;
+  color: @ink;
+  font-family: Inter, "Adwaita Sans", Cantarell, sans-serif;
+  /* T-116: type scale. DESIGN.md: 100–200% via text-scale, 8px grid stays
+     logical (padding/min-height keep px). Descendant `font-size: Npx` would
+     pin device pixels and ignore this, so every other font-size is
+     `calc(Npx * var(--fm-scale))` and these classes only change the factor. */
+  --fm-scale: 1;
+  font-size: calc(15px * var(--fm-scale));
+}
+
+window.fm-shell.scale-125 { --fm-scale: 1.25; }
+window.fm-shell.scale-150 { --fm-scale: 1.5; }
+window.fm-shell.scale-175 { --fm-scale: 1.75; }
+window.fm-shell.scale-200 { --fm-scale: 2; }
+
+window.fm-shell * {
+  color: inherit;
+  font-family: inherit;
+}
+
+/* GTK 4.20's theme paints button fills as a background-image, which covers
+   our background-color rules. Reset the image once here so every button
+   class below paints its own fill. */
+window.fm-shell button {
+  background-image: none;
+}
+
+/* T-097(5): no focus ring anywhere. T-054 gave every interactive surface a
+   shared 2px `@focus_ring` outline; the owner's answer on the live desk was
+   that the blue border has to go from everywhere, so these selectors now
+   turn the ring *off* rather than paint it.
+   They are kept, rather than deleted, for two reasons. `outline: none` is
+   what stops the host GTK theme drawing its own ring in its own accent --
+   deleting the rules would trade a blue border for an orange one on a system
+   that is themed that way. And the selectors themselves were hard-won:
+   an entry is matched with `:focus-within`, not `:focus`, because a GtkEntry
+   never carries the focus itself (it lives on the `text` node inside it), and
+   the list is matched with `:focus-visible` so the state only exists after a
+   keyboard move at all.
+   The cost is real and is not hidden here: a keyboard-only user now has no
+   ring to follow. What is left as focus feedback is the compose field's
+   accent underline (`.compose-grid entry.compose-field:focus-within`) and the
+   list's own selection. */
+window.fm-shell button:focus,
+window.fm-shell entry:focus-within,
+window.fm-shell textview:focus,
+window.fm-shell listview:focus-visible,
+window.fm-shell .thread-list:focus-visible {
+  outline: none;
+}
+
+/* T-097(6): no `min-width` here any more. The sidebar is a `GtkPaned` start
+   child now, and a CSS minimum is a floor the divider cannot be dragged past
+   -- with 280px here the pane could be widened and never narrowed. The floor
+   is `MIN_SIDEBAR_WIDTH` on the widget's own size request instead, which is
+   the same number in a place the drag can see. */
+.sidebar {
+  background-color: @paper_sidebar;
+  /* T-101: no right-hand hairline here. The sidebar is a `GtkPaned` start
+     child and the paned separator already draws that seam, so this painted a
+     second line right beside it -- twice the ink the design asks for, and the
+     other half of "too bright". One seam per boundary. */
+  padding: 0;
+}
+
+/* T-099: the list/reader divider is a `GtkPaned` position now, so the list
+   pane's own floor lives on the widget (`MIN_LIST_WIDTH`) -- a CSS minimum
+   there would also floor the divider and make the drag one-way. What is left
+   for CSS is the other side: how far right the divider may go before the
+   reading pane stops being a reading pane. The shell keeps the comfortable
+   split at wide sizes and lets the reader give up more of it on a narrow
+   desk, which is what the `narrow-shell` observer is for. */
+.preview-pane {
+  min-width: 420px;
+}
+window.fm-shell.narrow-shell .preview-pane {
+  min-width: 320px;
+}
+
+.sidebar-scroll {
+  padding: 24px 20px 16px;
+}
+
+.account {
+  padding: 0 8px;
+  border-radius: 12px;
+  background: none;
+  border: none;
+  box-shadow: none;
+  min-height: 48px;
+}
+.account:hover {
+  background-color: @row_hover;
+}
+.account-name {
+  font-size: calc(16px * var(--fm-scale));
+  font-weight: 650;
+  color: @ink;
+  letter-spacing: -0.01em;
+}
+.account-email {
+  font-size: calc(13px * var(--fm-scale));
+  color: @ink_secondary;
+}
+.account .chevron {
+  color: @ink_tertiary;
+  margin-left: 4px;
+}
+button.account-pick {
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: none;
+  border: none;
+  box-shadow: none;
+  min-height: 44px;
+}
+button.account-pick:hover {
+  background-color: @row_hover;
+}
+button.account-pick.active {
+  background-color: @paper_selected;
+}
+.account-status {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 999px;
+  background-color: @ink_tertiary;
+  margin-top: 8px;
+}
+.account-status.synced {
+  background-color: @accent;
+}
+.account-status.syncing {
+  background-color: @ink_secondary;
+}
+.account-status.offline {
+  background-color: @ink_tertiary;
+}
+.account-status.error {
+  background-color: @ink;
+}
+
+.folder-head {
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 500;
+  color: @ink_tertiary;
+  letter-spacing: 0.01em;
+  padding: 8px 8px 4px;
+}
+.folder-head label {
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 500;
+  color: @ink_tertiary;
+}
+button.icon-tiny {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: @ink_tertiary;
+}
+button.icon-tiny:hover {
+  background-color: @row_hover;
+  border-radius: 12px;
+}
+.prompt-title {
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 650;
+  color: @ink;
+}
+
+button.nav-item {
+  min-height: 40px;
+  padding: 0 14px;
+  border-radius: 12px;
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: @ink;
+  font-size: calc(15px * var(--fm-scale));
+}
+button.nav-item:hover {
+  background-color: @row_hover;
+}
+button.nav-item.active {
+  background-color: @paper_selected;
+  color: @accent;
+  font-weight: 650;
+}
+button.nav-item.active label,
+button.nav-item.active image {
+  color: @accent;
+}
+.nav-count {
+  font-size: calc(13px * var(--fm-scale));
+  color: @ink_tertiary;
+}
+button.nav-item.active .nav-count {
+  color: @accent;
+  font-weight: 650;
+}
+
+/* T-097(10): a custom folder's row is the button plus its own actions
+   menu. The `⋯` is muted rather than hidden -- an affordance that only
+   appears on hover is one the user has to already know about, which is
+   exactly how deleting a folder became impossible to find. */
+.nav-row {
+  padding: 0;
+}
+/* Both nodes: a `GtkMenuButton`'s own CSS node is `menubutton`, and the
+   thing that draws the frame is the plain `button` GTK puts inside it. A
+   rule on one of them alone leaves the other one framed. */
+.nav-more,
+.nav-more > button {
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0;
+  border-radius: 999px;
+  background: none;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  color: @ink_tertiary;
+}
+.nav-more > button:hover {
+  background-color: @row_hover;
+  color: @ink;
+}
+.nav-more-popover contents {
+  padding: 4px;
+}
+
+/* The flat left-aligned rows a popover uses for a list of choices. Shared
+   with the recipient suggestions, which have been asking for it. */
+button.menu-item {
+  padding: 6px 12px;
+  min-height: 32px;
+  border-radius: 8px;
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: @ink;
+  font-size: calc(14px * var(--fm-scale));
+}
+button.menu-item label {
+  /* GTK centres a button's label; a menu row reads as a list only when
+     every row starts on the same left edge. */
+  padding-right: 8px;
+}
+button.menu-item:hover {
+  background-color: @row_hover;
+}
+button.menu-item.destructive label {
+  color: @danger;
+}
+
+/* T-097(11): the New-folder colour picker. The swatch is a ring around the
+   same `.folder-dot` the sidebar draws, so the choice and its result are
+   literally the same widget. */
+.swatch-row {
+  padding: 2px 0;
+}
+button.swatch {
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0;
+  border-radius: 999px;
+  background: none;
+  border: 2px solid transparent;
+  box-shadow: none;
+}
+button.swatch:hover {
+  border-color: @hairline;
+}
+button.swatch:checked {
+  background: none;
+  border-color: @ink;
+}
+button.swatch .folder-dot {
+  min-width: 14px;
+  min-height: 14px;
+}
+
+.folder-dot {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 999px;
+  background-color: @ink_tertiary;
+}
+.dot-work { background-color: @folder_work; }
+.dot-personal { background-color: @folder_personal; }
+.dot-projects { background-color: @folder_projects; }
+.dot-receipts { background-color: @folder_receipts; }
+.dot-travel { background-color: @folder_travel; }
+
+.sidebar-foot {
+  padding: 12px 16px;
+  border-top: 1px solid @hairline;
+}
+
+.main {
+  background-color: @paper_pane;
+}
+
+.topbar {
+  min-height: 80px;
+  padding: 0 24px;
+  border-bottom: 1px solid @hairline;
+}
+
+/* T-036: selection count is a quiet status label; actions keep the same
+   icon-only toolbar metrics as the single-thread state. */
+.bulk-count {
+  color: @ink_secondary;
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 650;
+  min-width: 74px;
+}
+
+/* T-036: same quiet, inline selection bar as ui-preview. The bar replaces
+   the ordinary actions while two or more rows are selected; it never shifts
+   the search field or adds a second panel. */
+.selection-bar {
+  min-height: 40px;
+  padding: 0;
+  color: @ink;
+}
+
+.selection-bar button.btn-icon:disabled {
+  opacity: 0.45;
+}
+
+.selection-bar button.btn-icon:disabled:hover {
+  background-color: transparent;
+}
+
+button.btn-primary {
+  min-height: 48px;
+  min-width: 132px;
+  padding: 0 22px;
+  border-radius: 999px;
+  background-color: @accent;
+  color: @accent_text;
+  font-size: calc(16px * var(--fm-scale));
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+button.btn-primary:hover {
+  background-color: @accent_deep;
+}
+button.btn-primary:focus {
+  outline: none;
+}
+button.btn-primary label,
+button.btn-primary image {
+  color: @accent_text;
+}
+
+/* The top-bar Compose action is deliberately lighter than dialog actions:
+   it keeps a 44px accessible hit target but does not compete with the search
+   field or get pressed into the icon cluster on narrower windows. */
+button.compose-button {
+  min-width: 0;
+  min-height: 44px;
+  padding: 0 14px;
+}
+button.compose-button image {
+  min-width: 16px;
+  min-height: 16px;
+}
+
+.search {
+  background-color: @paper_recess;
+  border-radius: 999px;
+  min-height: 48px;
+  padding: 0 8px 0 14px;
+  border: none;
+  box-shadow: none;
+}
+.search:focus-within {
+  outline: none;
+}
+.search entry {
+  background: none;
+  /* Without this the query runs under the "/" badge at the pill's end. */
+  padding-right: 8px;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  color: @ink;
+  font-size: calc(15px * var(--fm-scale));
+  min-height: 44px;
+}
+.search entry placeholder {
+  color: @ink_tertiary;
+}
+
+.kbd {
+  min-width: 30px;
+  min-height: 30px;
+  margin-right: 4px;
+  border-radius: 999px;
+  background-color: @kbd_fill;
+  color: @ink_tertiary;
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 500;
+}
+
+button.btn-icon {
+  min-width: 40px;
+  min-height: 40px;
+  padding: 0;
+  border-radius: 12px;
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: @ink_secondary;
+}
+button.btn-icon:hover {
+  background-color: @paper_recess;
+  color: @ink;
+}
+
+button.ghost {
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: @ink_secondary;
+  font-size: calc(15px * var(--fm-scale));
+  border-radius: 12px;
+  padding: 4px 8px;
+}
+button.ghost:hover {
+  background-color: @paper_recess;
+}
+
+/* ui-preview's `.ghost-btn`: a settings action that stands alone in its row
+   is a button the user has to find, so it gets an outline and a hit area.
+   Plain `.ghost` is the quiet form the reference keeps for the second action
+   in a pair (`Edit`/`Remove`, `Save draft`/`Discard`), where it renders with
+   `border: 0`; without this class the standing actions rendered as grey text
+   with nothing around them -- "Sync now" and "Add account" did not read as
+   pressable at all. The height is the reference's own in-row override
+   (36px/12px), not the 48px of a dialog's primary action. */
+button.ghost.pill {
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid @stroke_soft;
+  border-radius: 999px;
+  background-color: @paper_pane;
+  color: @ink;
+  font-size: calc(16px * var(--fm-scale));
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+button.ghost.pill:hover {
+  background-color: @paper_recess;
+}
+button.ghost.pill:disabled {
+  color: @ink_tertiary;
+}
+
+.list-pane {
+  /* T-101: same as `.sidebar` -- the list/reader seam is the paned separator's
+     to draw, and a second line here doubled it. */
+  background-color: @list_board;
+}
+
+.list-head {
+  padding: 24px 16px 12px;
+}
+.list-title {
+  font-size: calc(22px * var(--fm-scale));
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  color: @ink;
+}
+
+listview.thread-list {
+  background-color: @list_board;
+  border: none;
+  box-shadow: none;
+  padding: 0 0 16px;
+}
+listview.thread-list > row {
+  padding: 0;
+  margin: 0;
+  background: none;
+  box-shadow: none;
+  outline: none;
+  border: none;
+}
+listview.thread-list > row:hover,
+listview.thread-list > row:selected,
+listview.thread-list > row:active {
+  background: none;
+  box-shadow: none;
+  outline: none;
+}
+
+.date-group {
+  min-height: 56px;
+  padding: 0 16px 8px;
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: @ink_tertiary;
+}
+
+.msg-row {
+  /* T-097(1,2): every card is exactly as tall as its four fixed slots --
+     sender line, subject line, two preview lines -- and never as tall as the
+     text that happened to arrive. GTK's min-height is content-box here:
+     19 + 19 + 34 + two 2px gaps is 76, and 10px vertical padding makes the
+     96px outer card (was 128px). A row whose preview text is not fetched yet
+     puts a skeleton in the same 34px slot, so the card does not change shape
+     under the reader when the text lands. */
+  min-height: 76px;
+  margin: 0 12px 8px;
+  /* T-099: 10px on the right, not 16px -- the owner asked for the star and
+     the hover plate to sit 10px in from the card's corner, and the star is
+     laid out by this padding. The text keeps its 16px on the left, where
+     nothing is pinned to the edge. */
+  padding: 10px 10px 10px 16px;
+  border-radius: 12px;
+  background-color: @paper_pane;
+}
+/* T-099: the selection is painted from GTK's selection model and nowhere
+   else. A class-based twin of this rule used to live here, written onto the
+   card at bind time and never taken back when the selection moved on -- the
+   row being opened was rebound, the row being left was not, so three clicks
+   left three cards blue. */
+listview.thread-list > row:selected .msg-row {
+  background-color: @row_selected;
+}
+.msg-attach {
+  color: @ink_tertiary;
+}
+.msg-importance {
+  color: @accent;
+  margin-top: 2px;
+}
+
+.unread-dot {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 999px;
+  background-color: @ink_tertiary;
+  margin-top: 6px;
+}
+.msg-row.unread .unread-dot {
+  background-color: @accent;
+}
+
+.msg-sender {
+  min-height: 19px;
+  font-size: calc(14px * var(--fm-scale));
+  font-weight: 500;
+  color: @ink;
+  letter-spacing: -0.01em;
+}
+.msg-row.unread .msg-sender {
+  font-weight: 650;
+}
+.msg-time {
+  font-size: calc(12px * var(--fm-scale));
+  color: @ink_tertiary;
+}
+.msg-subject {
+  min-height: 19px;
+  font-size: calc(14px * var(--fm-scale));
+  color: @ink;
+}
+.msg-row.unread .msg-subject {
+  font-weight: 650;
+}
+.msg-preview {
+  min-height: 34px;
+  font-size: calc(13px * var(--fm-scale));
+  line-height: 1.3;
+  color: @ink_tertiary;
+}
+/* T-097(7): the same 34px the text would take, so the card keeps its height
+   from first paint to fetched preview. Bars, not a spinner: a spinner says
+   "wait for this one row", and every row in a freshly synced folder is in
+   this state at once. */
+.preview-skeleton {
+  min-height: 34px;
+}
+.preview-skeleton .skel {
+  min-height: 9px;
+  margin: 0;
+}
+.msg-side {
+  min-width: 28px;
+  min-height: 28px;
+}
+button.btn-icon.star {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 999px;
+}
+
+.preview-pane {
+  background-color: @paper_pane;
+}
+.preview-empty {
+  color: @ink_tertiary;
+  font-size: calc(16px * var(--fm-scale));
+}
+.preview-subject {
+  font-size: calc(26px * var(--fm-scale));
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  color: @ink;
+}
+.chip {
+  background-color: @paper_recess;
+  color: @ink_secondary;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 500;
+}
+.avatar {
+  min-width: 40px;
+  min-height: 40px;
+  border-radius: 999px;
+  background-color: @avatar_blue;
+  color: @accent_text;
+  font-size: calc(16px * var(--fm-scale));
+  font-weight: 650;
+}
+.meta-name {
+  font-size: calc(16px * var(--fm-scale));
+  font-weight: 650;
+  color: @ink;
+}
+.meta-email {
+  font-size: calc(15px * var(--fm-scale));
+  color: @ink_secondary;
+}
+.meta-to,
+.meta-time {
+  font-size: calc(13px * var(--fm-scale));
+  color: @ink_tertiary;
+}
+.letter {
+  /* T-030: decoded plain-text bodies use the DESIGN.md body token, not
+     monospace source. HTML bodies render in the isolated WebView. */
+  font-family: Inter, "Adwaita Sans", Cantarell, sans-serif;
+  font-size: calc(16px * var(--fm-scale));
+  font-weight: 400;
+  line-height: 1.7;
+  color: @ink;
+}
+/* T-130: a link inside a plain-text body is Link Blue from DESIGN.md, the
+   same ink the sanitized HTML document paints its anchors with. GTK's own
+   default is the theme's accent, which is not this product's link colour
+   and in the dark theme sits far from the token. */
+.letter link {
+  color: @link;
+}
+
+.html-images-bar {
+  background-color: @paper_wash;
+  border-radius: 12px;
+  padding: 8px 12px;
+}
+.html-images-bar label {
+  font-size: calc(13px * var(--fm-scale));
+  color: @ink_secondary;
+}
+.html-images-bar button {
+  min-height: 32px;
+  padding: 4px 12px;
+  border-radius: 12px;
+  border: 1px solid @stroke_soft;
+  background-color: @paper_pane;
+  color: @ink;
+  font-size: calc(13px * var(--fm-scale));
+  box-shadow: none;
+}
+.html-images-bar button:hover {
+  background-color: @paper_recess;
+}
+
+.incoming-attachment-row {
+  min-height: 0;
+  padding: 8px 12px;
+  border: 1px solid @hairline;
+  border-radius: 12px;
+  background-color: @paper_recess;
+  color: @ink;
+}
+.incoming-attachment-name {
+  color: @ink;
+  font-size: calc(15px * var(--fm-scale));
+  font-weight: 500;
+}
+.incoming-attachment-meta {
+  color: @ink_secondary;
+  font-size: calc(13px * var(--fm-scale));
+}
+button.attachment-action {
+  min-height: 32px;
+  padding: 4px 10px;
+  border: 1px solid @stroke_soft;
+  border-radius: 12px;
+  background-color: @paper_pane;
+  color: @ink_secondary;
+  font-size: calc(13px * var(--fm-scale));
+  box-shadow: none;
+}
+button.attachment-action:hover:not(:disabled) {
+  background-color: @paper_wash;
+  color: @ink;
+}
+button.attachment-action:disabled {
+  color: @ink_tertiary;
+}
+
+.html-footer {
+  font-size: calc(13px * var(--fm-scale));
+  color: @ink_tertiary;
+}
+
+.thread-cards {
+  padding-bottom: 8px;
+}
+/* T-126: the earlier messages are history, not the letter -- they read
+   as a narrower stack under the open one. The inset is the whole
+   difference in width; padding stays put so the text inside two cards
+   still lines up with itself. */
+button.thread-card.collapsed {
+  min-height: 0;
+  padding: 12px 16px;
+  margin-left: 12px;
+  margin-right: 12px;
+  border-radius: 12px;
+  border: 1px solid @stroke_soft;
+  background-color: @paper_recess;
+  color: @ink;
+  box-shadow: none;
+}
+button.thread-card.collapsed:hover {
+  background-color: @paper_wash;
+}
+.thread-card.expanded {
+  border: 1px solid @stroke_soft;
+  border-radius: 12px;
+  background-color: @paper_pane;
+  padding: 12px 16px;
+}
+
+button.reply-bar {
+  min-height: 38px;
+  padding: 0 14px;
+  border-radius: 12px;
+  border: 1px solid @stroke_soft;
+  background-color: @paper_pane;
+  color: @ink_tertiary;
+  font-size: calc(15px * var(--fm-scale));
+  box-shadow: none;
+}
+button.reply-bar:hover {
+  background-color: @paper_recess;
+}
+
+.toast {
+  background-color: @paper_pane;
+  color: @ink;
+  border: 1px solid @hairline;
+  border-radius: 12px;
+  padding: 10px 14px;
+  box-shadow: none;
+  /* T-116: sit inside the list column, not wider than it. The label wraps. */
+  margin-left: 16px;
+  margin-right: 16px;
+}
+.toast .undo {
+  color: @accent;
+  background: none;
+  border: none;
+  font-weight: 650;
+}
+
+.empty-state {
+  color: @ink_secondary;
+  font-size: calc(15px * var(--fm-scale));
+  padding: 32px 16px;
+}
+.empty-state .title {
+  font-size: calc(15px * var(--fm-scale));
+  font-weight: 650;
+  color: @ink_secondary;
+}
+.empty-state .body {
+  font-size: calc(15px * var(--fm-scale));
+  color: @ink_tertiary;
+  margin-top: 4px;
+}
+
+.skeleton-list {
+  padding: 32px 16px;
+}
+/* T-097(7): the reading pane's loading state. Wider bars than the list's,
+   because what is coming is a paragraph and not a row of one-line cards. */
+.letter-skeleton {
+  padding: 8px 0 0;
+}
+/* T-099: a preloader, so it moves. A static grey bar is indistinguishable
+   from a card that simply has nothing in that slot, which is exactly how the
+   owner read it ("сообщение загружено, а скелетон не пропадает"). The pulse
+   is opacity only -- no gradient sweep -- because every visible row animates
+   at once during a warm-up and opacity is the one property GTK can animate
+   without re-snapshotting the bar's content. */
+@keyframes skel-pulse {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+.skel {
+  min-height: 12px;
+  border-radius: 8px;
+  background-color: @paper_recess;
+  margin: 8px 0;
+  animation: skel-pulse 1.4s ease-in-out infinite;
+}
+
+window.fm-shell.compact .msg-row {
+  min-height: 58px;
+  margin-bottom: 4px;
+  padding: 8px 16px;
+}
+window.fm-shell.compact button.nav-item {
+  min-height: 36px;
+}
+window.fm-shell.compact .date-group {
+  min-height: 40px;
+}
+window.fm-shell.compact .msg-preview {
+  min-height: 0;
+  font-size: 0;
+  opacity: 0;
+}
+
+paned > separator {
+  min-width: 1px;
+  min-height: 1px;
+  background-color: @hairline;
+  /* T-101: Adwaita paints the divider with `background-image: image(@borders)`,
+     and an image sits *over* a background colour -- the line stayed the stock
+     theme grey (#cdc7c2 measured on the light desk) no matter what @hairline
+     said. Against the dark panes that grey is what read as "the separators are
+     far too bright". Clearing the image is what lets the token through. */
+  background-image: none;
+  box-shadow: none;
+  border: none;
+}
+
+/* T-101: tooltips. A tooltip is its own toplevel, so nothing under
+   `window.fm-shell` reaches it and it was left to whatever the host GTK theme
+   paints -- on the owner's desk a dark plate with near-black text on it, which
+   is a hint nobody can read. Painted here with the same tokens as the rest of
+   the shell: paper under ink, one hairline, the 8px radius small surfaces use.
+   That also means the dark theme gets a dark tooltip with light text rather
+   than a light plate punched into it. */
+tooltip {
+  background-color: transparent;
+}
+tooltip.background,
+tooltip.background > box {
+  background-color: @paper_pane;
+  background-image: none;
+  color: @ink;
+  border: 1px solid @hairline;
+  border-radius: 8px;
+  box-shadow: none;
+}
+tooltip label {
+  color: @ink;
+  padding: 2px 4px;
+}
+
+.center-screen {
+  background-color: @paper_sidebar;
+}
+
+.welcome-card,
+.account-card {
+  padding: 32px;
+  min-width: 420px;
+}
+
+.welcome-mark {
+  margin-bottom: 16px;
+}
+
+.display {
+  font-size: calc(26px * var(--fm-scale));
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  color: @ink;
+}
+
+.lede {
+  font-size: calc(16px * var(--fm-scale));
+  color: @ink_secondary;
+  margin-bottom: 24px;
+}
+
+button.provider-btn {
+  min-height: 48px;
+  padding: 0 22px;
+  border-radius: 999px;
+  background-color: @paper_pane;
+  color: @ink;
+  border: 1px solid @stroke_soft;
+  font-size: calc(16px * var(--fm-scale));
+  font-weight: 650;
+  box-shadow: none;
+}
+button.provider-btn:hover {
+  background-color: @paper_recess;
+}
+.provider-service-icon {
+  min-width: 20px;
+  min-height: 20px;
+}
+
+.provider-yandex-mark {
+  min-width: 20px;
+  color: @provider_yandex;
+  font-size: calc(22px * var(--fm-scale));
+  font-weight: 700;
+}
+
+.preset-notice {
+  color: @ink_secondary;
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 500;
+}
+
+button.password-help {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  border-radius: 999px;
+  color: @ink_secondary;
+  background-color: transparent;
+  border: 1px solid @stroke_soft;
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 650;
+}
+button.password-help:hover {
+  color: @ink;
+  background-color: @paper_recess;
+}
+.password-help-popover {
+  padding: 0;
+}
+.password-help-body {
+  min-width: 320px;
+  padding: 14px;
+}
+.password-help-title {
+  color: @ink;
+  font-size: calc(16px * var(--fm-scale));
+  font-weight: 650;
+}
+.password-help-provider {
+  color: @ink;
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 650;
+}
+.password-help-copy {
+  color: @ink_secondary;
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 500;
+}
+button.password-help-link {
+  min-height: 24px;
+  padding: 0;
+  color: @accent;
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 650;
+}
+
+.account-form {
+  margin-top: 20px;
+}
+.account-form entry,
+.account-form passwordentry {
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: 12px;
+  border: 1px solid @stroke_soft;
+  background-color: @paper_pane;
+  color: @ink;
+  box-shadow: none;
+}
+.field-label {
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 500;
+  color: @ink_secondary;
+}
+.form-error {
+  font-size: calc(13px * var(--fm-scale));
+  color: @danger;
+}
+.wizard-error-slot {
+  min-height: 56px;
+  padding: 4px 8px 0;
+}
+.wizard-progress {
+  margin-top: 12px;
+  min-height: 120px;
+}
+.progress-label {
+  font-size: calc(16px * var(--fm-scale));
+  font-weight: 650;
+  color: @ink;
+}
+.account-form dropdown {
+  min-height: 44px;
+}
+
+.settings-shell {
+  background-color: @paper_pane;
+}
+
+.settings-overlay {
+  background-color: transparent;
+}
+.settings-scrim {
+  background-color: alpha(@ink, 0.18);
+  border: none;
+  box-shadow: none;
+}
+.settings-card {
+  border-radius: 12px;
+  border: 1px solid @hairline;
+  box-shadow: none;
+}
+
+.dialog-head {
+  padding: 16px 24px;
+  border-bottom: 1px solid @hairline;
+}
+
+headerbar.compose-header {
+  min-height: 56px;
+  padding: 0 16px;
+  background-color: @paper_pane;
+  border-bottom: 1px solid @hairline;
+}
+
+.settings-title {
+  font-size: calc(22px * var(--fm-scale));
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  color: @ink;
+}
+
+.settings-split {
+  background-color: @paper_pane;
+}
+
+.settings-nav-scroll {
+  border-right: 1px solid @hairline;
+  min-width: 200px;
+  padding: 8px;
+}
+
+/* Compose is a dedicated top-level window (D35), not a cramped form inside
+   the inbox. It uses the same restrained dialog grammar as Settings. */
+.compose-grid {
+  padding: 16px 24px;
+  border-bottom: 1px solid @hairline;
+}
+.compose-field-label {
+  min-width: 72px;
+  color: @ink_tertiary;
+  font-size: calc(15px * var(--fm-scale));
+}
+.compose-grid entry.compose-field {
+  min-height: 32px;
+  /* The left edge lines up with the read-only `From` value beside it, so only
+     the right side is padded -- a recipient long enough to fill the row must
+     not touch the window's edge. */
+  padding: 0 12px 0 0;
+  border: none;
+  border-radius: 0;
+  border-bottom: 1px solid transparent;
+  background: none;
+  box-shadow: none;
+  color: @ink;
+}
+/* `:focus-within` for the same reason as the shared focus ring above: the
+   focus is on the entry's inner `text` node, so `:focus` never matched and
+   the field's accent underline never appeared. */
+.compose-grid entry.compose-field:focus-within {
+  border-bottom-color: @accent;
+}
+window.fm-shell .compose-grid entry.compose-field:focus-within {
+  outline: none;
+}
+.compose-grid entry.compose-field:disabled {
+  color: @ink_secondary;
+}
+.compose-format-bar {
+  padding: 8px 16px;
+  border-bottom: 1px solid @hairline;
+}
+.compose-format-bar button.compose-format {
+  min-width: 32px;
+  min-height: 32px;
+  padding: 6px;
+}
+.compose-body-scroll {
+  background-color: @paper_pane;
+}
+textview.compose-body,
+textview.compose-body text {
+  padding: 16px 20px;
+  background-color: @paper_pane;
+  color: @ink;
+  font-size: calc(16px * var(--fm-scale));
+  line-height: 1.7;
+}
+.compose-placeholder {
+  color: @ink_tertiary;
+  font-size: calc(16px * var(--fm-scale));
+  padding: 0;
+}
+.compose-attachments,
+.compose-forward-attachments {
+  padding: 8px 0;
+}
+.compose-forward-heading {
+  color: @ink_secondary;
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 500;
+  padding: 0 0 4px;
+}
+.compose-attachment-row,
+.compose-forward-attachment {
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 1px solid @hairline;
+  border-radius: 12px;
+  background-color: @paper_recess;
+}
+.dialog-foot {
+  padding: 16px 24px;
+  border-top: 1px solid @hairline;
+}
+button.compose-send {
+  min-height: 40px;
+  /* GTK's min-width is the content box; 52 + 14px horizontal padding = 80. */
+  min-width: 52px;
+  padding: 0 14px;
+}
+button.compose-secondary {
+  min-height: 36px;
+  padding: 0 12px;
+}
+
+.settings-pane {
+  padding: 24px;
+}
+
+.settings-heading {
+  font-size: calc(16px * var(--fm-scale));
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  color: @ink;
+  padding: 0 0 12px;
+}
+
+.setting-row {
+  padding: 12px 0;
+  border-bottom: 1px solid @hairline;
+  min-height: 52px;
+  font-size: calc(15px * var(--fm-scale));
+}
+.setting-value {
+  color: @ink_secondary;
+  font-size: calc(15px * var(--fm-scale));
+}
+
+.settings-intro {
+  color: @ink_secondary;
+  font-size: calc(14px * var(--fm-scale));
+  margin-bottom: 4px;
+}
+.account-settings-card {
+  background-color: @paper_pane;
+  border: 1px solid @hairline;
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 12px;
+}
+.account-settings-avatar {
+  min-width: 40px;
+  min-height: 40px;
+  border-radius: 999px;
+  background-color: @paper-selected;
+  color: @accent;
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 650;
+}
+.account-settings-name {
+  color: @ink;
+  font-size: calc(15px * var(--fm-scale));
+  font-weight: 650;
+}
+.account-settings-email {
+  color: @ink_secondary;
+  font-size: calc(13px * var(--fm-scale));
+}
+.account-status {
+  border-radius: 999px;
+  padding: 4px 8px;
+  background-color: @paper_recess;
+  color: @ink_secondary;
+  font-size: calc(12px * var(--fm-scale));
+}
+.account-status.synced,
+.account-status.syncing {
+  background-color: @paper-selected;
+  color: @accent;
+}
+.account-status.error {
+  color: @danger;
+}
+.account-settings-actions {
+  border-top: 1px solid @hairline;
+  padding-top: 12px;
+}
+.account-settings-card entry {
+  min-height: 40px;
+  border: 1px solid @stroke_soft;
+  border-radius: 12px;
+  background-color: @paper_recess;
+  color: @ink;
+  box-shadow: none;
+}
+
+.segmented {
+  background-color: @paper_recess;
+  border-radius: 12px;
+  padding: 2px;
+}
+.segmented button {
+  min-height: 32px;
+  padding: 0 12px;
+  border-radius: 6px;
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: @ink_secondary;
+  font-size: calc(13px * var(--fm-scale));
+}
+.segmented button.is-on {
+  background-color: @paper_pane;
+  color: @ink;
+  font-weight: 650;
+}
+
+switch.switch {
+  min-width: 40px;
+  min-height: 24px;
+  padding: 0;
+  border-radius: 999px;
+  background-color: @stroke_soft;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+switch.switch:checked {
+  background-color: @accent;
+}
+switch.switch slider {
+  min-width: 20px;
+  min-height: 20px;
+  margin: 2px;
+  border-radius: 999px;
+  background-color: @paper_pane;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+.shortcut-row {
+  padding: 8px 32px;
+  border-bottom: 1px solid @hairline;
+  font-size: calc(15px * var(--fm-scale));
+}
+
+popover.fm-search,
+popover.fm-search > contents {
+  background-color: @paper_pane;
+  border: 1px solid @hairline;
+  border-radius: 12px;
+  padding: 4px;
+  box-shadow: none;
+}
+
+.search-overlay {
+  min-width: 360px;
+  padding: 4px;
+}
+
+button.search-hit {
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: none;
+  border: none;
+  box-shadow: none;
+}
+button.search-hit:hover {
+  background-color: @paper_wash;
+}
+.search-hit .from {
+  font-weight: 650;
+  color: @ink;
+  font-size: calc(15px * var(--fm-scale));
+}
+.search-hit .when {
+  color: @ink_tertiary;
+  font-size: calc(13px * var(--fm-scale));
+}
+.search-hit .sub {
+  color: @ink_secondary;
+  font-size: calc(15px * var(--fm-scale));
+}
+
+.search-hint {
+  color: @ink_tertiary;
+  font-size: calc(13px * var(--fm-scale));
+  padding: 8px 12px;
+}
+
+.pull-refresh-bubble {
+  color: @accent;
+  background-color: @paper_pane;
+  border: 1px solid @stroke_soft;
+  border-radius: 999px;
+  padding: 7px;
+  transition: margin 120ms ease-out, opacity 120ms ease-out;
+}
+.pull-refresh-bubble.armed {
+  color: @accent_deep;
+  background-color: @paper_selected;
+  border-color: alpha(@accent, 0.28);
+}
+@keyframes pull-refresh-burst {
+  0% { opacity: 1; }
+  60% { opacity: 0.82; }
+  100% { opacity: 0; }
+}
+.pull-refresh-bubble.burst {
+  animation: pull-refresh-burst 360ms ease-out 1;
+}
+
+window.fm-shell.reduce-motion * {
+  transition: none;
+}
+/* T-099: Reduce motion means the pulse too, not only transitions. The bars
+   stay -- they are still the "this is loading" shape -- they just hold
+   still. */
+window.fm-shell.reduce-motion .skel {
+  animation: none;
+}
+
+/* T-084: a folder the server permanently refused to create. Dimmed rather
+   than coloured with an error tone: it is not an error the user must act
+   on right now, it is a standing fact about the row. The row stays fully
+   usable -- mail moved into it while the create was queued lives here. */
+button.nav-item.nav-not-created label {
+  color: @ink_tertiary;
+}
+.nav-not-created-mark {
+  color: @ink_tertiary;
+}
+
+/* T-086: standing notice that this session runs on a throwaway in-memory
+   profile (the on-disk database could not be opened). Neutral paper tone
+   with a hairline seam, matching the "one accent, restrained everywhere
+   else" rule (DESIGN.md) -- this is not a second, alarming color voice,
+   it is a fact that stays true for the whole session, so it reads closer
+   to a fixed header bar than to a toast. */
+.ephemeral-banner {
+  background-color: @paper_recess;
+  border-bottom: 1px solid @hairline;
+  padding: 12px 20px;
+}
+.ephemeral-banner image {
+  color: @ink_secondary;
+}
+.ephemeral-banner-title {
+  font-size: calc(15px * var(--fm-scale));
+  font-weight: 650;
+  color: @ink;
+}
+.ephemeral-banner-body {
+  font-size: calc(13px * var(--fm-scale));
+  color: @ink_secondary;
+}
+
+/* T-032 (D39): hover quick actions on thread rows. The strip is an
+   overlay child (rows.rs), so it never shifts the text; hidden state is
+   opacity only, and rows.rs also drops `can_target` because GTK's
+   `opacity: 0` does not stop clicks. Time label and the unstarred star
+   fade out under the strip, like the preview. 28px buttons (preview),
+   not the 40px toolbar size. Tokens only -- no new hex. */
+.quick-actions {
+  opacity: 0;
+  /* T-099: 10px in from the card's top-right corner, as asked. The strip is
+     an overlay child over the whole row, so its margins count from the
+     overlay's edge, and the card is inset 12px of its own: 12 + 10 = 22.
+     The plate therefore lands on the star instead of stopping short of it
+     (T-097(4)) -- rows.rs hides the covered star and gives the strip a star
+     of its own in that slot, so the action stays exactly where it was. */
+  margin-top: 10px;
+  margin-right: 22px;
+  /* T-097(4): a plate. Without one the icons floated straight on the card and
+     collided with the subject and the preview underneath them; the plate is
+     what makes the strip a control group instead of four glyphs on text. */
+  padding: 3px;
+  border-radius: 999px;
+  background-color: @paper_pane;
+  border: 1px solid @hairline;
+}
+/* The hover class sits on the overlay (rows.rs), because that is the one
+   widget that contains both the row and the strip. Anchored on `.msg-row`
+   these selectors described a tree that does not exist: the strip is the
+   row's overlay *sibling*, so it never lit up. */
+.quick-on .quick-actions {
+  opacity: 1;
+}
+/* T-097(4): only the timestamp fades -- the plate covers it. Nothing fades
+   the star: fading it was what forced T-054's `can_target` dance (GTK's
+   `opacity: 0` does not stop clicks, so an invisible star still swallowed
+   presses aimed at Snooze). T-099 hides it outright while the plate is over
+   it and puts a working star in the plate's last slot. */
+.quick-on .msg-time {
+  opacity: 0;
+}
+.quick-actions button.btn-icon {
+  min-width: 26px;
+  min-height: 26px;
+  padding: 4px;
+}
+
+/* T-032: the short menus (More overflow, row/preview context menu).
+   Same shape as popover.fm-search: paper, hairline, 12px (Two Radii
+   Rule -- not the preview's 6px), no shadow. */
+popover.fm-menu,
+popover.fm-menu > contents {
+  background-color: @paper_pane;
+  border: 1px solid @hairline;
+  border-radius: 12px;
+  padding: 4px;
+  box-shadow: none;
+}
+popover.fm-menu button.ghost {
+  padding: 6px 12px;
+}
+
+/* T-032: MenuButton carries .btn-icon on the menubutton node; style its
+   internal button like the toolbar's plain buttons. */
+menubutton.btn-icon > button {
+  min-width: 40px;
+  min-height: 40px;
+  padding: 10px;
+  border-radius: 12px;
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: @ink_secondary;
+}
+menubutton.btn-icon > button:hover {
+  background-color: @paper_recess;
+  color: @ink;
+}
+
+/* MenuButton carries the class on the menubutton node; the visible widget
+   is its internal button, which still has the theme's padding/border (same
+   GTK 4.20 theme issue as the button fill above). Mirror the plain-button
+   resets for each class used on a MenuButton. */
+menubutton.account > button {
+  padding: 0 8px;
+  border-radius: 12px;
+  background: none;
+  border: none;
+  box-shadow: none;
+  min-height: 48px;
+  color: @ink;
+}
+menubutton.account > button:hover {
+  background-color: @row_hover;
+}
+menubutton.icon-tiny > button {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: @ink_tertiary;
+}
+menubutton.icon-tiny > button:hover {
+  background-color: @row_hover;
+  border-radius: 12px;
+}
+menubutton.ghost > button {
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: @ink_secondary;
+  font-size: calc(15px * var(--fm-scale));
+  border-radius: 12px;
+  padding: 4px 8px;
+}
+menubutton.ghost > button:hover {
+  background-color: @paper_recess;
+}
+
+/* T-037: Filter remains a quiet text action in the list header; the
+   popover chips make the active constraint explicit with the same tonal
+   selection as ui-preview. No extra accent surface or outline. */
+menubutton.filter-button > button {
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: @ink_secondary;
+  font-size: calc(15px * var(--fm-scale));
+  border-radius: 12px;
+  padding: 4px 8px;
+}
+menubutton.filter-button > button:hover {
+  background-color: @paper_recess;
+}
+popover.filter-menu,
+popover.filter-menu > contents {
+  min-width: 196px;
+}
+popover.filter-menu button.filter-chip {
+  min-height: 36px;
+  padding: 0 12px;
+  border-radius: 6px;
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: @ink;
+  font-size: calc(15px * var(--fm-scale));
+}
+popover.filter-menu button.filter-chip:hover {
+  background-color: @paper_wash;
+}
+popover.filter-menu button.filter-chip.active {
+  background-color: @paper_selected;
+  color: @accent;
+  font-weight: 650;
+}
+
+/* A starred row paints its star in accent (prototype: .star-btn.is-on). */
+button.btn-icon.star.active,
+button.btn-icon.star.active image {
+  color: @accent;
+}
+
+/* Search popover history / pager buttons: same flat row as .search-hit. */
+button.search-history-hit,
+button.search-load-more {
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: @ink;
+  font-size: calc(15px * var(--fm-scale));
+}
+button.search-history-hit:hover,
+button.search-load-more:hover {
+  background-color: @paper_recess;
+}
+
+/* T-078 (b): the "mail is being fetched" line above the list. Quiet by
+   construction -- it sits in the list column while the folder stays
+   readable, so it is sized and coloured as a caption, not as a banner. */
+/* T-132: the download reads at the foot of the sidebar, not over the
+   message list. Owner: "аккуратный минималистичный прогрессбар, который
+   будет показывать весь процесс. и убрать фетчинг из блока с
+   сообщениями". A caption in secondary ink and a 3px hairline trough --
+   the same restraint the rest of the chrome keeps; the accent is the one
+   colour allowed to move. */
+.sync-progress-label {
+  font-size: calc(12px * var(--fm-scale));
+  color: @ink_secondary;
+}
+
+.sync-progress-bar {
+  min-height: 3px;
+}
+
+.sync-progress-bar trough {
+  min-height: 3px;
+  border: none;
+  border-radius: 999px;
+  background-color: @paper_recess;
+}
+
+.sync-progress-bar progress {
+  min-height: 3px;
+  border: none;
+  border-radius: 999px;
+  background-color: @accent;
+}
+
+/* T-138: scrollbars are GTK's own chrome, not ours -- the stylesheet never
+   named them, so they kept whatever the desktop theme paints. Owner, on the
+   dark theme: "скроллбар выглядит слишком светлым" -- Adwaita's light slider
+   sat on our near-black panes as a bright bar. T-137 now tells GTK which
+   variant of its theme to draw, which already darkens them; these rules make
+   the answer ours rather than the host theme's, so a session running some
+   third-party GTK theme gets the same restraint. The slider is tertiary ink,
+   the same grey the timestamps use -- present when looked for, silent
+   otherwise -- and the trough stays transparent so the bar reads as sitting
+   on the pane rather than as a channel cut into it. */
+scrollbar {
+  background-color: transparent;
+  border: none;
+}
+
+scrollbar trough {
+  background-color: transparent;
+  border: none;
+}
+
+scrollbar slider {
+  background-color: @ink_tertiary;
+  border: none;
+  border-radius: 8px;
+  min-width: 8px;
+  min-height: 8px;
+  margin: 2px;
+}
+
+scrollbar slider:hover {
+  background-color: @ink_secondary;
+}
+
+scrollbar slider:active {
+  background-color: @ink;
+}
+
+/* The thin bar an overlay scrollbar leaves behind when the pointer is
+   elsewhere. Adwaita styles it with its own selector, which outranks the
+   rules above, so it has to be answered on its own terms. */
+scrollbar.overlay-indicator:not(.hovering):not(.dragging) slider {
+  background-color: @ink_tertiary;
+  border: 1px solid transparent;
+}

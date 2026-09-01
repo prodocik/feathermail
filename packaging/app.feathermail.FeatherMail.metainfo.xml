@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>app.feathermail.FeatherMail</id>
+  <name>Feather Mail</name>
+  <summary>Your email, without the clutter</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <launchable type="desktop-id">app.feathermail.FeatherMail.desktop</launchable>
+  <provides><binary>feathermail</binary></provides>
+  <url type="homepage">https://github.com/prodocik/feathermail</url>
+  <developer id="io.github.prodocik"><name>prodocik</name></developer>
+  <releases>
+    <release version="0.1.0" date="2026-09-01" />
+  </releases>
+  <content_rating type="oars-1.1" />
+  <description><p>Feather Mail is a Linux-native, local-first GTK4 email client with offline access, threaded conversations, search, IMAP synchronization and SMTP sending.</p></description>
+</component>

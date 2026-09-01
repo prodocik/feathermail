@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Feather Mail
+Comment=Your email, without the clutter
+Exec=feathermail %u
+Icon=app.feathermail.FeatherMail
+Terminal=false
+Categories=Network;Email;
+MimeType=x-scheme-handler/mailto;
+StartupNotify=true
+StartupWMClass=app.feathermail.FeatherMail

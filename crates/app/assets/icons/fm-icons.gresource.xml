@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/app/feathermail/icons">
+    <file>fm-archive-symbolic.svg</file>
+    <file>fm-attach-symbolic.svg</file>
+    <file>fm-bold-symbolic.svg</file>
+    <file>fm-chevron-down-symbolic.svg</file>
+    <file>fm-close-symbolic.svg</file>
+    <file>fm-compose-symbolic.svg</file>
+    <file>fm-drafts-symbolic.svg</file>
+    <file>fm-filter-symbolic.svg</file>
+    <file>fm-folder-symbolic.svg</file>
+    <file>fm-inbox-symbolic.svg</file>
+    <file>fm-italic-symbolic.svg</file>
+    <file>fm-link-symbolic.svg</file>
+    <file>fm-list-symbolic.svg</file>
+    <file>fm-moon-symbolic.svg</file>
+    <file>fm-more-symbolic.svg</file>
+    <file>fm-plus-symbolic.svg</file>
+    <file>fm-quote-symbolic.svg</file>
+    <file>fm-read-symbolic.svg</file>
+    <file>fm-refresh-bubble-symbolic.svg</file>
+    <file>fm-refresh-burst-symbolic.svg</file>
+    <file>fm-reply-symbolic.svg</file>
+    <file>fm-search-symbolic.svg</file>
+    <file>fm-sent-symbolic.svg</file>
+    <file>fm-settings-symbolic.svg</file>
+    <file>fm-snooze-symbolic.svg</file>
+    <file>fm-spam-symbolic.svg</file>
+    <file>fm-star-filled-symbolic.svg</file>
+    <file>fm-star-symbolic.svg</file>
+    <file>fm-sun-symbolic.svg</file>
+    <file>fm-trash-symbolic.svg</file>
+    <file>fm-underline-symbolic.svg</file>
+    <file>fm-unread-symbolic.svg</file>
+  </gresource>
+</gresources>

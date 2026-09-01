@@ -1,0 +1,32 @@
+/* DESIGN.md dark roles (precomputed; no color-mix so GTK 4.14 CI can load this). */
+/* --paper-sidebar --paper-pane --paper-recess --paper-wash --paper-selected */
+/* --ink --ink-secondary --ink-tertiary --hairline --stroke-soft */
+/* --accent --accent-deep --accent-text --link --avatar-blue --provider-yandex --danger */
+
+@define-color paper_sidebar #15171a;
+@define-color paper_pane #181b1f;
+@define-color paper_recess #272a2e;
+@define-color paper_wash #212c39;
+@define-color paper_selected #253446;
+@define-color ink #f3f4f6;
+@define-color ink_secondary #9ca3af;
+@define-color ink_tertiary #727880;
+@define-color hairline #292c30;
+@define-color stroke_soft #323539;
+@define-color accent #60a5fa;
+@define-color accent_deep #89bbf9;
+@define-color accent_text #111315;
+@define-color link #60a5fa;
+@define-color avatar_blue #3b82f6;
+@define-color provider_yandex #fc3f1d;
+@define-color folder_work #47cc50;
+@define-color folder_personal #9451f4;
+@define-color folder_projects #fb954a;
+@define-color folder_receipts #4181f3;
+@define-color folder_travel #2dd2e0;
+@define-color list_board #15181b;
+@define-color row_hover #1c2229;
+@define-color row_selected #1e2a38;
+@define-color kbd_fill #22262b;
+@define-color focus_ring #60a5fa;
+@define-color danger #ff8a80;

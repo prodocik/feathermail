@@ -1,0 +1,35 @@
+# Build
+/target/
+**/*.rs.bk
+*.deb
+*.rpm
+*.AppImage
+dist/
+
+# Secrets — never commit
+.env
+.env.*
+oauth.toml
+*.pem
+*.p12
+*.key
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local review captures
+.impeccable/review/
+.impeccable/live/
+docs/p0-review/
+
+# Node (ui-preview stays static; ignore if someone adds a bundler)
+node_modules/
+
+# Python bytecode from the native E2E / perf harnesses
+__pycache__/
+*.pyc

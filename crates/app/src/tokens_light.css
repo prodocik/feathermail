@@ -1,0 +1,33 @@
+/* DESIGN.md tokens 1:1. GTK @define-color uses underscores; comments keep --token names. */
+/* --paper-sidebar --paper-pane --paper-recess --paper-wash --paper-selected */
+/* --ink --ink-secondary --ink-tertiary --hairline --stroke-soft */
+/* --accent --accent-deep --accent-text --link --avatar-blue --provider-yandex --danger */
+/* --folder-work --folder-personal --folder-projects --folder-receipts --folder-travel */
+
+@define-color paper_sidebar #fafafc;
+@define-color paper_pane #ffffff;
+@define-color paper_recess #f5f6f8;
+@define-color paper_wash #f1f5fd;
+@define-color paper_selected #e5ecfd;
+@define-color ink #0b0c0e;
+@define-color ink_secondary #6b7280;
+@define-color ink_tertiary #9aa0ab;
+@define-color hairline #eef0f3;
+@define-color stroke_soft #e6e8ee;
+@define-color accent #1a64fc;
+@define-color accent_deep #1557e0;
+@define-color accent_text #ffffff;
+@define-color link #1a58f4;
+@define-color avatar_blue #3b82f6;
+@define-color provider_yandex #fc3f1d;
+@define-color folder_work #47cc50;
+@define-color folder_personal #9451f4;
+@define-color folder_projects #fb954a;
+@define-color folder_receipts #4181f3;
+@define-color folder_travel #2dd2e0;
+@define-color list_board #f5f6f8;
+@define-color row_hover #f8fafd;
+@define-color row_selected #eaf1fe;
+@define-color kbd_fill #ffffff;
+@define-color focus_ring #1a64fc;
+@define-color danger #b42318;

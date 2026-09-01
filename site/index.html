@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#fafafc">
+  <meta name="description" content="Feather Mail is a fast, minimal email client built natively for Linux with Rust and GTK4.">
+  <title>Feather Mail — fast, minimal email for Linux</title>
+  <link rel="icon" href="assets/mark.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="Feather Mail home">
+      <img src="assets/mark.png" width="36" height="36" alt="">
+      <span>Feather Mail</span>
+    </a>
+    <nav aria-label="Main navigation">
+      <a href="#features">Features</a>
+      <a href="#privacy">Privacy</a>
+      <a href="https://github.com/prodocik/feathermail">Source</a>
+    </nav>
+    <a class="button button-small" href="https://github.com/prodocik/feathermail/releases/latest">Download</a>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow"><span></span> Fast. Minimal. Native.</p>
+        <h1>Mail without<br>the wait.</h1>
+        <p class="lede">Feather Mail opens from a local cache and keeps synchronization in the background. A focused Linux-native interface leaves you with the message, not the machinery.</p>
+        <div class="hero-actions">
+          <a class="button" href="https://github.com/prodocik/feathermail/releases/latest">Download for Linux</a>
+          <a class="text-link" href="https://github.com/prodocik/feathermail">View source <span aria-hidden="true">↗</span></a>
+        </div>
+        <p class="fine-print">GPL-3.0-or-later · x86_64 .deb and AppImage</p>
+      </div>
+      <div class="hero-mark" aria-hidden="true">
+        <img src="assets/mark.png" alt="">
+      </div>
+    </section>
+
+    <section class="app-stage" aria-label="Feather Mail application screenshot">
+      <div class="window-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+      <div class="hero-shot"><img src="assets/inbox.png" alt="Feather Mail showing two mailboxes in a three-pane inbox"></div>
+    </section>
+
+    <section class="principles" id="features">
+      <p class="section-kicker">Speed you can feel</p>
+      <h2>Fast in the ways that matter.</h2>
+      <div class="feature-grid">
+        <article>
+          <span class="number">01</span>
+          <h3>Open, then sync</h3>
+          <p>Your inbox appears from local cache while new mail arrives in the background. No blank page waiting on the network.</p>
+        </article>
+        <article>
+          <span class="number">02</span>
+          <h3>Only what you need</h3>
+          <p>Three calm panes, one clear accent and no engagement clutter. Several mailboxes become one simple workflow.</p>
+        </article>
+        <article>
+          <span class="number">03</span>
+          <h3>Native and direct</h3>
+          <p>GTK4 controls and concise keyboard paths make compose, search, archive and reply feel immediate on Linux.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="gallery" aria-label="Feather Mail details">
+      <figure class="gallery-large">
+        <img src="assets/compose.png" alt="Composing an email in Feather Mail" loading="lazy">
+        <figcaption><span>Compose</span> A focused editor, with familiar formatting and attachments.</figcaption>
+      </figure>
+      <div class="gallery-copy">
+        <p class="section-kicker">Minimal by design</p>
+        <h2>Everything close. Nothing in the way.</h2>
+        <p>Switch mailboxes, search every account or compose a reply without changing context. Offline actions wait quietly and continue when the network returns.</p>
+        <figure class="detail-shot">
+          <img src="assets/accounts.png" alt="Feather Mail account switcher" loading="lazy">
+        </figure>
+      </div>
+    </section>
+
+    <section class="privacy" id="privacy">
+      <div>
+        <p class="section-kicker">Private by construction</p>
+        <h2>Your inbox is not a data source.</h2>
+      </div>
+      <ul>
+        <li><strong>No telemetry.</strong><span>There is no opt-in because nothing is collected.</span></li>
+        <li><strong>Remote images blocked.</strong><span>Tracking pixels and network images stay off until you choose otherwise.</span></li>
+        <li><strong>Secrets in the keyring.</strong><span>Passwords and tokens never go into SQLite, logs or MCP responses.</span></li>
+        <li><strong>HTML isolated.</strong><span>JavaScript is off; mail CSS and links pass explicit safety policies.</span></li>
+      </ul>
+    </section>
+
+    <section class="cta">
+      <img src="assets/mark.png" width="72" height="72" alt="" loading="lazy">
+      <p class="section-kicker">Open source · Linux native</p>
+      <h2>Less waiting. Less interface. More mail.</h2>
+      <div class="hero-actions">
+        <a class="button" href="https://github.com/prodocik/feathermail/releases/latest">Get Feather Mail 0.1</a>
+        <a class="text-link" href="https://github.com/sponsors/prodocik">Support development</a>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>© 2026 prodocik</span>
+    <span>Feather Mail is free software under GPL-3.0-or-later.</span>
+    <a href="https://github.com/prodocik/feathermail/blob/main/SECURITY.md">Security</a>
+  </footer>
+</body>
+</html>

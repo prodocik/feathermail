@@ -1,0 +1,20 @@
+[package]
+name = "feathermail-security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Keyring and log redaction"
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+secret-service = { version = "5.1.0", features = ["rt-async-io-crypto-rust"] }
+
+[dev-dependencies]
+feathermail-db = { path = "../db" }
+
+[lints]
+workspace = true

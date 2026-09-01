@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/db",
+    "crates/providers",
+    "crates/sync",
+    "crates/search",
+    "crates/html",
+    "crates/attachments",
+    "crates/notifications",
+    "crates/security",
+    "crates/service",
+    "crates/mcp",
+    "crates/app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/prodocik/feathermail"
+rust-version = "1.93"
+publish = false
+
+[workspace.dependencies]
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "env-filter", "ansi"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Отладочные символы: только таблицы строк для своего кода, ничего для зависимостей.
+# Бэктрейсы с файлом и номером строки остаются; пошаговая отладка в gdb/lldb — нет,
+# для неё поднять debug до 1. Режет вес debug-бинарников примерно вчетверо
+# и снимает пик памяти на линковке.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false

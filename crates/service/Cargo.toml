@@ -1,0 +1,41 @@
+[package]
+name = "feathermail-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Feather Mail — composition root: wires Core to the live IMAP/SMTP providers and runs sync in the background"
+
+[dependencies]
+feathermail-core = { path = "../core" }
+feathermail-attachments = { path = "../attachments" }
+feathermail-providers = { path = "../providers" }
+feathermail-sync = { path = "../sync" }
+feathermail-security = { path = "../security" }
+
+[dev-dependencies]
+# For tests only: seeds/inspects rows on the same on-disk SQLite profile a
+# test's `Core` handle also has open (WAL mode, see `Database::configure`),
+# since `Core.db` is `pub(crate)` and this crate has no other way to read
+# the `operations` table's `status` column from outside `feathermail-core`.
+# Already pinned once in the workspace root's `[workspace.dependencies]`
+# and used the same way by `crates/core`'s own test suite (`queue.rs`'s
+# `seed()`); not a new dependency to the workspace, just a new consumer of
+# an existing one.
+rusqlite = { workspace = true }
+tempfile = "3"
+# T-082: same path-dependency as `[dependencies]` above, re-declared here
+# with `test-support` turned on -- Cargo unifies the two into one build of
+# `feathermail-providers` for this crate's test targets, with the feature
+# enabled, while every other, non-test consumer of `feathermail-providers`
+# still builds it without the feature. This is what opens up
+# `feathermail_providers::test_support` (the shared fake IMAP server, moved
+# out of `crates/providers/src/apply.rs`'s own `#[cfg(test)]` module) to
+# the end-to-end test in `tests/`, without adding it to a normal build of
+# `feathermail-providers` itself.
+feathermail-providers = { path = "../providers", features = ["test-support"] }
+
+[lints]
+workspace = true
