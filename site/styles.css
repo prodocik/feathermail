@@ -141,6 +141,14 @@ figcaption span { color: var(--ink); font-weight: 700; margin-right: 8px; }
 .cta h2 { margin: 0 auto 36px; }
 .cta .hero-actions { justify-content: center; }
 
+.support { width: min(calc(100% - 48px), 900px); margin: -60px auto 130px; text-align: center; }
+.support p { margin: 0 0 20px; color: var(--secondary); }
+.wallets { margin: 0; display: grid; gap: 10px; justify-content: center; }
+.wallets div { display: flex; gap: 12px; align-items: baseline; justify-content: center; flex-wrap: wrap; }
+.wallets dt { font-weight: 700; font-size: 13px; }
+.wallets dd { margin: 0; }
+.wallets code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+
 footer { width: min(calc(100% - 48px), var(--max)); min-height: 90px; margin: 0 auto; display: flex; align-items: center; gap: 28px; border-top: 1px solid var(--hairline); color: var(--tertiary); font-size: 13px; }
 footer span:nth-child(2) { margin-left: auto; }
 
@@ -161,7 +169,7 @@ footer span:nth-child(2) { margin-left: auto; }
 }
 
 @media (max-width: 520px) {
-  .site-header, .hero, .principles, .gallery, .privacy, .cta, footer { width: min(calc(100% - 32px), var(--max)); }
+  .site-header, .hero, .principles, .gallery, .privacy, .cta, .support, footer { width: min(calc(100% - 32px), var(--max)); }
   .brand span { display: none; }
   h1 { font-size: 52px; }
   .hero { min-height: auto; padding-bottom: 56px; }

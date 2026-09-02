@@ -71,4 +71,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Feather Mail is [GPL-3.0-or-later](LICENSE) free software and is maintained by [prodocik](https://github.com/prodocik). Forks are welcome under the GPL. This canonical repository is solo-maintained and does not merge outside commits; bug reports and private [security reports](SECURITY.md) are welcome.
 
-Development is supported by donations, not by selling inbox data: [GitHub Sponsors](https://github.com/sponsors/prodocik).
+Development is supported by donations, not by selling inbox data. See [Support the project](#support-the-project).
+
+## Support the project
+
+- [GitHub Sponsors](https://github.com/sponsors/prodocik)
+- Crypto:
+
+| Network | Address |
+|---|---|
+| Bitcoin | `bc1qx6j4yswhckt4w3myfc3lluzz79rahq403m0jm3` |
+| Ethereum | `0xEb3C23Ad55c7F9ECbf5791F78C6123526667867D` |
+| Solana | `35XhyaYjHirh6gs5C3eiCYVXPHEmpuiXAgjmgBr1tSU2` |
