@@ -13,7 +13,7 @@ A fast, minimal email client built natively for Linux with Rust, GTK4 and Relm4.
   <a href="https://github.com/sponsors/prodocik"><img src="https://img.shields.io/github/sponsors/prodocik?style=flat-square&label=sponsors" alt="GitHub Sponsors"></a>
 </p>
 
-[Website](https://prodocik.github.io/feathermail/) · [Download v0.1](https://github.com/prodocik/feathermail/releases/latest) · [Install guide](docs/install.md) · [MCP guide](docs/mcp/overview.md) · [Changelog](CHANGELOG.md)
+[Website](https://prodocik.github.io/feathermail/) · [Download](https://github.com/prodocik/feathermail/releases/latest) · [Install guide](docs/install.md) · [MCP guide](docs/mcp/overview.md) · [Changelog](CHANGELOG.md)
 
 ![Feather Mail showing a local-first three-pane inbox](site/assets/inbox.png)
 
@@ -31,22 +31,22 @@ A fast, minimal email client built natively for Linux with Rust, GTK4 and Relm4.
 
 ## Install
 
-The [v0.1 release](https://github.com/prodocik/feathermail/releases/latest) provides x86_64 `.deb` and AppImage packages. Both require GTK 4.10 or newer and the WebKitGTK 6.0 runtime; the AppImage intentionally uses the host WebKitGTK so its helper processes stay version-matched.
+Every [release](https://github.com/prodocik/feathermail/releases/latest) ships x86_64 `.deb` and AppImage packages; the release page lists the current version and what changed. Both require GTK 4.10 or newer and the WebKitGTK 6.0 runtime; the AppImage intentionally uses the host WebKitGTK so its helper processes stay version-matched.
 
 ```bash
 # Ubuntu / Debian / Linux Mint
-sudo apt install ./feathermail_0.2.0_amd64.deb
+sudo apt install ./feathermail_*_amd64.deb
 
 # Other recent x86_64 distributions
-chmod +x Feather-Mail-0.2.0-x86_64.AppImage
-./Feather-Mail-0.2.0-x86_64.AppImage
+chmod +x Feather-Mail-*-x86_64.AppImage
+./Feather-Mail-*-x86_64.AppImage
 ```
 
 See [docs/install.md](docs/install.md) for dependencies, source builds and provider notes.
 
-## Account support in v0.1
+## Account support
 
-The Add Account screen configures manual IMAP/SMTP. Google and Yandex users should use provider app passwords. Microsoft 365 and Outlook.com commonly require Modern Auth and may reject password-only clients; interactive Microsoft OAuth is not exposed in this release. The UI says this before credentials are submitted.
+The Add Account screen configures IMAP/SMTP; after you enter your address it looks up the provider's servers (Thunderbird ISPDB and DNS SRV) and fills in whatever you left empty, and everything stays editable. Google and Yandex users should use provider app passwords. Microsoft 365 and Outlook.com commonly require Modern Auth and may reject password-only clients; interactive Microsoft OAuth is not exposed yet. The UI says this before credentials are submitted.
 
 Secrets are stored in the desktop Secret Service keyring, never in SQLite. If no keyring is available, Feather Mail refuses to save the account password.
 

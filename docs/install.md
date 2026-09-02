@@ -1,6 +1,6 @@
 # Install Feather Mail
 
-Feather Mail 0.1 is a native x86_64 Linux application. Windows, macOS, Flatpak, Snap, rpm and ARM packages are not included in this release.
+Feather Mail is a native x86_64 Linux application. Windows, macOS, Flatpak, Snap, rpm and ARM packages are not provided yet. The current version and its changes are listed on the [releases page](https://github.com/prodocik/feathermail/releases/latest).
 
 ## Requirements
 
@@ -12,21 +12,21 @@ The packages were built and smoke-tested on Ubuntu 25.10. Ubuntu 24.04+, Debian 
 
 ## Debian, Ubuntu and Linux Mint
 
-Download `feathermail_0.2.0_amd64.deb` from [GitHub Releases](https://github.com/prodocik/feathermail/releases/latest), then install it with dependency resolution:
+Download the `.deb` package from [GitHub Releases](https://github.com/prodocik/feathermail/releases/latest), then install it with dependency resolution:
 
 ```bash
-sudo apt install ./feathermail_0.2.0_amd64.deb
+sudo apt install ./feathermail_*_amd64.deb
 ```
 
 Launch **Feather Mail** from the app grid or run `feathermail`.
 
 ## AppImage
 
-Download `Feather-Mail-0.2.0-x86_64.AppImage` from [GitHub Releases](https://github.com/prodocik/feathermail/releases/latest):
+Download the AppImage from [GitHub Releases](https://github.com/prodocik/feathermail/releases/latest):
 
 ```bash
-chmod +x Feather-Mail-0.2.0-x86_64.AppImage
-./Feather-Mail-0.2.0-x86_64.AppImage
+chmod +x Feather-Mail-*-x86_64.AppImage
+./Feather-Mail-*-x86_64.AppImage
 ```
 
 The AppImage deliberately does not bundle WebKitGTK: WebKit spawns version-matched helper processes from the host. Install your distribution's WebKitGTK 6.0 runtime if the library is missing.
@@ -54,7 +54,7 @@ cargo run -p feathermail
 
 ## Add an account
 
-Version 0.1 exposes manual IMAP/SMTP configuration. Google and Yandex users should create a provider app password. Microsoft 365 and Outlook.com commonly require Modern Auth and may reject a password-only client; interactive Microsoft OAuth is not available in this UI release.
+The Add Account screen configures IMAP/SMTP. After you enter your address it looks up the provider's servers (Thunderbird ISPDB and DNS SRV) and fills in the fields you left empty; every field stays editable. Google and Yandex users should create a provider app password. Microsoft 365 and Outlook.com commonly require Modern Auth and may reject a password-only client; interactive Microsoft OAuth is not available yet.
 
 Feather Mail stores mail data under `~/.local/share/feathermail/`, caches bodies and attachments under `~/.cache/feathermail/`, and keeps credentials only in the session Secret Service keyring.
 
