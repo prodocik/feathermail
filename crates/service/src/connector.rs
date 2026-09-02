@@ -26,6 +26,15 @@ pub enum ConnectorKind {
     /// `MicrosoftImap`'s auth family (T-020): XOAUTH2 over the same wire
     /// mechanism as Gmail (`crates/providers/src/xoauth2.rs`).
     Microsoft,
+    /// T-165: a Gmail mailbox whose bearer token is issued by the desktop
+    /// session's account manager (`feathermail_providers::Goa`) instead of
+    /// by a Feather Mail OAuth client. On the wire this is identical to
+    /// [`Self::Gmail`] -- same XOAUTH2, same hosts, same keyring slot for
+    /// the access token -- so it is a separate variant for exactly one
+    /// reason: where the *next* token comes from when this one expires.
+    /// Folding it into `Gmail` would send it looking for a Google refresh
+    /// token that, by design, was never stored (D19a).
+    Goa,
     /// `GenericImapSmtp`'s auth family (T-018): plain LOGIN with the saved
     /// password. Also the fallback for any provider string this crate
     /// does not otherwise recognize, same as `Core::account_connection`'s
@@ -43,6 +52,7 @@ impl ConnectorKind {
         match provider {
             "gmail" => Self::Gmail,
             "microsoft" => Self::Microsoft,
+            "goa" => Self::Goa,
             _ => Self::Generic,
         }
     }
@@ -51,7 +61,7 @@ impl ConnectorKind {
     /// this connector family authenticates with.
     pub fn secret_kind(self) -> SecretKind {
         match self {
-            Self::Gmail | Self::Microsoft => SecretKind::OauthAccess,
+            Self::Gmail | Self::Microsoft | Self::Goa => SecretKind::OauthAccess,
             Self::Generic => SecretKind::Password,
         }
     }
@@ -61,7 +71,7 @@ impl ConnectorKind {
     /// ([`Self::secret_kind`]).
     pub fn imap_auth(self, secret: String) -> ImapAuth {
         match self {
-            Self::Gmail | Self::Microsoft => ImapAuth::XOauth2(secret),
+            Self::Gmail | Self::Microsoft | Self::Goa => ImapAuth::XOauth2(secret),
             Self::Generic => ImapAuth::Login(secret),
         }
     }
@@ -85,6 +95,7 @@ mod tests {
             ConnectorKind::from_provider_str("generic"),
             ConnectorKind::Generic
         );
+        assert_eq!(ConnectorKind::from_provider_str("goa"), ConnectorKind::Goa);
     }
 
     #[test]
@@ -104,6 +115,7 @@ mod tests {
             SecretKind::OauthAccess
         );
         assert_eq!(ConnectorKind::Generic.secret_kind(), SecretKind::Password);
+        assert_eq!(ConnectorKind::Goa.secret_kind(), SecretKind::OauthAccess);
     }
 
     #[test]
@@ -119,6 +131,10 @@ mod tests {
         assert!(matches!(
             ConnectorKind::Generic.imap_auth("hunter2".into()),
             ImapAuth::Login(p) if p == "hunter2"
+        ));
+        assert!(matches!(
+            ConnectorKind::Goa.imap_auth("token".into()),
+            ImapAuth::XOauth2(t) if t == "token"
         ));
     }
 }

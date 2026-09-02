@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.0 — 2026-09-02
+
+Adding a mailbox is the whole of this release: accounts you are already signed into on this desktop can be
+added with one click, and the Add-account screen was rebuilt around that choice.
+
+### Add account
+
+- **Sign in with a desktop account.** Feather Mail reads the accounts your desktop already holds (GNOME
+  Online Accounts) and lists the ones that carry mail. One click adds the mailbox: the token comes from the
+  session account manager, so there is no browser window, no password, and no client secret in the app.
+- **The Add-account screen now has three levels.** The first asks where the mailbox lives — *IMAP* or
+  *Linux*. *IMAP* leads to the familiar presets (Google, Microsoft, Yandex) and the manual form; *Linux*
+  lists the accounts you signed into on this desktop. If there are none, that level explains how to add one
+  in Settings instead of showing an empty list. **Back** returns to the level you came from.
+- Both first-level buttons carry an icon, and their label and hint line up on a single left edge.
+
+### Reading mail
+
+- The message header now names the address the letter actually arrived at instead of saying "to me" — the
+  one that matters when All accounts mixes several mailboxes into one list. When a message went to several
+  recipients, the header names your own mailbox among them.
+
+### Fixes
+
+- **XOAUTH2 sign-in to Gmail failed with "Couldn't reach the server."** The IMAP reply to `AUTHENTICATE` was
+  read one line deep, and Gmail answers a successful bind with an untagged `* CAPABILITY` line *before* the
+  tagged `OK`. That first line was mistaken for the result. Both the probe made while adding a mailbox and
+  every live session shared the bug; they now share one corrected implementation that reads on to the tagged
+  line.
+
 ## 0.2.0 — 2026-09-02
 
 A stability release driven by a full audit of the client. No new account types; the fixes below cover

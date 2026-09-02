@@ -7,6 +7,7 @@ mod autoconfig;
 mod folders;
 mod generic;
 mod gmail;
+mod goa;
 mod idle;
 mod microsoft;
 mod oauth;
@@ -28,6 +29,11 @@ pub use autoconfig::{
 pub use folders::discovered_folders;
 pub use generic::GenericImapSmtp;
 pub use gmail::GmailImap;
+pub use goa::{
+    usable_account, Goa, GoaAccount, GoaBus, GoaError, GoaMail, GoaObject, GoaSkip, LiveGoaBus,
+    GOA_ACCOUNT_IFACE, GOA_GOOGLE_PROVIDER_TYPE, GOA_MAIL_IFACE, GOA_OAUTH2_IFACE, GOA_OBJECT_ROOT,
+    GOA_SERVICE,
+};
 pub use idle::{run_idle, run_idle_with, IdleOutcome, IDLE_TIMEOUT_SECS, NO_IDLE_POLL_SECS};
 pub use microsoft::{
     MicrosoftClientConfig, MicrosoftImap, MicrosoftOauth, MICROSOFT_AUTH_URL, MICROSOFT_SCOPE,

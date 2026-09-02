@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "feathermail"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "feathermail-attachments",
  "feathermail-core",
@@ -547,14 +547,14 @@ dependencies = [
 
 [[package]]
 name = "feathermail-attachments"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "feathermail-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "feathermail-db",
  "feathermail-html",
@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "feathermail-db"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "tempfile",
@@ -576,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "feathermail-html"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ammonia",
  "base64 0.22.1",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "feathermail-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "feathermail-attachments",
  "feathermail-core",
@@ -600,11 +600,11 @@ dependencies = [
 
 [[package]]
 name = "feathermail-notifications"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "feathermail-providers"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "feathermail-attachments",
@@ -618,15 +618,16 @@ dependencies = [
  "simple-dns",
  "tempfile",
  "ureq",
+ "zbus",
 ]
 
 [[package]]
 name = "feathermail-search"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "feathermail-security"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "feathermail-db",
  "secret-service",
@@ -636,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "feathermail-service"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "feathermail-attachments",
  "feathermail-core",
@@ -649,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "feathermail-sync"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "field-offset"

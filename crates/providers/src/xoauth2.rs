@@ -13,10 +13,8 @@ use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::transport::smtp::SmtpTransport;
 
-use crate::oauth::sasl_xoauth2;
 use crate::wire::{
-    capability, expect_greeting, imap_connect, looks_like_auth, net, read_line, read_tagged,
-    sanitize, smtp_err, tagged, TIMEOUT,
+    capability, expect_greeting, imap_connect, looks_like_auth, sanitize, smtp_err, tagged, TIMEOUT,
 };
 
 /// Probe IMAP + SMTP over XOAUTH2. Empty token → reauth without a round trip.
@@ -43,35 +41,16 @@ fn imap_xoauth2(form: &MailboxForm, access_token: &str) -> Result<Vec<String>, C
     Ok(caps)
 }
 
+/// T-165: one implementation of the XOAUTH2 bind, shared with the live
+/// session path (`session.rs`). It used to be duplicated here with the
+/// same single-line read, so the bug `wire::read_authenticate_reply`
+/// documents existed twice and could be fixed in only one of them.
 fn authenticate_xoauth2<S: Read + Write>(
     stream: &mut S,
     user: &str,
     access_token: &str,
 ) -> Result<(), ConnectError> {
-    let mut encoded = sasl_xoauth2(user, access_token);
-    stream.write_all(b"A2 AUTHENTICATE XOAUTH2 ").map_err(net)?;
-    stream.write_all(&encoded).map_err(net)?;
-    stream.write_all(b"\r\n").map_err(net)?;
-    stream.flush().map_err(net)?;
-    encoded.fill(0);
-    let line = read_line(stream)?;
-    if line.starts_with("A2 OK") {
-        return Ok(());
-    }
-    if line.starts_with('+') {
-        stream.write_all(b"\r\n").map_err(net)?;
-        stream.flush().map_err(net)?;
-        let lines = read_tagged(stream, "A2")?;
-        let last = lines.last().cloned().unwrap_or_default();
-        if last.starts_with("A2 OK") {
-            return Ok(());
-        }
-        return Err(ConnectError::reauth(sanitize(&last)));
-    }
-    if line.starts_with("A2 NO") || line.starts_with("A2 BAD") {
-        return Err(ConnectError::reauth(sanitize(&line)));
-    }
-    Err(ConnectError::network(sanitize(&line)))
+    crate::wire::imap_authenticate_xoauth2(stream, "A2", user, access_token)
 }
 
 fn smtp_xoauth2(form: &MailboxForm, access_token: &str) -> Result<(), ConnectError> {
@@ -160,7 +139,18 @@ pub(crate) mod fake_server {
                     let text = String::from_utf8_lossy(&decoded);
                     let ok = text.contains(accept_token) && text.contains("user=");
                     if ok {
-                        write!(writer, "{tag} OK Success\r\n").unwrap();
+                        // T-165: real Gmail sends its post-login capability
+                        // list *before* the tagged OK. The fake said only
+                        // "{tag} OK", which is why a reader that stopped at
+                        // the first line passed every test here and failed
+                        // against Google on its own success line.
+                        write!(
+                            writer,
+                            "* CAPABILITY IMAP4rev1 UNSELECT IDLE NAMESPACE QUOTA ID XLIST \
+                             CHILDREN X-GM-EXT-1 UIDPLUS COMPRESS=DEFLATE ENABLE MOVE \
+                             CONDSTORE ESEARCH UTF8=ACCEPT\r\n{tag} OK Success\r\n"
+                        )
+                        .unwrap();
                     } else {
                         write!(
                             writer,

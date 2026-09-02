@@ -46,7 +46,11 @@ See [docs/install.md](docs/install.md) for dependencies, source builds and provi
 
 ## Account support
 
-The Add Account screen configures IMAP/SMTP; after you enter your address it looks up the provider's servers (Thunderbird ISPDB and DNS SRV) and fills in whatever you left empty, and everything stays editable. Google and Yandex users should use provider app passwords. Microsoft 365 and Outlook.com commonly require Modern Auth and may reject password-only clients; interactive Microsoft OAuth is not exposed yet. The UI says this before credentials are submitted.
+Add Account asks first where the mailbox lives: **IMAP** or **Linux**.
+
+**Linux** lists the accounts this desktop is already signed into (GNOME Online Accounts) that carry mail. One press adds the mailbox: no browser step, no password. Feather Mail ships **no Google client ID or secret** for this path -- the access token is issued by the session's own account manager over D-Bus, and all Feather Mail keeps is that short-lived token plus the account's id in the manager, used to ask for the next one. Revoke access where the account lives: Settings -> Online Accounts. Sessions without such a manager (KDE, a bare Sway/i3) see instructions there and use the IMAP branch instead.
+
+**IMAP** configures IMAP/SMTP with presets for Google, Microsoft and Yandex plus a form for your own server; after you enter your address it looks up the provider's servers (Thunderbird ISPDB and DNS SRV) and fills in whatever you left empty, and everything stays editable. Google and Yandex users should use provider app passwords. Microsoft 365 and Outlook.com commonly require Modern Auth and may reject password-only clients; interactive Microsoft OAuth is not exposed yet. The UI says this before credentials are submitted.
 
 Secrets are stored in the desktop Secret Service keyring, never in SQLite. If no keyring is available, Feather Mail refuses to save the account password.
 

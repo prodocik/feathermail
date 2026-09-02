@@ -267,7 +267,7 @@ mod tests {
         assert!(shell.contains("fm-unread-symbolic"));
         assert_eq!(
             shell.matches("set_can_target: false,").count(),
-            11,
+            13,
             "button content and the pull-refresh overlay must never steal pointer clicks"
         );
         assert!(
@@ -313,6 +313,13 @@ mod tests {
         for class in [
             "wizard-chooser-lede",
             "wizard-provider",
+            // T-167: level one, and the three states of the Linux level.
+            "wizard-source",
+            "wizard-system-probing",
+            "wizard-system-empty",
+            // T-165: the session-account row is synchronised through the
+            // same stable-class path as every other wizard child.
+            "wizard-system-accounts",
             "wizard-imap-form",
             "wizard-progress-spinner",
             "wizard-progress-label",
@@ -328,7 +335,7 @@ mod tests {
         assert!(
             shell.contains("fn sync_wizard_visibility")
                 && shell.contains("fn refresh_wizard_view")
-                && shell.contains("sync_wizard_visibility(&self.window, &self.wizard)"),
+                && shell.contains("sync_wizard_visibility(&self.window, &self.wizard,"),
             "in-place wizard transitions must synchronise visibility and allocation"
         );
         for screen in ["Welcome", "AddAccount"] {

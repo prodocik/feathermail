@@ -20,6 +20,11 @@ roxmltree = "0.20"
 sha2 = "0.10"
 simple-dns = "0.9"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
+# D19a: session-bus client for GNOME Online Accounts (T-165). Already in
+# the tree through `feathermail-security`'s `secret-service`, so this adds
+# no new third-party code -- only the blocking wrapper this crate calls
+# from its own (non-GTK) threads.
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 
 [features]
 # T-082: opens up `test_support` (the shared fake IMAP server) to an

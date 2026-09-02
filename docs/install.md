@@ -54,7 +54,11 @@ cargo run -p feathermail
 
 ## Add an account
 
-The Add Account screen configures IMAP/SMTP. After you enter your address it looks up the provider's servers (Thunderbird ISPDB and DNS SRV) and fills in the fields you left empty; every field stays editable. Google and Yandex users should create a provider app password. Microsoft 365 and Outlook.com commonly require Modern Auth and may reject a password-only client; interactive Microsoft OAuth is not available yet.
+Add Account asks first where the mailbox lives: **IMAP** or **Linux**.
+
+**Linux** lists the accounts this desktop is already signed into (GNOME Online Accounts) that carry mail; one press adds the mailbox, with no browser step and no password. The access token comes from the session's own account manager over D-Bus, so Feather Mail carries no Google client ID or secret for this path. Revoke access in Settings -> Online Accounts. If the session has no such manager, that level says so and you use the IMAP branch.
+
+**IMAP** configures IMAP/SMTP with presets for Google, Microsoft and Yandex plus a form for your own server. After you enter your address it looks up the provider's servers (Thunderbird ISPDB and DNS SRV) and fills in the fields you left empty; every field stays editable. Google and Yandex users should create a provider app password. Microsoft 365 and Outlook.com commonly require Modern Auth and may reject a password-only client; interactive Microsoft OAuth is not available yet.
 
 Feather Mail stores mail data under `~/.local/share/feathermail/`, caches bodies and attachments under `~/.cache/feathermail/`, and keeps credentials only in the session Secret Service keyring.
 

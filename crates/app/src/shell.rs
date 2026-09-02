@@ -1451,6 +1451,26 @@ pub struct App {
     toast_generation: u64,
     wizard: Wizard,
     wizard_gen: u64,
+    /// T-165: Google accounts the desktop session already holds, as the
+    /// picker sees them: `(GOA account id, address)`. Empty when the
+    /// session has no account manager, when it has no usable account, or
+    /// before the background probe has answered -- the button row is
+    /// hidden in all three cases, because a button that cannot work is
+    /// worse than no button.
+    system_accounts: Vec<(String, String)>,
+    /// The row those buttons live in. Held (not `#[name]`d in `view!`)
+    /// because it is repopulated imperatively when the probe answers: how
+    /// many accounts the session holds is not known when the tree is
+    /// built.
+    system_accounts_box: gtk::Box,
+    /// Generation guard for that probe, same shape as `wizard_gen`: a
+    /// reply that arrives after the wizard was closed and reopened must
+    /// not repopulate a list the user is no longer looking at.
+    system_accounts_gen: u64,
+    /// T-167: the Linux level can be open before the probe has answered.
+    /// Without this the screen would show the "no accounts here" text
+    /// during the round trip and then replace it with a list.
+    system_accounts_probing: bool,
     imap_form: gtk::Box,
     email_entry: gtk::Entry,
     password_entry: gtk::PasswordEntry,
@@ -1971,6 +1991,23 @@ impl App {
     /// cache `refresh_selected` fills in.
     fn selected_thread(&self) -> Option<Thread> {
         self.selected_thread_obj.clone()
+    }
+
+    /// T-167: the `to ...` line of the opened letter. The mailbox comes
+    /// from the thread's own account, not from "the account currently
+    /// selected" -- in the unified inbox those are different things, and
+    /// the second one would label every letter with whatever mailbox the
+    /// sidebar happens to be pointing at.
+    fn selected_recipient_line(&self) -> String {
+        let Some(thread) = self.selected_thread() else {
+            return String::new();
+        };
+        let mailbox = self
+            .accounts_cache
+            .iter()
+            .find(|account| account.id == thread.account_id)
+            .map(|account| account.email.as_str());
+        recipient_line(&thread.to, mailbox)
     }
 
     /// T-029: N>1 conversations draw the accordion; a single message keeps
@@ -5817,16 +5854,23 @@ impl App {
         // CSS-tagged page hosts are the one canonical screen switch; the
         // watches remain as a declarative mirror for future model changes.
         sync_screen_visibility(&self.window, screen);
-        sync_wizard_visibility(&self.window, &self.wizard);
+        sync_wizard_visibility(
+            &self.window,
+            &self.wizard,
+            self.system_accounts_probing,
+            !self.system_accounts.is_empty(),
+        );
         let window = self.window.clone();
         let wizard = self.wizard.clone();
+        let probing = self.system_accounts_probing;
+        let has_system_accounts = !self.system_accounts.is_empty();
         let settings = self.settings.clone();
         glib::idle_add_local_once(move || {
             // Relm4's generated watches run between the input arm and this
             // idle callback. Re-apply the canonical visibility after that
             // pass too, so a stale sibling value cannot win the final frame.
             sync_screen_visibility(&window, screen);
-            sync_wizard_visibility(&window, &wizard);
+            sync_wizard_visibility(&window, &wizard, probing, has_system_accounts);
             settings.set_visible(screen == Screen::Settings);
             settings.queue_resize();
             settings.queue_allocate();
@@ -5854,11 +5898,13 @@ impl App {
     /// they need their own immediate child visibility sync and one
     /// post-watch allocation/draw pass.
     fn refresh_wizard_view(&self) {
-        sync_wizard_visibility(&self.window, &self.wizard);
+        let probing = self.system_accounts_probing;
+        let has_system_accounts = !self.system_accounts.is_empty();
+        sync_wizard_visibility(&self.window, &self.wizard, probing, has_system_accounts);
         let window = self.window.clone();
         let wizard = self.wizard.clone();
         glib::idle_add_local_once(move || {
-            sync_wizard_visibility(&window, &wizard);
+            sync_wizard_visibility(&window, &wizard, probing, has_system_accounts);
             window.queue_resize();
             window.queue_allocate();
             window.queue_draw();
@@ -6763,6 +6809,92 @@ fn safe_attachment_filename(filename: &str) -> String {
 /// attempt inside the cache-root check above.
 fn attachment_launch_file(path: &Path) -> gio::File {
     gio::File::for_path(path)
+}
+
+/// T-167: the line under the sender in an opened letter.
+///
+/// It said `to me` -- a constant. In a single-mailbox profile that is
+/// merely uninformative; in the unified inbox ("All accounts") it hides
+/// the one fact the reader is actually looking for, which is *which* of
+/// their addresses this message arrived at. Two mailboxes, one list, and
+/// every letter claims to be addressed to the same "me".
+///
+/// The rule, in order:
+/// 1. this profile's own mailbox address, when the header names it --
+///    so the ordinary case reads as the account the mail landed in;
+/// 2. otherwise the first address the header carries -- an alias, a
+///    list, or a `Delivered-To`-style relay is still an honest answer to
+///    "where did this arrive", and inventing the account address there
+///    would be a lie about the envelope;
+/// 3. otherwise the account address, when the header is empty (Bcc-only
+///    mail carries no `To:` at all);
+/// 4. and only with neither, the old wording, because a blank line under
+///    the sender reads as a rendering bug.
+fn recipient_line(to: &str, mailbox: Option<&str>) -> String {
+    let decoded = decode_encoded_words(to);
+    let mut first: Option<String> = None;
+    for entry in split_address_list(&decoded) {
+        let Some(address) = address_of(&entry) else {
+            continue;
+        };
+        if let Some(mailbox) = mailbox {
+            if address.eq_ignore_ascii_case(mailbox) {
+                return format!("to {mailbox}");
+            }
+        }
+        if first.is_none() {
+            first = Some(address);
+        }
+    }
+    match (first, mailbox) {
+        (Some(address), _) => format!("to {address}"),
+        (None, Some(mailbox)) => format!("to {mailbox}"),
+        (None, None) => "to me".to_string(),
+    }
+}
+
+/// Split a header address list on its *separating* commas only. A quoted
+/// display name is allowed to contain one (`"Doe, John" <j@x>`), and so is
+/// the inside of angle brackets; splitting on every comma turns one
+/// recipient into two halves, neither of which is an address.
+fn split_address_list(list: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut angled = false;
+    for ch in list.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                current.push(ch);
+            }
+            '<' if !quoted => {
+                angled = true;
+                current.push(ch);
+            }
+            '>' if !quoted => {
+                angled = false;
+                current.push(ch);
+            }
+            ',' | ';' if !quoted && !angled => {
+                entries.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    entries.push(current);
+    entries
+}
+
+/// The address out of one `Name <a@b>` or bare `a@b` entry.
+fn address_of(entry: &str) -> Option<String> {
+    let entry = entry.trim();
+    let address = match (entry.rfind('<'), entry.rfind('>')) {
+        (Some(open), Some(close)) if close > open => &entry[open + 1..close],
+        _ => entry,
+    };
+    let address = address.trim().trim_matches('"').trim();
+    (address.contains('@') && !address.contains(char::is_whitespace)).then(|| address.to_string())
 }
 
 fn recipient_fragment(value: &str) -> String {
@@ -10320,11 +10452,62 @@ fn sync_screen_visibility(window: &gtk::ApplicationWindow, screen: Screen) {
 /// an unrelated expose event.  Stable CSS classes make this one small walk
 /// the same canonical switch for every wizard state; the watches remain a
 /// declarative mirror for later model changes.
-fn sync_wizard_visibility(window: &gtk::ApplicationWindow, wizard: &Wizard) {
+/// T-165: the row of session accounts is part of the chooser, and it also
+/// disappears entirely when the probe found nothing -- an empty row would
+/// leave a hole above the presets. Pulled out of
+/// [`sync_wizard_visibility`] so the rule can be asserted without a
+/// window: both halves matter, and "always visible" or "visible on the
+/// IMAP form too" are exactly the mistakes a widget test would not catch.
+fn show_system_accounts(wizard: &Wizard, probing: bool, has_system_accounts: bool) -> bool {
+    wizard.show_system() && !probing && has_system_accounts
+}
+
+/// The probe is a D-Bus round trip that can also go to the network, so
+/// the Linux level can be on screen before the answer is. Saying so beats
+/// both of the alternatives: a blank card (looks broken) and the "no
+/// accounts here" instructions (a claim we cannot make yet, and which
+/// would then be replaced by a list -- the screen contradicting itself).
+fn show_system_probing(wizard: &Wizard, probing: bool) -> bool {
+    wizard.show_system() && probing
+}
+
+/// The answer came back empty. This is the ordinary case on a session
+/// with no account manager, so it is instructions, not an error: the
+/// person has to go somewhere else (system settings) and come back.
+fn show_system_empty(wizard: &Wizard, probing: bool, has_system_accounts: bool) -> bool {
+    wizard.show_system() && !probing && !has_system_accounts
+}
+
+/// Level one. Two buttons, no list -- picking a branch is a separate
+/// question from picking an account inside it.
+fn show_source(wizard: &Wizard) -> bool {
+    wizard.show_source()
+}
+
+/// The level's own lede, except where it would contradict what is under
+/// it: "Accounts you are already signed into on this desktop" directly
+/// above "No accounts here yet" is the screen arguing with itself. When
+/// the instructions are showing they are the explanation.
+fn show_lede(wizard: &Wizard, probing: bool, has_system_accounts: bool) -> bool {
+    !wizard.step.lede().is_empty() && !show_system_empty(wizard, probing, has_system_accounts)
+}
+
+fn sync_wizard_visibility(
+    window: &gtk::ApplicationWindow,
+    wizard: &Wizard,
+    probing: bool,
+    has_system_accounts: bool,
+) {
     let Some(root) = window.child() else {
         return;
     };
     let show_chooser = wizard.show_chooser();
+    let show_source = show_source(wizard);
+    let show_system_accounts = show_system_accounts(wizard, probing, has_system_accounts);
+    let show_system_probing = show_system_probing(wizard, probing);
+    let show_system_empty = show_system_empty(wizard, probing, has_system_accounts);
+    let lede = wizard.step.lede();
+    let show_lede = show_lede(wizard, probing, has_system_accounts);
     let show_form = wizard.show_form();
     let show_progress = wizard.show_progress();
     let show_spinner = wizard.step != WizardStep::Ready;
@@ -10336,10 +10519,24 @@ fn sync_wizard_visibility(window: &gtk::ApplicationWindow, wizard: &Wizard) {
     let mut pending = vec![root];
     while let Some(widget) = pending.pop() {
         let classes = widget.css_classes();
-        if classes.iter().any(|class| class == "wizard-chooser-lede")
-            || classes.iter().any(|class| class == "wizard-provider")
-        {
+        if classes.iter().any(|class| class == "wizard-chooser-lede") {
+            widget.set_visible(show_lede);
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                label.set_label(lede);
+            }
+        } else if classes.iter().any(|class| class == "wizard-provider") {
             widget.set_visible(show_chooser);
+        } else if classes.iter().any(|class| class == "wizard-source") {
+            widget.set_visible(show_source);
+        } else if classes
+            .iter()
+            .any(|class| class == "wizard-system-accounts")
+        {
+            widget.set_visible(show_system_accounts);
+        } else if classes.iter().any(|class| class == "wizard-system-probing") {
+            widget.set_visible(show_system_probing);
+        } else if classes.iter().any(|class| class == "wizard-system-empty") {
+            widget.set_visible(show_system_empty);
         } else if classes.iter().any(|class| class == "wizard-imap-form") {
             widget.set_visible(show_form);
         } else if classes.iter().any(|class| class == "wizard-progress") {
@@ -10370,6 +10567,10 @@ fn sync_wizard_visibility(window: &gtk::ApplicationWindow, wizard: &Wizard) {
                 class.as_str(),
                 "wizard-chooser-lede"
                     | "wizard-provider"
+                    | "wizard-source"
+                    | "wizard-system-accounts"
+                    | "wizard-system-probing"
+                    | "wizard-system-empty"
                     | "wizard-imap-form"
                     | "wizard-progress"
                     | "wizard-progress-spinner"
@@ -10491,6 +10692,65 @@ fn mailbox_preset_values(preset: MailboxPreset) -> MailboxPresetValues {
             smtp_security: MailSecurity::Ssl,
             notice: "Yandex: enter the app password created for Mail.",
         },
+    }
+}
+
+/// T-165: the container the session-account buttons live in. Its own
+/// visibility is driven by `sync_wizard_visibility` through the stable
+/// `wizard-system-accounts` class, the same way every other wizard part
+/// is, so it cannot be left behind by a `#[watch]` that has not run yet.
+fn build_system_accounts_row() -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    row.add_css_class("wizard-system-accounts");
+    row.set_visible(false);
+    row
+}
+
+/// Rebuild the buttons from the model. Called only when the probe answers
+/// (and to empty the row when the wizard reopens), because the number of
+/// accounts is not known when `view!` builds the tree.
+///
+/// T-167: the line that used to sit above these buttons ("Already signed
+/// in on this desktop") is now the level's own lede -- the whole screen is
+/// about session accounts, so the explanation belongs to the screen, not
+/// repeated inside the list.
+fn fill_system_accounts_row(
+    row: &gtk::Box,
+    accounts: &[(String, String)],
+    sender: &ComponentSender<App>,
+) {
+    while let Some(child) = row.first_child() {
+        row.remove(&child);
+    }
+    if accounts.is_empty() {
+        row.set_visible(false);
+        return;
+    }
+    for (handle, email) in accounts {
+        let button = gtk::Button::new();
+        button.add_css_class("provider-btn");
+        button.add_css_class("wizard-system-account");
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        content.set_halign(gtk::Align::Center);
+        content.set_can_target(false);
+        let icon = gtk::Image::new();
+        icon.add_css_class("provider-service-icon");
+        icon.set_pixel_size(20);
+        icon.set_paintable(Some(&google_provider_mark()));
+        content.append(&icon);
+        let label = gtk::Label::new(Some(email));
+        label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        content.append(&label);
+        button.set_child(Some(&content));
+        // The address alone is the visible label; the accessible name says
+        // what pressing it does, since "you@gmail.com" is not an action.
+        button.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Use {email} from the desktop's online accounts"
+        ))]);
+        let tx = sender.input_sender().clone();
+        let handle = handle.clone();
+        button.connect_clicked(move |_| tx.emit(Msg::UseSystemAccount(handle.clone())));
+        row.append(&button);
     }
 }
 
@@ -11380,11 +11640,150 @@ impl SimpleComponent for App {
                         gtk::Label {
                             add_css_class: "lede",
                             add_css_class: "wizard-chooser-lede",
-                            set_label: "Choose a preset or enter your mailbox settings.",
+                            #[watch]
+                            set_label: model.wizard.step.lede(),
                             set_wrap: true,
                             set_max_width_chars: 40,
                             #[watch]
-                            set_visible: model.wizard.show_chooser(),
+                            set_visible: show_lede(
+                                &model.wizard,
+                                model.system_accounts_probing,
+                                !model.system_accounts.is_empty(),
+                            ),
+                        },
+                        // T-167, level one. Two answers to "where does this
+                        // mailbox live", and nothing else on the screen --
+                        // the presets and the session accounts are each one
+                        // branch's own list, a level down.
+                        gtk::Button {
+                            add_css_class: "provider-btn",
+                            add_css_class: "wizard-source",
+                            #[watch]
+                            set_visible: model.wizard.show_source(),
+                            connect_clicked => Msg::ChooseImap,
+
+                            // Fill, not Center: each button centring its own
+                            // content puts the two icons on two different
+                            // vertical lines (measured: x=506 and x=521),
+                            // which reads as a crooked column. One left edge
+                            // for both, set by the button's own padding.
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Horizontal,
+                                set_spacing: 12,
+                                set_halign: gtk::Align::Fill,
+                                set_hexpand: true,
+                                set_can_target: false,
+
+                                gtk::Image {
+                                    add_css_class: "provider-service-icon",
+                                    set_icon_name: Some("fm-server-symbolic"),
+                                    set_pixel_size: 22,
+                                    // Without this the image takes the whole
+                                    // 64px row height as its allocation.
+                                    set_valign: gtk::Align::Center,
+                                },
+                                gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+                                    set_spacing: 2,
+                                    set_halign: gtk::Align::Start,
+                                    set_valign: gtk::Align::Center,
+                                    set_hexpand: true,
+
+                                    gtk::Label {
+                                        set_label: "IMAP",
+                                        set_xalign: 0.0,
+                                    },
+                                    gtk::Label {
+                                        add_css_class: "wizard-source-hint",
+                                        set_label: "Google, Microsoft, Yandex or any other server",
+                                        set_xalign: 0.0,
+                                        set_ellipsize: gtk::pango::EllipsizeMode::End,
+                                    },
+                                },
+                            },
+                        },
+                        gtk::Button {
+                            add_css_class: "provider-btn",
+                            add_css_class: "wizard-source",
+                            #[watch]
+                            set_visible: model.wizard.show_source(),
+                            connect_clicked => Msg::ChooseSystem,
+
+                            // Fill, not Center: each button centring its own
+                            // content puts the two icons on two different
+                            // vertical lines (measured: x=506 and x=521),
+                            // which reads as a crooked column. One left edge
+                            // for both, set by the button's own padding.
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Horizontal,
+                                set_spacing: 12,
+                                set_halign: gtk::Align::Fill,
+                                set_hexpand: true,
+                                set_can_target: false,
+
+                                gtk::Image {
+                                    add_css_class: "provider-service-icon",
+                                    set_icon_name: Some("fm-desktop-symbolic"),
+                                    set_pixel_size: 22,
+                                    // Without this the image takes the whole
+                                    // 64px row height as its allocation.
+                                    set_valign: gtk::Align::Center,
+                                },
+                                gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+                                    set_spacing: 2,
+                                    set_halign: gtk::Align::Start,
+                                    set_valign: gtk::Align::Center,
+                                    set_hexpand: true,
+
+                                    gtk::Label {
+                                        set_label: "Linux",
+                                        set_xalign: 0.0,
+                                    },
+                                    gtk::Label {
+                                        add_css_class: "wizard-source-hint",
+                                        set_label: "Accounts you signed into on this desktop",
+                                        set_xalign: 0.0,
+                                        set_ellipsize: gtk::pango::EllipsizeMode::End,
+                                    },
+                                },
+                            },
+                        },
+                        // Level two of the Linux branch: the list, the wait
+                        // before it, or -- when the session holds nothing --
+                        // where to go and sign in.
+                        gtk::Label {
+                            add_css_class: "lede",
+                            add_css_class: "wizard-system-probing",
+                            set_label: "Checking this desktop's accounts...",
+                            set_wrap: true,
+                            set_max_width_chars: 40,
+                            #[watch]
+                            set_visible: model.wizard.show_system()
+                                && model.system_accounts_probing,
+                        },
+                        #[local_ref]
+                        system_accounts_box -> gtk::Box {
+                            #[watch]
+                            set_visible: model.wizard.show_system()
+                                && !model.system_accounts_probing
+                                && !model.system_accounts.is_empty(),
+                        },
+                        gtk::Label {
+                            add_css_class: "lede",
+                            add_css_class: "wizard-system-empty",
+                            set_label: "No accounts here yet. Open the system settings \
+                                        (GNOME: Settings -> Online Accounts), add your \
+                                        Google account there, then come back to this \
+                                        screen. Desktops without an account manager use \
+                                        IMAP instead.",
+                            set_wrap: true,
+                            set_max_width_chars: 40,
+                            set_xalign: 0.0,
+                            #[watch]
+                            set_visible: model.wizard.show_system()
+                                && !model.system_accounts_probing
+                                && model.system_accounts.is_empty(),
                         },
                         gtk::Button {
                             add_css_class: "provider-btn",
@@ -12471,8 +12870,15 @@ impl SimpleComponent for App {
                                                     },
                                                     gtk::Label {
                                                         add_css_class: "meta-to",
-                                                        set_label: "to me",
+                                                        #[watch]
+                                                        set_label: &model.selected_recipient_line(),
                                                         set_xalign: 0.0,
+                                                        // A long list address
+                                                        // must not set the
+                                                        // width of the letter
+                                                        // pane (T-101's rule,
+                                                        // same reason).
+                                                        set_ellipsize: gtk::pango::EllipsizeMode::End,
                                                     },
                                                 },
                                                 gtk::Label {
@@ -12844,6 +13250,9 @@ impl SimpleComponent for App {
         let html_view_host = gtk::Box::new(gtk::Orientation::Vertical, 0);
         html_view_host.set_vexpand(true);
         let form = build_imap_form(&sender);
+        // T-165: empty at build time on purpose -- the probe that fills it
+        // runs off the GTK thread and answers after the window exists.
+        let system_accounts_box = build_system_accounts_row();
         let compose = build_compose();
         compose.window.set_transient_for(Some(&root));
         let send_tx = sender.input_sender().clone();
@@ -13210,6 +13619,10 @@ impl SimpleComponent for App {
             toast_generation: 0,
             wizard: Wizard::default(),
             wizard_gen: 0,
+            system_accounts: Vec::new(),
+            system_accounts_gen: 0,
+            system_accounts_probing: false,
+            system_accounts_box: system_accounts_box.clone(),
             imap_form: form.root,
             email_entry: form.email,
             password_entry: form.password,
@@ -13345,6 +13758,7 @@ impl SimpleComponent for App {
         let account_menu = &model.account_menu;
         let account_btn = &model.account_btn;
         let imap_form = &model.imap_form;
+        let system_accounts_box = &model.system_accounts_box;
         let skeleton = &model.skeleton;
         let thread_view = &model.list.view;
         let html_view_host = &model.html_view_host;
@@ -15369,7 +15783,61 @@ impl SimpleComponent for App {
                 self.wizard.reset();
                 self.clear_imap_form();
                 self.account_btn.popdown();
+                // T-165: ask the session what it holds every time the
+                // wizard opens, not once at startup -- an account can be
+                // added in Settings while Feather Mail is running, and the
+                // answer is one D-Bus round trip.
+                // T-167: the probe moved to `Msg::ChooseSystem`. Asking
+                // here spent a D-Bus round trip on every wizard opening,
+                // including the ones that go straight to the IMAP form,
+                // and answered a question the first screen no longer asks.
+                self.system_accounts.clear();
+                self.system_accounts_probing = false;
+                fill_system_accounts_row(&self.system_accounts_box, &[], &sender);
+                self.system_accounts_gen += 1;
                 self.go(Screen::AddAccount, &sender);
+            }
+            Msg::ChooseImap => {
+                self.wizard.choose_imap();
+                self.refresh_wizard_view();
+            }
+            // T-165 note carried forward: ask the session what it holds
+            // every time this level opens, not once at startup -- an
+            // account can be added in Settings while Feather Mail is
+            // running, and the answer is one D-Bus round trip.
+            Msg::ChooseSystem => {
+                self.wizard.choose_system();
+                self.system_accounts.clear();
+                fill_system_accounts_row(&self.system_accounts_box, &[], &sender);
+                self.system_accounts_probing = true;
+                self.system_accounts_gen += 1;
+                let gen = self.system_accounts_gen;
+                let tx = sender.input_sender().clone();
+                // D11: the probe may block on D-Bus (and, inside GOA, on
+                // the network); it never runs on this thread.
+                feathermail_service::spawn_system_accounts(move |accounts| {
+                    tx.emit(Msg::SystemAccountsFound { gen, accounts });
+                });
+                self.refresh_wizard_view();
+            }
+            Msg::SystemAccountsFound { gen, accounts } => {
+                // A reply for a wizard the user already left: dropping it
+                // is the whole point of the generation, same as
+                // `Msg::Provisioned`.
+                if gen != self.system_accounts_gen {
+                    return;
+                }
+                self.system_accounts_probing = false;
+                self.system_accounts = accounts;
+                fill_system_accounts_row(&self.system_accounts_box, &self.system_accounts, &sender);
+                self.refresh_wizard_view();
+            }
+            Msg::UseSystemAccount(handle) => {
+                self.wizard.error = None;
+                self.begin_provision(
+                    feathermail_service::ProvisionRequest::SystemAccount { handle },
+                    &sender,
+                );
             }
             Msg::ShowOtherForm => {
                 self.wizard.error = None;
@@ -15544,8 +16012,12 @@ impl SimpleComponent for App {
                         self.wizard.cancel_to_form();
                         self.refresh_wizard_view();
                     }
-                } else if self.wizard.show_form() {
-                    self.wizard.step = WizardStep::Providers;
+                } else if let Some(step) = self.wizard.back_step() {
+                    // T-167: one step back per press, decided by the
+                    // wizard itself. Back used to mean "form -> presets,
+                    // anything else -> leave", which with three levels
+                    // would skip level one entirely.
+                    self.wizard.step = step;
                     self.wizard.error = None;
                     self.refresh_wizard_view();
                 } else {
@@ -16536,6 +17008,72 @@ mod tests {
         assert_eq!(new_mail_summary_body(1), "1 new message");
         assert_eq!(new_mail_summary_body(25), "25 new messages");
         assert_eq!(new_mail_summary_body(0), "0 new messages");
+    }
+
+    /// T-167: the owner opened a letter in "All accounts" and the header
+    /// said `to me`, which is true of every letter in a merged list and
+    /// therefore tells the reader nothing. The mailbox it arrived at is
+    /// the point.
+    #[test]
+    fn the_letter_header_names_the_mailbox_the_mail_arrived_at() {
+        assert_eq!(
+            recipient_line("Vladimir <work@example.com>", Some("work@example.com")),
+            "to work@example.com"
+        );
+        assert_eq!(
+            recipient_line(
+                "someone@else.test, WORK@EXAMPLE.COM",
+                Some("work@example.com")
+            ),
+            "to work@example.com",
+            "the address is the same mailbox whatever case the sender typed it in"
+        );
+    }
+
+    /// Mail that reached this mailbox without naming it -- an alias, a
+    /// mailing list, a Bcc. Showing the account address there would claim
+    /// an envelope the message does not have, so the header wins.
+    #[test]
+    fn a_letter_addressed_elsewhere_shows_the_address_it_was_sent_to() {
+        assert_eq!(
+            recipient_line("rust-users@lists.example.org", Some("work@example.com")),
+            "to rust-users@lists.example.org"
+        );
+        assert_eq!(
+            recipient_line("", Some("work@example.com")),
+            "to work@example.com",
+            "a Bcc-only message carries no To: header at all"
+        );
+    }
+
+    /// A display name may contain the very character the list is split on.
+    /// Splitting on every comma turns one recipient into two non-addresses
+    /// and the line falls back to something wrong.
+    #[test]
+    fn a_comma_inside_a_quoted_display_name_does_not_split_the_recipient() {
+        assert_eq!(
+            recipient_line("\"Doe, John\" <john@example.com>", Some("work@example.com")),
+            "to john@example.com"
+        );
+    }
+
+    /// The header is MIME-encoded as often as the sender line is, and an
+    /// address hidden behind `=?utf-8?B?...?=` must still be found.
+    #[test]
+    fn an_encoded_recipient_header_is_decoded_before_it_is_read() {
+        let encoded = "=?utf-8?B?0JLQu9Cw0LTQuNC80LjRgA==?= <work@example.com>";
+        assert_eq!(
+            recipient_line(encoded, Some("work@example.com")),
+            "to work@example.com"
+        );
+    }
+
+    /// The last resort keeps the old wording: a blank line under the
+    /// sender reads as a rendering fault, not as "no recipient".
+    #[test]
+    fn a_letter_with_neither_header_nor_mailbox_keeps_the_old_wording() {
+        assert_eq!(recipient_line("", None), "to me");
+        assert_eq!(recipient_line("undisclosed-recipients:;", None), "to me");
     }
 
     /// D14: a summary is about a mailbox, so it is titled with the mailbox
@@ -23335,6 +23873,163 @@ mod tests {
             !arm.contains("show_toast"),
             "a provisioning failure is wizard state, not a toast"
         );
+    }
+
+    /// T-165: the session-account button is the one wizard control that
+    /// does provision straight away -- it has nothing to fill in, because
+    /// the address and the token both come from the account manager. It
+    /// must go through the system arm specifically: routing it through
+    /// `ProvisionRequest::Oauth` would start a browser sign-in with a
+    /// client ID this build does not have.
+    #[test]
+    fn the_system_account_button_provisions_through_the_system_arm() {
+        let src = include_str!("shell.rs");
+        let arm = extract_brace_body(src, "Msg::UseSystemAccount(handle) => {");
+        assert!(arm.contains("ProvisionRequest::SystemAccount { handle }"));
+        assert!(arm.contains("begin_provision"));
+        assert!(
+            !arm.contains("ProvisionRequest::Oauth") && !arm.contains("GoogleClientConfig"),
+            "the session account must not start a browser sign-in"
+        );
+    }
+
+    /// The probe answers on a thread, so a reply can land after the user
+    /// has closed and reopened the wizard. Same guard as `Msg::Provisioned`.
+    #[test]
+    fn a_late_system_accounts_reply_is_dropped() {
+        let src = include_str!("shell.rs");
+        let arm = extract_brace_body(src, "Msg::SystemAccountsFound { gen, accounts } => {");
+        assert!(
+            arm.contains("if gen != self.system_accounts_gen"),
+            "a reply for a closed wizard must be dropped, not applied"
+        );
+    }
+
+    /// D11: the probe is a D-Bus round trip that GOA may turn into a
+    /// network call, so it must never be made from the update arm itself.
+    /// T-167 moved it from opening the wizard to entering the Linux level,
+    /// which is the only screen that asks the question.
+    #[test]
+    fn the_system_accounts_probe_runs_off_the_gtk_thread() {
+        let src = include_str!("shell.rs");
+        let arm = extract_brace_body(src, "Msg::ChooseSystem => {");
+        assert!(
+            arm.contains("spawn_system_accounts"),
+            "the wizard must ask the service to probe on its own thread"
+        );
+        assert!(
+            !arm.contains("Goa::") && !arm.contains("mail_accounts()"),
+            "the shell must not talk to the account manager directly (D9)"
+        );
+        let opening = extract_brace_body(src, "Msg::OpenAddAccount => {");
+        assert!(
+            !opening.contains("spawn_system_accounts"),
+            "opening the wizard lands on level one, which does not need the answer"
+        );
+    }
+
+    /// T-167: the three states of the Linux level are exclusive, and each
+    /// one is wrong on the other two's screen. Showing the instructions
+    /// while the probe is still out would claim there are no accounts
+    /// before we know; showing them on the IMAP branch would explain
+    /// Online Accounts to someone typing a server name.
+    #[test]
+    fn the_linux_level_shows_exactly_one_of_wait_list_or_instructions() {
+        let mut wizard = Wizard::default();
+        wizard.choose_system();
+
+        assert!(show_system_probing(&wizard, true));
+        assert!(!show_system_accounts(&wizard, true, true));
+        assert!(!show_system_empty(&wizard, true, false));
+
+        assert!(show_system_accounts(&wizard, false, true));
+        assert!(!show_system_probing(&wizard, false));
+        assert!(!show_system_empty(&wizard, false, true));
+
+        assert!(show_system_empty(&wizard, false, false));
+        assert!(!show_system_accounts(&wizard, false, false));
+    }
+
+    /// The screen must not argue with itself: the Linux lede claims the
+    /// desktop is signed into accounts, which is exactly what the empty
+    /// state denies.
+    #[test]
+    fn the_level_lede_gives_way_to_the_instructions_it_would_contradict() {
+        let mut wizard = Wizard::default();
+        wizard.choose_system();
+        assert!(
+            show_lede(&wizard, true, false),
+            "the wait line keeps its lede"
+        );
+        assert!(show_lede(&wizard, false, true), "so does the list");
+        assert!(
+            !show_lede(&wizard, false, false),
+            "the instructions are the explanation; the lede would deny them"
+        );
+
+        let mut imap = Wizard::default();
+        assert!(
+            show_lede(&imap, false, false),
+            "level one always has its question"
+        );
+        imap.choose_imap();
+        assert!(show_lede(&imap, false, false));
+        imap.step = WizardStep::Connecting;
+        assert!(
+            !show_lede(&imap, false, false),
+            "progress has a label of its own, not a lede"
+        );
+    }
+
+    /// Every bundled icon a widget asks for by name must actually be in
+    /// the compiled resource. A missing one is not a build error: GTK
+    /// draws the broken-image glyph, and only a person looking at the
+    /// screen would notice.
+    #[test]
+    fn every_icon_the_shell_names_is_in_the_bundle() {
+        let src = include_str!("shell.rs");
+        let manifest = include_str!("../assets/icons/fm-icons.gresource.xml");
+        let mut checked = 0;
+        for (index, _) in src.match_indices("set_icon_name: Some(\"fm-") {
+            let rest = &src[index + "set_icon_name: Some(\"".len()..];
+            let name = &rest[..rest.find('"').expect("icon name is quoted")];
+            assert!(
+                manifest.contains(&format!("<file>{name}.svg</file>")),
+                "{name} is used by the shell but not compiled into fm-icons.gresource"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "the icon names must be found, not silently skipped"
+        );
+    }
+
+    /// None of the three belongs to any other level.
+    #[test]
+    fn the_session_accounts_never_appear_outside_their_own_level() {
+        let mut wizard = Wizard::default();
+        assert!(
+            !show_system_accounts(&wizard, false, true),
+            "level one asks which branch, and answers nothing itself"
+        );
+        assert!(!show_system_empty(&wizard, false, false));
+        assert!(show_source(&wizard));
+
+        wizard.choose_imap();
+        assert!(!show_system_accounts(&wizard, false, true));
+        assert!(!show_system_empty(&wizard, false, false));
+        assert!(!show_source(&wizard));
+
+        wizard.step = WizardStep::OtherForm;
+        assert!(!show_system_accounts(&wizard, false, true));
+
+        wizard.choose_system();
+        wizard.step = WizardStep::Connecting;
+        assert!(!show_system_accounts(&wizard, false, true));
+        assert!(!show_system_empty(&wizard, false, false));
+        wizard.step = WizardStep::Ready;
+        assert!(!show_system_accounts(&wizard, false, true));
     }
 
     /// Provider buttons are configuration presets only. They must keep the

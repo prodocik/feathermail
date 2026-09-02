@@ -30,9 +30,9 @@ use feathermail_core::{
 };
 use feathermail_providers::{
     build_draft_message, build_outbox_message, discovered_folders, run_idle_with, send_formatted,
-    AttachmentFetchLimits, GoogleClientConfig, GoogleOauth, IdleOutcome, ImapMailProvider,
-    ImapSession, LiveHttp, MicrosoftClientConfig, MicrosoftOauth, OauthReauth, SmtpAuth,
-    TokenRefresh,
+    AttachmentFetchLimits, Goa, GoogleClientConfig, GoogleOauth, IdleOutcome, ImapMailProvider,
+    ImapSession, LiveGoaBus, LiveHttp, MicrosoftClientConfig, MicrosoftOauth, OauthReauth,
+    SmtpAuth, TokenRefresh,
 };
 use feathermail_security::{LibsecretStore, SecretError, SecretKey, SecretStore};
 use feathermail_sync::{sync_folder, SyncError, SyncOutcome};
@@ -675,6 +675,10 @@ pub trait ProviderFactory: Send {
 trait OauthClientSource: Send {
     fn google(&self) -> Result<Box<dyn TokenRefresh>, ConnectError>;
     fn microsoft(&self) -> Result<Box<dyn TokenRefresh>, ConnectError>;
+    /// T-165: the session's own account manager. Unlike the two above it
+    /// loads no client config at all -- there is nothing to configure,
+    /// because Feather Mail is not the OAuth client here.
+    fn goa(&self) -> Result<Box<dyn TokenRefresh>, ConnectError>;
 }
 
 /// Production [`OauthClientSource`]: today's `connect()` behavior, moved
@@ -694,6 +698,17 @@ impl OauthClientSource for LiveOauthClientSource {
     fn microsoft(&self) -> Result<Box<dyn TokenRefresh>, ConnectError> {
         let oauth = MicrosoftOauth::new(MicrosoftClientConfig::load()?, LiveHttp);
         Ok(Box::new(oauth))
+    }
+
+    fn goa(&self) -> Result<Box<dyn TokenRefresh>, ConnectError> {
+        // A session without the account manager is `ConnectError::network`,
+        // not an auth failure: the account is fine, the daemon is simply
+        // not there right now (a Wayland session that just restarted, a
+        // login before the user bus finished coming up). D32's backoff is
+        // the right place for that, not "sign in again".
+        let goa = Goa::<LiveGoaBus>::connect()
+            .map_err(|err| ConnectError::network(err.message().to_string()))?;
+        Ok(Box::new(goa))
     }
 }
 
@@ -866,6 +881,10 @@ impl ProviderFactory for ImapProviderFactory {
                 let oauth = self.oauth.microsoft()?;
                 self.connect_oauth(account, kind, oauth, &key, attempt)
             }
+            ConnectorKind::Goa => {
+                let oauth = self.oauth.goa()?;
+                self.connect_oauth(account, kind, oauth, &key, attempt)
+            }
         }?;
         let outbox = Core::open(&self.db_path).map_err(core_err_to_connect)?;
         Ok(Box::new(SendingSession {
@@ -874,7 +893,9 @@ impl ProviderFactory for ImapProviderFactory {
             form: smtp_form,
             auth: match kind {
                 ConnectorKind::Generic => SmtpAuth::Password,
-                ConnectorKind::Gmail | ConnectorKind::Microsoft => SmtpAuth::Xoauth2,
+                ConnectorKind::Gmail | ConnectorKind::Microsoft | ConnectorKind::Goa => {
+                    SmtpAuth::Xoauth2
+                }
             },
             secrets: Arc::clone(&self.secrets),
             secret_key: key,
@@ -969,8 +990,12 @@ where
         }
         // Gmail/Microsoft both carry a refresh token, so both get the
         // bounded, at-most-once reauth-and-retry every later `apply()`
-        // call gets from `ReauthingProvider`.
-        ConnectorKind::Gmail | ConnectorKind::Microsoft => {
+        // call gets from `ReauthingProvider`. A GOA account joins them
+        // (T-165): what it carries in that slot is the account manager's
+        // own account id rather than a Google refresh token, but the
+        // shape is identical -- one saved handle that can be exchanged
+        // for a fresh access token without a browser.
+        ConnectorKind::Gmail | ConnectorKind::Microsoft | ConnectorKind::Goa => {
             let provider = connect_with_bounded_reauth(secrets, key, attempt, reauth)?;
             Ok(Box::new(provider))
         }
@@ -2304,16 +2329,26 @@ mod tests {
     }
 
     /// Test [`OauthClientSource`]: hands out a [`FixedTokenRefresh`] for
-    /// either provider, sharing one call counter between them (a given
-    /// test only ever exercises one of `google`/`microsoft`, so which one
-    /// shares the counter is not load-bearing, only convenient).
+    /// every provider, sharing one refresh counter between them (a given
+    /// test only ever exercises one branch, so which one shares the
+    /// counter is not load-bearing, only convenient).
+    ///
+    /// `asked` is load-bearing, though (T-165): the three source methods
+    /// return interchangeable doubles, so without recording *which* one
+    /// `connect()` reached for, a `ConnectorKind::Goa` account routed
+    /// through `google()` -- the exact mutation that would send a GOA
+    /// account looking for a Google refresh token that was never stored --
+    /// would still refresh once and still pass. Recording the name is what
+    /// pins each arm to its own source.
     struct FakeOauthClientSource {
         fresh_access_token: String,
         refresh_calls: Arc<AtomicU32>,
+        asked: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl FakeOauthClientSource {
-        fn token_refresh(&self) -> Box<dyn TokenRefresh> {
+        fn token_refresh(&self, which: &'static str) -> Box<dyn TokenRefresh> {
+            self.asked.lock().unwrap().push(which);
             Box::new(FixedTokenRefresh {
                 access_token: self.fresh_access_token.clone(),
                 calls: self.refresh_calls.clone(),
@@ -2323,11 +2358,15 @@ mod tests {
 
     impl OauthClientSource for FakeOauthClientSource {
         fn google(&self) -> Result<Box<dyn TokenRefresh>, ConnectError> {
-            Ok(self.token_refresh())
+            Ok(self.token_refresh("google"))
         }
 
         fn microsoft(&self) -> Result<Box<dyn TokenRefresh>, ConnectError> {
-            Ok(self.token_refresh())
+            Ok(self.token_refresh("microsoft"))
+        }
+
+        fn goa(&self) -> Result<Box<dyn TokenRefresh>, ConnectError> {
+            Ok(self.token_refresh("goa"))
         }
     }
 
@@ -2350,6 +2389,14 @@ mod tests {
         fn microsoft(&self) -> Result<Box<dyn TokenRefresh>, ConnectError> {
             panic!(
                 "OauthClientSource::microsoft() was called for a Generic \
+                 (password) account -- connect() must never load an OAuth \
+                 client for one"
+            );
+        }
+
+        fn goa(&self) -> Result<Box<dyn TokenRefresh>, ConnectError> {
+            panic!(
+                "OauthClientSource::goa() was called for a Generic \
                  (password) account -- connect() must never load an OAuth \
                  client for one"
             );
@@ -2377,7 +2424,10 @@ mod tests {
     /// by the `Microsoft` arm still working, or vice versa (see this
     /// module's `#[cfg(test)]` self-check for both directions verified by
     /// hand).
-    fn assert_connect_survives_a_stale_oauth_token_via_exactly_one_reauth(provider: &str) {
+    fn assert_connect_survives_a_stale_oauth_token_via_exactly_one_reauth(
+        provider: &str,
+        expected_source: &'static str,
+    ) {
         let (port, state) = spawn_fake_imap_server(vec![], true);
         state
             .lock()
@@ -2401,9 +2451,11 @@ mod tests {
             .unwrap();
 
         let refresh_calls = Arc::new(AtomicU32::new(0));
+        let asked = Arc::new(Mutex::new(Vec::new()));
         let oauth: Box<dyn OauthClientSource> = Box::new(FakeOauthClientSource {
             fresh_access_token: "fresh-access-token".into(),
             refresh_calls: refresh_calls.clone(),
+            asked: asked.clone(),
         });
 
         let mut factory = ImapProviderFactory::for_test(db_path.clone(), secrets.clone(), oauth);
@@ -2425,6 +2477,15 @@ mod tests {
             refresh_calls.load(Ordering::SeqCst),
             1,
             "connect() must have refreshed the token exactly once"
+        );
+
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            [expected_source],
+            "a {provider} account must get its next token from \
+             OauthClientSource::{expected_source}() -- routing it through \
+             another provider's client would look for a credential that \
+             account never stored"
         );
 
         session.apply(&op("op-1")).expect(
@@ -2455,12 +2516,25 @@ mod tests {
 
     #[test]
     fn imap_provider_factory_connect_survives_a_stale_gmail_token_via_exactly_one_reauth() {
-        assert_connect_survives_a_stale_oauth_token_via_exactly_one_reauth("gmail");
+        assert_connect_survives_a_stale_oauth_token_via_exactly_one_reauth("gmail", "google");
     }
 
     #[test]
     fn imap_provider_factory_connect_survives_a_stale_microsoft_token_via_exactly_one_reauth() {
-        assert_connect_survives_a_stale_oauth_token_via_exactly_one_reauth("microsoft");
+        assert_connect_survives_a_stale_oauth_token_via_exactly_one_reauth(
+            "microsoft",
+            "microsoft",
+        );
+    }
+
+    /// T-165's own arm of the same property: a GOA account's saved handle
+    /// is exchanged for a fresh token through the account manager, and the
+    /// session `connect()` hands back is built with that fresh token. The
+    /// handle happens to be a GOA account id rather than a Google refresh
+    /// token, which is exactly why the source assertion above matters.
+    #[test]
+    fn imap_provider_factory_connect_survives_a_stale_goa_token_via_exactly_one_reauth() {
+        assert_connect_survives_a_stale_oauth_token_via_exactly_one_reauth("goa", "goa");
     }
 
     #[test]

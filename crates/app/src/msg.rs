@@ -386,6 +386,27 @@ pub enum Msg {
         email: WizardEmail,
         outcome: AutoconfigOutcome,
     },
+    /// T-167: level one of the wizard -- which kind of mailbox this is.
+    /// `ChooseImap` opens the provider presets, `ChooseSystem` the
+    /// accounts the desktop session already holds (or, when it holds
+    /// none, how to add one).
+    ChooseImap,
+    ChooseSystem,
+    /// T-165: the one-shot probe of the session's account manager
+    /// (`feathermail_service::spawn_system_accounts`) has answered with
+    /// the Google accounts it holds, as `(GOA account id, address)`. An
+    /// empty list is the ordinary answer on a session without one, not an
+    /// error: T-167 turns it into the instructions on the Linux level rather
+    /// than a hidden row. `gen` guards a reply that lands after the wizard
+    /// was closed and reopened.
+    SystemAccountsFound {
+        gen: u64,
+        accounts: Vec<(String, String)>,
+    },
+    /// T-165: add the session account with this GOA id. No browser and no
+    /// Feather Mail client ID are involved -- the token comes from the
+    /// account manager over D-Bus.
+    UseSystemAccount(String),
     WizardBack,
     OpenInboxFromWizard,
     EditAccount(String),

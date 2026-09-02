@@ -29,8 +29,9 @@ use std::sync::Arc;
 
 use feathermail_core::{AccountId, Core, MailboxForm};
 use feathermail_providers::{
-    google_account_email, GenericImapSmtp, GmailImap, GoogleClientConfig, GoogleOauth, LiveHttp,
-    MicrosoftClientConfig, MicrosoftImap, MicrosoftOauth, OauthError, TokenSet,
+    google_account_email, GenericImapSmtp, GmailImap, Goa, GoaBus, GoaError, GoogleClientConfig,
+    GoogleOauth, LiveGoaBus, LiveHttp, MicrosoftClientConfig, MicrosoftImap, MicrosoftOauth,
+    OauthError, TokenSet,
 };
 use feathermail_security::{SecretKey, SecretStore};
 
@@ -55,6 +56,12 @@ pub enum ProvisionRequest {
         provider: OauthProvider,
         email: Option<String>,
     },
+    /// T-165 path: an account the desktop session already holds
+    /// (GNOME Online Accounts). No browser, no client ID, no sign-in of
+    /// our own -- the token is asked for over D-Bus and probed exactly
+    /// like the Gmail one. `handle` is the GOA account id the picker
+    /// showed.
+    SystemAccount { handle: String },
 }
 
 impl std::fmt::Debug for ProvisionRequest {
@@ -69,6 +76,13 @@ impl std::fmt::Debug for ProvisionRequest {
                 .debug_struct("Oauth")
                 .field("provider", provider)
                 .field("email", email)
+                .finish(),
+            // The handle is an account id, not a credential, so it is
+            // printable -- the token this request goes on to fetch never
+            // reaches this type at all.
+            Self::SystemAccount { handle } => f
+                .debug_struct("SystemAccount")
+                .field("handle", handle)
                 .finish(),
         }
     }
@@ -89,6 +103,31 @@ pub fn spawn_provision(
     });
 }
 
+/// T-165: ask the session's account manager which Google accounts it
+/// holds, off the caller's thread (D11 -- the caller is the GTK thread,
+/// and this is a D-Bus round trip that may itself go to the network).
+///
+/// Every failure collapses to an empty list on purpose: "no account
+/// manager here", "it is not answering" and "it holds nothing we can use"
+/// are the same thing from the wizard's point of view -- do not offer the
+/// button. The manual form and the OAuth path are unaffected either way,
+/// so there is nothing for the user to act on and no error worth showing.
+pub fn spawn_system_accounts(sink: impl FnOnce(Vec<(String, String)>) + Send + 'static) {
+    std::thread::spawn(move || sink(system_accounts()));
+}
+
+fn system_accounts() -> Vec<(String, String)> {
+    Goa::<LiveGoaBus>::connect()
+        .and_then(|goa| goa.mail_accounts())
+        .map(|(usable, _skipped)| {
+            usable
+                .into_iter()
+                .map(|account| (account.id, account.email))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn provision(
     db_path: PathBuf,
     secrets: Arc<dyn SecretStore>,
@@ -102,7 +141,50 @@ fn provision(
         ProvisionRequest::Oauth { provider, email } => {
             provision_oauth(&mut core, &secrets, provider, email.as_deref())
         }
+        ProvisionRequest::SystemAccount { handle } => {
+            let goa = Goa::<LiveGoaBus>::connect().map_err(goa_error_message)?;
+            provision_system_account(&mut core, &secrets, &goa, &handle)
+        }
     }
+}
+
+/// T-165: add an account the session's own account manager already holds.
+///
+/// Generic over the bus so the two failure shapes that need no network --
+/// the account disappeared from Settings between opening the picker and
+/// pressing the button, and the manager refusing to hand over a token --
+/// are covered by this module's tests with no D-Bus at all.
+///
+/// Ordering is the same discipline the rest of this file follows: token
+/// first (it is also the probe credential), account row second, keyring
+/// last, rollback on a failed keyring write.
+///
+/// What lands in the keyring differs from the OAuth arms in one way worth
+/// stating plainly (D19a): the `oauth_refresh` slot holds the *GOA account
+/// id*, not a Google refresh token. Feather Mail never receives a
+/// long-lived Google credential for these accounts -- the grant stays in
+/// the account manager, and the id is merely the handle used to ask it for
+/// the next access token (see `feathermail_providers::Goa`'s `TokenRefresh`
+/// impl). Revoking access happens in Settings, not here.
+fn provision_system_account<B: GoaBus>(
+    core: &mut Core,
+    secrets: &Arc<dyn SecretStore>,
+    goa: &Goa<B>,
+    handle: &str,
+) -> Result<String, String> {
+    let account = goa.find(handle).map_err(goa_error_message)?;
+    let access = goa.access_token(&account).map_err(goa_error_message)?;
+    let id = core
+        .add_goa_account(&account.email, &access, &GmailImap)
+        .map_err(|e| e.message)?;
+    let saved = secrets
+        .put(&SecretKey::oauth_access(id.as_str()), &access)
+        .and_then(|()| secrets.put(&SecretKey::oauth_refresh(id.as_str()), &account.id));
+    if let Err(err) = saved {
+        rollback(core, &id, secrets);
+        return Err(err.to_string());
+    }
+    Ok(id.as_str().to_string())
 }
 
 fn provision_password(
@@ -202,6 +284,12 @@ fn provider_name(provider: OauthProvider) -> &'static str {
         OauthProvider::Google => "Google",
         OauthProvider::Microsoft => "Microsoft",
     }
+}
+
+/// Same boundary as [`oauth_error_message`]: `GoaError::Bus` may carry
+/// D-Bus error text, and that stays out of the UI string.
+fn goa_error_message(err: GoaError) -> String {
+    err.message().to_string()
 }
 
 /// D14: only the human `message` crosses to the UI -- `details` may carry
@@ -560,6 +648,90 @@ mod tests {
         );
     }
 
+    /// A session bus double for the T-165 arm: the accounts are whatever
+    /// the test says, and the token call answers per path.
+    struct FakeGoaBus {
+        objects: Vec<feathermail_providers::GoaObject>,
+        token: Result<String, GoaError>,
+    }
+
+    impl feathermail_providers::GoaBus for FakeGoaBus {
+        fn objects(&self) -> Result<Vec<feathermail_providers::GoaObject>, GoaError> {
+            Ok(self.objects.clone())
+        }
+
+        fn access_token(&self, _path: &str) -> Result<String, GoaError> {
+            self.token.clone()
+        }
+    }
+
+    fn goa_google_object(id: &str, email: &str) -> feathermail_providers::GoaObject {
+        feathermail_providers::GoaObject {
+            path: format!("/org/gnome/OnlineAccounts/Accounts/{id}"),
+            id: id.to_string(),
+            provider_type: feathermail_providers::GOA_GOOGLE_PROVIDER_TYPE.to_string(),
+            provider_name: "Google".into(),
+            presentation_identity: email.to_string(),
+            mail_disabled: false,
+            is_locked: false,
+            attention_needed: false,
+            has_oauth2: true,
+            mail: Some(feathermail_providers::GoaMail {
+                email: email.to_string(),
+                imap_supported: true,
+                imap_host: "imap.gmail.com".into(),
+                smtp_supported: true,
+                smtp_host: "smtp.gmail.com".into(),
+            }),
+        }
+    }
+
+    /// The wizard shows a picker, then the user presses a button: between
+    /// those two moments the account can be removed in Settings. Nothing
+    /// may be written for an account that is no longer there.
+    #[test]
+    fn a_system_account_removed_between_picking_and_adding_leaves_nothing_behind() {
+        let mut core = Core::memory().unwrap();
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::new());
+        let goa = Goa::new(FakeGoaBus {
+            objects: vec![],
+            token: Ok("ya29.token".into()),
+        });
+        let err = provision_system_account(&mut core, &secrets, &goa, "account_1").unwrap_err();
+        assert!(err.contains("no longer in Settings"), "{err}");
+        assert_eq!(core.list_accounts().unwrap().len(), 0);
+    }
+
+    /// A manager that refuses the token must not leave a half-made
+    /// account either -- the token is also the probe credential, so this
+    /// fails before any row exists.
+    #[test]
+    fn a_system_account_whose_token_is_refused_leaves_nothing_behind() {
+        let mut core = Core::memory().unwrap();
+        let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::new());
+        let goa = Goa::new(FakeGoaBus {
+            objects: vec![goa_google_object("account_1", "you@gmail.com")],
+            token: Err(GoaError::Unusable {
+                message: "GNOME Online Accounts returned an empty token.".into(),
+            }),
+        });
+        let err = provision_system_account(&mut core, &secrets, &goa, "account_1").unwrap_err();
+        assert!(err.contains("empty token"), "{err}");
+        assert_eq!(core.list_accounts().unwrap().len(), 0);
+    }
+
+    /// D14/D19a: the D-Bus error text may name interfaces and methods;
+    /// only the human sentence crosses to the UI.
+    #[test]
+    fn goa_bus_details_do_not_reach_the_ui_string() {
+        let message = goa_error_message(GoaError::Bus {
+            message: "GNOME Online Accounts didn't hand over a token.".into(),
+            details: Some("org.freedesktop.DBus.Error.ServiceUnknown: gory detail".into()),
+        });
+        assert_eq!(message, "GNOME Online Accounts didn't hand over a token.");
+        assert!(!message.contains("gory detail"));
+    }
+
     /// T-094 pins on the OAuth arms themselves (the network halves are
     /// not offline-testable): Google must provision through
     /// `add_gmail_account` with a `GoogleClientConfig` sign-in, Microsoft
@@ -582,6 +754,41 @@ mod tests {
         );
         assert!(
             body.contains("rollback(core, &id, secrets)"),
+            "a failed keyring write must roll the account back (T-021)"
+        );
+    }
+
+    /// T-165's arm, pinned the same way: a system account provisions
+    /// through `add_goa_account` (its own `provider` string is what routes
+    /// later token refreshes back to the account manager), and the handle
+    /// it saves is the GOA account id -- never a Google client config,
+    /// because Feather Mail is not the OAuth client on this path.
+    #[test]
+    fn the_system_account_arm_uses_its_own_provider_door() {
+        let src = include_str!("provision.rs");
+        let body = src.split("mod tests").next().unwrap();
+        // Just this function's body: the next top-level `fn` ends it.
+        // Without that cut the slice would run on into `oauth_sign_in`
+        // and the "no Feather Mail OAuth client here" assertion below
+        // would be reading someone else's arm.
+        let arm = body
+            .split("fn provision_system_account")
+            .nth(1)
+            .expect("the system-account arm must exist")
+            .split("\nfn ")
+            .next()
+            .expect("the arm must end at the next top-level fn");
+        assert!(arm.contains("add_goa_account"), "GOA arm");
+        assert!(
+            arm.contains("SecretKey::oauth_refresh(id.as_str()), &account.id"),
+            "the saved handle must be the GOA account id"
+        );
+        assert!(
+            !arm.contains("GoogleClientConfig") && !arm.contains("GoogleOauth"),
+            "the GOA arm must not load a Feather Mail OAuth client"
+        );
+        assert!(
+            arm.contains("rollback(core, &id, secrets)"),
             "a failed keyring write must roll the account back (T-021)"
         );
     }

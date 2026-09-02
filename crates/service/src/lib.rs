@@ -48,7 +48,7 @@ pub mod worker;
 pub use autoconfig::{spawn_autoconfig, AutoconfigOutcome, LOOKUP_TIMEOUT};
 pub use connector::ConnectorKind;
 pub use provider_factory::{ImapProviderFactory, MailSession, ProviderFactory};
-pub use provision::{spawn_provision, OauthProvider, ProvisionRequest};
+pub use provision::{spawn_provision, spawn_system_accounts, OauthProvider, ProvisionRequest};
 pub use worker::{start, start_deferred, SyncEvent, SyncHandle, Viewport};
 
 pub fn crate_name() -> &'static str {

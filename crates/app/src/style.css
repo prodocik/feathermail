@@ -940,6 +940,25 @@ button.provider-btn {
 button.provider-btn:hover {
   background-color: @paper_recess;
 }
+/* T-167: the two level-one buttons carry a second line saying what each
+   branch contains, so they are taller than a one-line preset pill. The
+   hint keeps the quiet secondary colour of a lede -- it explains the
+   button, it is not a second thing to read. */
+button.wizard-source {
+  min-height: 64px;
+  padding: 8px 22px;
+}
+.wizard-source-hint {
+  font-size: calc(13px * var(--fm-scale));
+  font-weight: 400;
+  color: @ink_secondary;
+}
+/* The Linux level's wait line and its instructions sit where a list
+   would, so they keep the card's own left edge rather than the lede's
+   centred block. */
+.wizard-system-empty {
+  margin-bottom: 8px;
+}
 .provider-service-icon {
   min-width: 20px;
   min-height: 20px;

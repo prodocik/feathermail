@@ -76,9 +76,25 @@ pub enum EscapeAction {
     None,
 }
 
+/// T-167: the wizard has three levels, not one screen with everything on
+/// it. Level one asks *where the mailbox lives* -- an IMAP server we sign
+/// into ourselves, or an account the desktop session already holds. Level
+/// two is that answer's own list: the provider presets, or the session's
+/// accounts. Level three is the detail: the IMAP form, then progress.
+///
+/// Before this the session accounts sat as a row above the presets, which
+/// put two different kinds of sign-in -- "type a password" and "reuse the
+/// one the system already has" -- in one undifferentiated column, and gave
+/// the empty case nowhere to explain itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WizardStep {
+    /// Level 1: IMAP or Linux.
+    Source,
+    /// Level 2, IMAP: Google / Microsoft / Yandex / other.
     Providers,
+    /// Level 2, Linux: the session's own accounts, or how to add one.
+    SystemAccounts,
+    /// Level 3: the mailbox form.
     OtherForm,
     Connecting,
     Synchronizing,
@@ -91,15 +107,40 @@ impl WizardStep {
             Self::Connecting => "Connecting...",
             Self::Synchronizing => "Synchronizing...",
             Self::Ready => "Ready",
-            Self::Providers | Self::OtherForm => "",
+            Self::Source | Self::Providers | Self::SystemAccounts | Self::OtherForm => "",
         }
     }
+
+    /// The line under the title. It is per-step because each level asks a
+    /// different question, and a single sentence covering all of them
+    /// ("choose a preset or enter your settings") describes level two of
+    /// one branch only.
+    pub fn lede(self) -> &'static str {
+        match self {
+            Self::Source => "Where does this mailbox live?",
+            Self::Providers => "Choose a preset or enter your mailbox settings.",
+            Self::SystemAccounts => "Accounts you are already signed into on this desktop.",
+            Self::OtherForm | Self::Connecting | Self::Synchronizing | Self::Ready => "",
+        }
+    }
+}
+
+/// Which level-one branch the wizard is in. It outlives the step because
+/// a failure has to come back to the branch it started from: dropping a
+/// refused session account onto the manual IMAP form would ask the owner
+/// to type a password for an account whose whole point is not having one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WizardSource {
+    #[default]
+    Imap,
+    System,
 }
 
 /// T-017 add-account wizard. Progress is on the same screen, not a fourth page.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Wizard {
     pub step: WizardStep,
+    pub source: WizardSource,
     pub inbox_ready: bool,
     pub error: Option<String>,
     pub busy: bool,
@@ -110,7 +151,8 @@ pub struct Wizard {
 impl Default for Wizard {
     fn default() -> Self {
         Self {
-            step: WizardStep::Providers,
+            step: WizardStep::Source,
+            source: WizardSource::Imap,
             inbox_ready: false,
             error: None,
             busy: false,
@@ -129,8 +171,64 @@ impl Wizard {
         };
     }
 
+    /// Level 1 is on screen.
+    pub fn show_source(&self) -> bool {
+        self.step == WizardStep::Source
+    }
+
+    /// The preset list. It stays visible while the form below it is open:
+    /// the form is level three *of the presets*, and hiding what you just
+    /// picked from would make "Back" the only way to see it again.
     pub fn show_chooser(&self) -> bool {
         matches!(self.step, WizardStep::Providers | WizardStep::OtherForm)
+    }
+
+    /// Level 2 of the Linux branch -- the list, or the instructions when
+    /// the session holds nothing we can use.
+    pub fn show_system(&self) -> bool {
+        self.step == WizardStep::SystemAccounts
+    }
+
+    /// Enter a branch. The step and the branch move together; nothing else
+    /// may set one without the other, which is why these are methods.
+    pub fn choose_imap(&mut self) {
+        self.source = WizardSource::Imap;
+        self.step = WizardStep::Providers;
+        self.error = None;
+    }
+
+    pub fn choose_system(&mut self) {
+        self.source = WizardSource::System;
+        self.step = WizardStep::SystemAccounts;
+        self.error = None;
+    }
+
+    /// What Back means on the level currently shown. `None` is "leave the
+    /// wizard" -- the caller decides where to (Welcome or Inbox), which is
+    /// a question about the profile, not about this screen.
+    ///
+    /// Progress is not handled here: cancelling a connection attempt has a
+    /// generation to bump and an inbox to maybe open, so it stays with the
+    /// caller and reaches this type through [`Wizard::cancel_to_form`].
+    pub fn back_step(&self) -> Option<WizardStep> {
+        match self.step {
+            WizardStep::Source => None,
+            WizardStep::Providers | WizardStep::SystemAccounts => Some(WizardStep::Source),
+            WizardStep::OtherForm => Some(WizardStep::Providers),
+            WizardStep::Connecting | WizardStep::Synchronizing | WizardStep::Ready => {
+                Some(self.resume_step())
+            }
+        }
+    }
+
+    /// Where an interrupted or failed attempt lands. The IMAP branch owes
+    /// the owner the form they filled in; the Linux branch owes them the
+    /// list of accounts, because there is no form to return to.
+    fn resume_step(&self) -> WizardStep {
+        match self.source {
+            WizardSource::Imap => WizardStep::OtherForm,
+            WizardSource::System => WizardStep::SystemAccounts,
+        }
     }
 
     pub fn show_form(&self) -> bool {
@@ -174,11 +272,11 @@ impl Wizard {
         self.busy = false;
         self.inbox_ready = false;
         self.account_id = None;
-        self.step = WizardStep::OtherForm;
+        self.step = self.resume_step();
     }
 
     pub fn cancel_to_form(&mut self) {
-        self.step = WizardStep::OtherForm;
+        self.step = self.resume_step();
         self.inbox_ready = false;
         self.busy = false;
         self.error = None;
@@ -422,5 +520,118 @@ mod tests {
         ] {
             assert!(labels.contains(&need), "missing {need}");
         }
+    }
+
+    /// T-167: the three levels, walked forward and back. The wizard opens
+    /// on the question, not on one branch's answer.
+    #[test]
+    fn the_wizard_opens_on_the_source_question_and_back_leaves_it() {
+        let wizard = Wizard::default();
+        assert_eq!(wizard.step, WizardStep::Source);
+        assert!(wizard.show_source());
+        assert!(
+            !wizard.show_chooser(),
+            "no presets before a branch is picked"
+        );
+        assert!(!wizard.show_system());
+        assert_eq!(
+            wizard.back_step(),
+            None,
+            "Back on level one leaves the wizard entirely"
+        );
+    }
+
+    #[test]
+    fn each_branch_goes_back_to_the_source_question() {
+        let mut imap = Wizard::default();
+        imap.choose_imap();
+        assert_eq!(imap.step, WizardStep::Providers);
+        assert!(imap.show_chooser());
+        assert_eq!(imap.back_step(), Some(WizardStep::Source));
+
+        let mut system = Wizard::default();
+        system.choose_system();
+        assert_eq!(system.step, WizardStep::SystemAccounts);
+        assert!(system.show_system());
+        assert!(
+            !system.show_chooser(),
+            "the Linux branch is not the preset list with an extra row"
+        );
+        assert_eq!(system.back_step(), Some(WizardStep::Source));
+    }
+
+    /// Level three belongs to the IMAP branch, so Back from the form is
+    /// the preset list -- one step, not out of the wizard.
+    #[test]
+    fn back_from_the_mailbox_form_returns_to_the_presets() {
+        let mut wizard = Wizard::default();
+        wizard.choose_imap();
+        wizard.step = WizardStep::OtherForm;
+        assert!(
+            wizard.show_chooser(),
+            "the presets stay visible above the form"
+        );
+        assert_eq!(wizard.back_step(), Some(WizardStep::Providers));
+    }
+
+    /// A refused sign-in must come back to the branch it started from.
+    /// Dropping a rejected session account onto the IMAP form would ask
+    /// for a password that account does not have.
+    #[test]
+    fn a_failure_returns_to_the_branch_it_started_in() {
+        let mut imap = Wizard::default();
+        imap.choose_imap();
+        imap.submit("acc-1".into());
+        imap.fail("Couldn't reach the server.");
+        assert_eq!(imap.step, WizardStep::OtherForm);
+
+        let mut system = Wizard::default();
+        system.choose_system();
+        system.submit("acc-2".into());
+        system.fail("This account is no longer in Settings -> Online Accounts.");
+        assert_eq!(system.step, WizardStep::SystemAccounts);
+        assert_eq!(
+            system.error.as_deref(),
+            Some("This account is no longer in Settings -> Online Accounts.")
+        );
+    }
+
+    /// Cancelling a connection attempt follows the same rule as failing.
+    #[test]
+    fn cancelling_a_connection_returns_to_the_branch_it_started_in() {
+        let mut system = Wizard::default();
+        system.choose_system();
+        system.submit("acc-2".into());
+        system.cancel_to_form();
+        assert_eq!(system.step, WizardStep::SystemAccounts);
+    }
+
+    /// Reopening the wizard forgets the branch: the next account is not
+    /// necessarily of the same kind as the last one.
+    #[test]
+    fn reset_returns_to_the_source_question() {
+        let mut wizard = Wizard::default();
+        wizard.choose_system();
+        wizard.reset();
+        assert_eq!(wizard.step, WizardStep::Source);
+        assert_eq!(wizard.source, WizardSource::Imap);
+    }
+
+    /// Each level asks its own question, so each level has its own lede.
+    #[test]
+    fn every_chooser_level_has_its_own_lede() {
+        assert!(!WizardStep::Source.lede().is_empty());
+        assert!(!WizardStep::Providers.lede().is_empty());
+        assert!(!WizardStep::SystemAccounts.lede().is_empty());
+        assert_ne!(WizardStep::Source.lede(), WizardStep::Providers.lede());
+        assert_ne!(
+            WizardStep::Providers.lede(),
+            WizardStep::SystemAccounts.lede()
+        );
+        assert_eq!(
+            WizardStep::Connecting.lede(),
+            "",
+            "progress has its own label, not a lede"
+        );
     }
 }

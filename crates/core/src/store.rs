@@ -2439,6 +2439,28 @@ impl Core {
         self.add_mailbox(&form, access_token, "gmail", connector)
     }
 
+    /// T-165: a Google account whose bearer token comes from the desktop
+    /// session's own account manager (GNOME Online Accounts) rather than
+    /// from a Feather Mail OAuth client. The mailbox is Gmail's, so the
+    /// hosts and the XOAUTH2 probe are `add_gmail_account`'s verbatim --
+    /// the *only* difference is the saved `provider` string, which is what
+    /// tells `crates/service`'s connector where to get the next token
+    /// (`ConnectorKind::Goa`). Nothing Google-issued is stored in sqlite
+    /// here either; the token is probed and dropped.
+    pub fn add_goa_account(
+        &mut self,
+        email: &str,
+        access_token: &str,
+        connector: &impl MailConnector,
+    ) -> Result<AccountId, CoreError> {
+        if access_token.is_empty() {
+            return Err(CoreError::from_code(ErrorCode::AuthRequired));
+        }
+        let form = MailboxForm::gmail(email)
+            .map_err(|e| CoreError::new(ErrorCode::InvalidArgument, e.as_str()))?;
+        self.add_mailbox(&form, access_token, "goa", connector)
+    }
+
     /// T-020: Microsoft after OAuth. Access token is probed, not stored in sqlite.
     pub fn add_microsoft_account(
         &mut self,
@@ -6661,6 +6683,57 @@ mod tests {
             !values.contains("ya29.s3cret"),
             "token leaked into sqlite: {values}"
         );
+    }
+
+    /// T-165: same mailbox as Gmail, different `provider` -- that string
+    /// is the whole difference, because it is what tells the connector to
+    /// ask the session's account manager for the next token instead of a
+    /// Feather Mail OAuth client. If this ever saved "gmail", a GOA
+    /// account would silently look for a Google refresh token that was
+    /// never stored.
+    #[test]
+    fn add_goa_account_saves_the_gmail_mailbox_under_its_own_provider() {
+        let mut core = Core::memory().unwrap();
+        let id = core
+            .add_goa_account("you@gmail.com", "ya29.s3cret", &OkConnector)
+            .unwrap();
+        let conn = core.db.conn();
+        let (provider, imap_host, smtp_host, email): (String, String, String, String) = conn
+            .query_row(
+                "SELECT provider, imap_host, smtp_host, email FROM accounts WHERE id = 'you'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(provider, "goa");
+        assert_eq!(imap_host, "imap.gmail.com");
+        assert_eq!(smtp_host, "smtp.gmail.com");
+        assert_eq!(email, "you@gmail.com");
+        let values: String = conn
+            .query_row(
+                "SELECT quote(id)||quote(name)||quote(email)||quote(provider)
+                      ||quote(imap_host)||quote(imap_port)||quote(smtp_host)||quote(smtp_port)
+                      ||quote(imap_security)||quote(smtp_security)||quote(username)
+                      ||quote(status)
+                 FROM accounts WHERE id = 'you'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !values.contains("ya29.s3cret"),
+            "token leaked into sqlite: {values}"
+        );
+        assert_eq!(id.as_str(), "you");
+    }
+
+    #[test]
+    fn add_goa_account_without_a_token_is_refused() {
+        let mut core = Core::memory().unwrap();
+        let err = core
+            .add_goa_account("you@gmail.com", "", &OkConnector)
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::AuthRequired);
     }
 
     #[test]
